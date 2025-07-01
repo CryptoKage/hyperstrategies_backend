@@ -1,5 +1,3 @@
-// server/routes/auth.js
-
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -32,7 +30,6 @@ router.post('/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // 🧠 Generate wallet + encrypt key
     const wallet = generateWallet();
     const encryptedKey = encrypt(wallet.privateKey);
 
@@ -93,29 +90,31 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// --- Google OAuth2 (Unchanged) ---
+// --- Google OAuth2 ---
 router.get('/google',
   passport.authenticate('google', { scope: ['profile', 'email'] })
 );
 
 router.get('/google/callback',
-  passport.authenticate('google', { failureRedirect: 'http://localhost:3000/login' }),
+  passport.authenticate('google', {
+    failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-stratagies.com/login'
+  }),
   (req, res) => {
     const payload = {
-  user: {
-    id: req.user.user_id,
-    username: req.user.username
-  }
-};
+      user: {
+        id: req.user.user_id,
+        username: req.user.username
+      }
+    };
 
-const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
 
-res.redirect(`http://localhost:3000/oauth-success?token=${token}`);
-
+    const frontend = process.env.FRONTEND_URL || 'https://www.hyper-stratagies.com';
+    res.redirect(`${frontend}/oauth-success?token=${token}`);
   }
 );
 
-// --- New: /me Route (Authenticated) ---
+// --- /me Route ---
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
