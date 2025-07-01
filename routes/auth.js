@@ -97,7 +97,7 @@ router.get('/google',
 
 router.get('/google/callback',
   passport.authenticate('google', {
-    failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-stratagies.com/login'
+    failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login'
   }),
   (req, res) => {
     const payload = {
@@ -109,7 +109,7 @@ router.get('/google/callback',
 
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
 
-    const frontend = process.env.FRONTEND_URL || 'https://www.hyper-stratagies.com';
+    const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
     res.redirect(`${frontend}/oauth-success?token=${token}`);
   }
 );
