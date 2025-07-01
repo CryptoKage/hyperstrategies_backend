@@ -3,7 +3,7 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 
 const ALCHEMY_URL = process.env.ALCHEMY_URL;
-const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL);
+const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL); // Ethereum mainnet is autodetected
 
 async function pollDeposits() {
   try {
