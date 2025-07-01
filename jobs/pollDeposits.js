@@ -3,21 +3,29 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 
 const ALCHEMY_URL = process.env.ALCHEMY_URL;
-console.log('🚀 Using ALCHEMY_URL:', ALCHEMY_URL); // Debug line to verify env var
+console.log('🚀 Using ALCHEMY_URL:', ALCHEMY_URL);
 
-const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL);
+let provider;
 
-// Immediately test network connection
-provider.getNetwork()
-  .then(network => {
+async function initializeProvider() {
+  try {
+    provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL);
+    const network = await provider.getNetwork();
+    const block = await provider.getBlockNumber();
     console.log(`🔌 Connected to Ethereum network: ${network.name} (chainId: ${network.chainId})`);
-  })
-  .catch(err => {
+    console.log(`✅ Alchemy provider connected. Current block number: ${block}`);
+  } catch (err) {
     console.error('❌ Alchemy provider connection failed:', err);
-  });
+  }
+}
 
 async function pollDeposits() {
   try {
+    if (!provider) {
+      console.warn('⚠️ Provider not initialized. Skipping deposit check.');
+      return;
+    }
+
     const { rows: users } = await pool.query(
       `SELECT user_id, eth_address, balance FROM users WHERE eth_address IS NOT NULL`
     );
@@ -35,7 +43,6 @@ async function pollDeposits() {
           `UPDATE users SET balance = $1 WHERE user_id = $2`,
           [ethBalance, user.user_id]
         );
-
         await pool.query(
           `INSERT INTO deposits (user_id, amount) VALUES ($1, $2)`,
           [user.user_id, depositAmount]
@@ -51,4 +58,7 @@ async function pollDeposits() {
   }
 }
 
-module.exports = pollDeposits;
+module.exports = {
+  pollDeposits,
+  initializeProvider,
+};

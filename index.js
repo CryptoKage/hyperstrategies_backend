@@ -56,14 +56,17 @@ app.use('/api/withdraw', withdrawRoutes);
 })();
 
 // --- Start the Server ---
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
 
-  // -- withdraw 
+  // Withdraw route
   app.use('/api/withdraw', require('./routes/withdraw'));
 
-  const pollDeposits = require('./jobs/pollDeposits');
+  // ✅ Init provider and polling loop
+  const { pollDeposits, initializeProvider } = require('./jobs/pollDeposits');
+  await initializeProvider();
+
   setInterval(() => {
     pollDeposits();
-  }, 30_000); // Every 30 seconds
+  }, 30_000); // every 30 seconds
 });
