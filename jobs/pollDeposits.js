@@ -3,16 +3,14 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 
 const ALCHEMY_URL = process.env.ALCHEMY_URL;
-const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL); // Ethereum mainnet is autodetected
 
-// 🧪 Network connection test
-provider.getNetwork()
-  .then(net => {
-    console.log("✅ Connected to Ethereum network:", net.name, "Chain ID:", net.chainId);
-  })
-  .catch(err => {
-    console.error("❌ Network detection failed:", err);
-  });
+// ✅ Explicitly define network: Ethereum Mainnet (name + chainId)
+const network = {
+  name: 'homestead',  // Ethereum mainnet alias
+  chainId: 1
+};
+
+const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL, network);
 
 async function pollDeposits() {
   try {
