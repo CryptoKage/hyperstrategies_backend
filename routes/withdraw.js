@@ -1,0 +1,72 @@
+// server/routes/withdraw.js
+const express = require('express');
+const { ethers } = require('ethers');
+const pool = require('../db');
+const authenticateToken = require('../middleware/authenticateToken');
+const { decrypt } = require('../utils/walletUtils');
+
+const router = express.Router();
+
+router.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { amount, toAddress } = req.body;
+    const userId = req.user.id;
+
+    if (!ethers.utils.isAddress(toAddress)) {
+      return res.status(400).json({ error: 'Invalid ETH address' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT eth_address, eth_private_key_encrypted, balance FROM users WHERE user_id = $1`,
+      [userId]
+    );
+
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const ethAddress = user.eth_address;
+    const decryptedKey = decrypt(user.eth_private_key_encrypted);
+    const balance = parseFloat(user.balance);
+    const amountEth = parseFloat(amount);
+
+    if (amountEth > balance) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    // Set up provider + signer
+    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_URL);
+    const wallet = new ethers.Wallet(decryptedKey, provider);
+
+    const tx = await wallet.sendTransaction({
+      to: toAddress,
+      value: ethers.utils.parseEther(amount.toString()),
+    });
+
+    console.log(`Sent ${amountEth} ETH to ${toAddress} in tx ${tx.hash}`);
+
+    // Save withdrawal + update balance
+    await pool.query('BEGIN');
+
+    await pool.query(
+      `INSERT INTO withdrawals (user_id, to_address, amount, tx_hash, status)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, toAddress, amountEth, tx.hash, 'sent']
+    );
+
+    await pool.query(
+      `UPDATE users SET balance = balance - $1 WHERE user_id = $2`,
+      [amountEth, userId]
+    );
+
+    await pool.query('COMMIT');
+
+    res.json({ success: true, txHash: tx.hash });
+
+  } catch (err) {
+    console.error('Withdraw error:', err);
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to send withdrawal' });
+  }
+});
+
+module.exports = router;
