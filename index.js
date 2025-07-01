@@ -55,11 +55,15 @@ app.use('/api/withdraw', withdrawRoutes);
   }
 })();
 
-// --- Start Server ---
+// --- Start the Server ---
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-});
 
-// --- Deposit Polling ---
-const pollDeposits = require('./jobs/pollDeposits');
-setInterval(pollDeposits, 30_000);
+  // -- withdraw 
+  app.use('/api/withdraw', require('./routes/withdraw'));
+
+  const pollDeposits = require('./jobs/pollDeposits');
+  setInterval(() => {
+    pollDeposits();
+  }, 30_000); // Every 30 seconds
+});

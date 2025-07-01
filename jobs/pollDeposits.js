@@ -3,14 +3,18 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 
 const ALCHEMY_URL = process.env.ALCHEMY_URL;
+console.log('🚀 Using ALCHEMY_URL:', ALCHEMY_URL); // Debug line to verify env var
 
-// ✅ Explicitly define network: Ethereum Mainnet (name + chainId)
-const network = {
-  name: 'homestead',  // Ethereum mainnet alias
-  chainId: 1
-};
+const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL);
 
-const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL, network);
+// Immediately test network connection
+provider.getNetwork()
+  .then(network => {
+    console.log(`🔌 Connected to Ethereum network: ${network.name} (chainId: ${network.chainId})`);
+  })
+  .catch(err => {
+    console.error('❌ Alchemy provider connection failed:', err);
+  });
 
 async function pollDeposits() {
   try {
