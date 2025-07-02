@@ -48,6 +48,15 @@ async function getEthUsdPrice() {
   }
 }
 
+function getTokenAbi() {
+  return [
+    // ✅ Standard ERC20 methods used in polling
+    "function balanceOf(address owner) view returns (uint256)",
+    "function decimals() view returns (uint8)",
+    "function transfer(address to, uint amount) returns (bool)"
+  ];
+}
+
 async function estimateGasForTokenTransfer({ provider, fromAddress, toAddress, tokenAddress, amount }) {
   const tokenAbi = getTokenAbi();
   const contract = new ethers.Contract(tokenAddress, tokenAbi, provider);
