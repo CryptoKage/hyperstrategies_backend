@@ -1,6 +1,7 @@
 // jobs/pollDeposits.js
 const { ethers } = require('ethers');
 const pool = require('../db');
+const { getTokenAddress, getTokenAbi } = require('../utils/withdrawHelpers');
 
 const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
 console.log('🚀 Using ALCHEMY_RPC_URL:', ALCHEMY_RPC_URL);
@@ -30,18 +31,22 @@ async function pollDeposits() {
       `SELECT user_id, eth_address, balance FROM users WHERE eth_address IS NOT NULL`
     );
 
+    const usdcAddress = getTokenAddress('usdc');
+    const usdcAbi = getTokenAbi();
+    const usdcContract = new ethers.Contract(usdcAddress, usdcAbi, provider);
+
     for (const user of users) {
-      const onChainBalance = await provider.getBalance(user.eth_address);
-      const ethBalance = parseFloat(ethers.utils.formatEther(onChainBalance));
+      const onChainRaw = await usdcContract.balanceOf(user.eth_address);
+      const onChainBalance = parseFloat(ethers.utils.formatUnits(onChainRaw, 6));
       const dbBalance = parseFloat(user.balance);
 
-      if (ethBalance > dbBalance) {
-        const depositAmount = ethBalance - dbBalance;
+      if (onChainBalance > dbBalance) {
+        const depositAmount = onChainBalance - dbBalance;
 
         await pool.query('BEGIN');
         await pool.query(
           `UPDATE users SET balance = $1 WHERE user_id = $2`,
-          [ethBalance, user.user_id]
+          [onChainBalance, user.user_id]
         );
         await pool.query(
           `INSERT INTO deposits (user_id, amount) VALUES ($1, $2)`,
@@ -49,7 +54,7 @@ async function pollDeposits() {
         );
         await pool.query('COMMIT');
 
-        console.log(`💰 Detected new deposit of ${depositAmount} ETH for user ${user.user_id}`);
+        console.log(`💰 Detected USDC deposit of $${depositAmount} for user ${user.user_id}`);
       }
     }
   } catch (err) {
