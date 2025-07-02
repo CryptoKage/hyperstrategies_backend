@@ -1,4 +1,5 @@
 const express = require('express');
+const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../db');
@@ -6,7 +7,7 @@ const passport = require('passport');
 const { generateWallet, encrypt } = require('../utils/walletUtils');
 const authenticateToken = require('../middleware/authenticateToken');
 
-const router = express.Router();
+
 
 // --- Registration Endpoint ---
 router.post('/register', async (req, res) => {

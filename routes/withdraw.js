@@ -73,3 +73,5 @@ router.post('/', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Withdrawal failed' });
   }
 });
+
+module.exports = router;
