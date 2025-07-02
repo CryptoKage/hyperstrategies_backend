@@ -1,0 +1,1 @@
+const wallet = new ethers.Wallet(user.privateKey, provider);
