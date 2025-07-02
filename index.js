@@ -41,7 +41,7 @@ app.use('/api/withdraw', withdrawRoutes);
 // Alchemy test
 (async () => {
   try {
-    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_URL);
+    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const block = await provider.getBlockNumber();
     console.log(`✅ Alchemy provider connected. Current block number: ${block}`);
   } catch (err) {

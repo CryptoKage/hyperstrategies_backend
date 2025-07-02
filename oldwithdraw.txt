@@ -39,7 +39,7 @@ router.post('/', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_URL);
+    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const wallet = new ethers.Wallet(decryptedKey, provider);
 
     const tx = await wallet.sendTransaction({
@@ -82,7 +82,7 @@ router.post('/confirm', authenticateToken, async (req, res) => {
 
     const tokenAddress = getTokenAddress(token);
     const userWallet = await getUserWallet(userId);
-    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_URL);
+    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 
     const gasEstimate = await estimateGasForTokenTransfer({
       provider,

@@ -2,14 +2,14 @@
 const { ethers } = require('ethers');
 const pool = require('../db');
 
-const ALCHEMY_URL = process.env.ALCHEMY_URL;
-console.log('🚀 Using ALCHEMY_URL:', ALCHEMY_URL);
+const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
+console.log('🚀 Using ALCHEMY_RPC_URL:', ALCHEMY_RPC_URL);
 
 let provider;
 
 async function initializeProvider() {
   try {
-    provider = new ethers.providers.JsonRpcProvider(ALCHEMY_URL);
+    provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC_URL);
     const network = await provider.getNetwork();
     const block = await provider.getBlockNumber();
     console.log(`🔌 Connected to Ethereum network: ${network.name} (chainId: ${network.chainId})`);

@@ -17,7 +17,7 @@ router.post('/confirm', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid recipient address' });
     }
 
-    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_URL);
+    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const userWallet = await getUserWallet(userId);
     const tokenAddress = getTokenAddress(token);
     const tokenAbi = getTokenAbi();
