@@ -42,7 +42,6 @@ app.use(passport.session());
 // --- Routes ---
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
-app.use('/api/withdraw', withdrawRoutes);
 
 // --- Alchemy Startup Test ---
 (async () => {
