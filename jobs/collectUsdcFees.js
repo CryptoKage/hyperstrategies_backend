@@ -1,4 +1,4 @@
-// jobs/collectUsdcFees.js
+// jobs/collectUsdcFees.js .
 
 const { ethers } = require('ethers');
 const pool = require('../db');
