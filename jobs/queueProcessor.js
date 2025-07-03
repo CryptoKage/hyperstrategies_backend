@@ -2,7 +2,6 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 const { decrypt } = require('../utils/walletUtils');
 const tokenMap = require('../utils/tokens/tokenMap');
-const usdcAbi = require('../utils/tokens/usdcAbi.json');
 const { sendEthFromHotWalletIfNeeded } = require('../utils/gas/sendEthFromHotWalletIfNeeded');
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
@@ -10,76 +9,108 @@ const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_UR
 async function processWithdrawals() {
   console.log('🔄 Checking withdrawal queue...');
 
-  const { rows } = await pool.query(
-    `SELECT * FROM withdrawal_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`
-  );
+  const res = await pool.query(`
+    SELECT * FROM withdrawal_queue
+    WHERE status = 'queued'
+    ORDER BY created_at ASC
+    LIMIT 1
+  `);
 
-  if (rows.length === 0) return;
+  if (res.rows.length === 0) return;
 
-  const withdrawal = rows[0];
-  const { id, user_id, to_address, amount, token } = withdrawal;
-  const floatAmount = parseFloat(amount);
+  const withdrawal = res.rows[0];
+  const { id, user_id, to_address, amount, token, gas_funded } = withdrawal;
 
-  console.log(`⚙️ Processing withdrawal #${id} (${floatAmount} ${token}) to ${to_address}`);
+  console.log(`⚙️ Processing withdrawal #${id} (${amount} ${token}) to ${to_address}`);
 
   try {
-    const userRes = await pool.query(
-      'SELECT eth_address, eth_private_key_encrypted, balance FROM users WHERE user_id = $1',
-      [user_id]
-    );
+    await pool.query(`UPDATE withdrawal_queue SET status = 'processing' WHERE id = $1`, [id]);
 
-    if (userRes.rows.length === 0) {
-      throw new Error(`User ${user_id} not found`);
+    const userRes = await pool.query(`
+      SELECT eth_address, eth_private_key_encrypted, balance FROM users WHERE user_id = $1
+    `, [user_id]);
+
+    const user = userRes.rows[0];
+    const decryptedKey = decrypt(user.eth_private_key_encrypted);
+    const userWallet = new ethers.Wallet(decryptedKey, provider);
+
+    const tokenData = tokenMap[token];
+    if (!tokenData) throw new Error(`❌ Unsupported token ${token}`);
+
+    const contract = new ethers.Contract(tokenData.address, tokenData.abi, userWallet);
+    const parsedAmount = ethers.utils.parseUnits(amount.toString(), tokenData.decimals);
+
+    // Try estimating gas (this will fail if there's not enough ETH)
+    let gasLimit, gasPrice, totalGasCost;
+    try {
+      const txRequest = await contract.populateTransaction.transfer(to_address, parsedAmount);
+      txRequest.from = user.eth_address;
+
+      gasLimit = await provider.estimateGas(txRequest);
+      gasPrice = await provider.getGasPrice();
+      totalGasCost = gasLimit.mul(gasPrice);
+
+      const ethBalance = await provider.getBalance(user.eth_address);
+
+      if (ethBalance.lt(totalGasCost)) {
+        if (!gas_funded) {
+          const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
+          if (txHash) {
+            console.log(`⛽ Funded gas for user ${user.eth_address} with TX: ${txHash}`);
+            await pool.query(`
+              UPDATE withdrawal_queue SET gas_funded = TRUE, retries = retries + 1, status = 'queued'
+              WHERE id = $1
+            `, [id]);
+          } else {
+            console.log(`⚠️ Failed to fund gas for user ${user.eth_address}`);
+          }
+        } else {
+          console.log(`💤 Already funded gas, waiting for ETH to arrive in ${user.eth_address}`);
+        }
+        return;
+      }
+    } catch (gasErr) {
+      console.error(`❌ Failed estimating gas: ${gasErr.message}`);
+      if (!gas_funded) {
+        const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
+        if (txHash) {
+          console.log(`⛽ Funded ETH via hot wallet: ${txHash}`);
+          await pool.query(`
+            UPDATE withdrawal_queue SET gas_funded = TRUE, retries = retries + 1, status = 'queued'
+            WHERE id = $1
+          `, [id]);
+        }
+      }
+      return;
     }
 
-    const { eth_address, eth_private_key_encrypted, balance } = userRes.rows[0];
-    const decryptedPrivateKey = decrypt(eth_private_key_encrypted);
-    const userWallet = new ethers.Wallet(decryptedPrivateKey, provider);
-
-    if (floatAmount > parseFloat(balance)) {
-      throw new Error('Insufficient balance');
-    }
-
-    const tokenInfo = tokenMap[token.toLowerCase()];
-    if (!tokenInfo) throw new Error('Unsupported token');
-
-    // Fund with ETH if needed (now done before estimation)
-    const fundTx = await sendEthFromHotWalletIfNeeded(user_id, eth_address, token, amount);
-    if (fundTx) {
-      console.log(`💸 Hot wallet sent ETH to ${eth_address} for gas, tx: ${fundTx}`);
-      return; // Will retry next poll once funds are confirmed
-    }
-
-    const contract = new ethers.Contract(tokenInfo.address, tokenInfo.abi, userWallet);
-    const decimals = tokenInfo.decimals;
-    const parsedAmount = ethers.utils.parseUnits(amount.toString(), decimals);
-
+    // Proceed with the actual transfer
     const tx = await contract.transfer(to_address, parsedAmount);
+    console.log(`✅ Broadcasted TX: ${tx.hash}`);
 
+    // Update balances & logs
     await pool.query('BEGIN');
-    await pool.query(
-      `INSERT INTO withdrawals (user_id, to_address, amount, token, tx_hash, status)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [user_id, to_address, floatAmount, token, tx.hash, 'sent']
-    );
-    await pool.query(
-      `UPDATE users SET balance = balance - $1, gas_fee_collected = TRUE WHERE user_id = $2`,
-      [floatAmount, user_id]
-    );
-    await pool.query(
-      `UPDATE withdrawal_queue SET status = 'sent' WHERE id = $1`,
-      [id]
-    );
+    await pool.query(`
+      INSERT INTO withdrawals (user_id, to_address, amount, token, tx_hash, status)
+      VALUES ($1, $2, $3, $4, $5, 'sent')
+    `, [user_id, to_address, amount, token, tx.hash]);
+    await pool.query(`
+      UPDATE users SET balance = balance - $1 WHERE user_id = $2
+    `, [amount, user_id]);
+    await pool.query(`
+      DELETE FROM withdrawal_queue WHERE id = $1
+    `, [id]);
     await pool.query('COMMIT');
 
-    console.log(`✅ Sent withdrawal #${id}, tx: ${tx.hash}`);
-
+    console.log(`✅ Withdrawal #${id} completed and recorded.`);
   } catch (err) {
-    console.error(`❌ Failed withdrawal #${id}:`, err.message);
-    await pool.query(
-      `UPDATE withdrawal_queue SET status = 'failed', retries = retries + 1 WHERE id = $1`,
-      [id]
-    );
+    console.error(`❌ Withdrawal #${id} failed: ${err.message}`);
+
+    await pool.query(`
+      UPDATE withdrawal_queue
+      SET status = 'queued', retries = retries + 1
+      WHERE id = $1
+    `, [id]);
   }
 }
 
