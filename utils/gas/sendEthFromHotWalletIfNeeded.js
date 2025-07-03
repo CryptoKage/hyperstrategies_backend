@@ -1,4 +1,4 @@
-// utils/ethGasFunding/sendEthFromHotWalletIfNeeded.js
+// utils/gas/sendEthFromHotWalletIfNeeded.js
 
 const { ethers } = require('ethers');
 const tokenMap = require('../utils/tokens/tokenMap');
