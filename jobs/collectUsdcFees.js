@@ -2,7 +2,7 @@
 
 const { ethers } = require('ethers');
 const pool = require('../db');
-const tokenMap = require('../utils/tokenMap');
+const tokenMap = require('../utils/tokens/tokenMap');
 const usdcAbi = require('../utils/abi/usdc.json');
 const { decrypt } = require('../utils/walletUtils');
 

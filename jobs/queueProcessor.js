@@ -5,7 +5,7 @@ const pool = require('../db');
 const { decrypt } = require('../utils/walletUtils');
 const { sendEthFromHotWalletIfNeeded } = require('../utils/ethGasFunding');
 const estimateTokenTransferGas = require('../utils/gas/estimateTokenTransferGas');
-const tokenMap = require('../utils/tokenMap');
+const tokenMap = require('../utils/tokens/tokenMap');
 const usdcAbi = require('../utils/abis/usdcAbi.json');
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
