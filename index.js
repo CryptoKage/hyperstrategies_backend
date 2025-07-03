@@ -60,4 +60,10 @@ app.listen(PORT, async () => {
   setInterval(() => {
     pollDeposits();
   }, 30_000);
+
+  const { processWithdrawals } = require('./jobs/queueProcessor');
+
+setInterval(() => {
+  processWithdrawals();
+}, 45_000); // run every 45s
 });
