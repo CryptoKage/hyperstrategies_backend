@@ -53,6 +53,7 @@ router.post('/confirm', authenticateToken, async (req, res) => {
 
 // Withdraw Route
 router.post('/', authenticateToken, async (req, res) => {
+  console.log("🔥 Received POST /api/withdraw request");
   try {
     const { amount, toAddress, token = 'eth' } = req.body;
     const userId = req.user.id;
