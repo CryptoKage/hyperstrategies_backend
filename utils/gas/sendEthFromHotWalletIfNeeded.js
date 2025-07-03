@@ -1,47 +1,69 @@
+// utils/sendEthFromHotWalletIfNeeded.js
 const { ethers } = require('ethers');
-const pool = require('../../db');
-
+const fetch = require('node-fetch');
+const pool = require('../db');
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const hotWallet = new ethers.Wallet(process.env.HOT_WALLET_PRIVATE_KEY, provider);
 
-/**
- * Sends ETH from the hot wallet to the user address if gas is insufficient.
- * @param {string} userId - UUID of the user in DB
- * @param {string} userAddress - Ethereum address of the user
- */
+async function getEthPriceUSD() {
+  const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd");
+  const data = await res.json();
+  return data.ethereum.usd;
+}
+
 async function sendEthFromHotWalletIfNeeded(userId, userAddress) {
   const balance = await provider.getBalance(userAddress);
-  const gasPrice = await provider.getGasPrice();
-  const estimatedGasLimit = ethers.BigNumber.from(55000); // Typical ERC20 tx
-  const estimatedGasCost = gasPrice.mul(estimatedGasLimit);
+  const balanceEth = parseFloat(ethers.utils.formatEther(balance));
 
-  // Add a 10% buffer
-  const buffer = estimatedGasCost.mul(10).div(100);
-  const totalNeeded = estimatedGasCost.add(buffer);
+  const MIN_BALANCE = 0.0001;
+  const FUND_AMOUNT = 0.0005;
+  const FUND_CAP = 0.005; // safeguard: max 0.005 ETH ever sent per wallet
 
-  if (balance.gte(totalNeeded)) {
-    return null; // Enough ETH, do nothing
+  if (balanceEth >= MIN_BALANCE) return null;
+
+  // Check historical funding total
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(amount_eth), 0) AS total_sent FROM hot_wallet_funding_log WHERE user_id = $1`,
+    [userId]
+  );
+  const totalSent = parseFloat(rows[0].total_sent);
+  if (totalSent + FUND_AMOUNT > FUND_CAP) {
+    console.warn(`⛔ User ${userId} reached funding cap`);
+    return null;
   }
-
-  // Cap funding to 0.001 ETH
-  const cap = ethers.utils.parseEther("0.007");
-  const amountToSend = totalNeeded.gt(cap) ? cap : totalNeeded;
 
   const tx = await hotWallet.sendTransaction({
     to: userAddress,
-    value: amountToSend,
+    value: ethers.utils.parseEther(FUND_AMOUNT.toString())
   });
 
-  await pool.query(`
-    INSERT INTO hot_wallet_funding_log (user_id, to_address, amount_eth, tx_hash)
-    VALUES ($1, $2, $3, $4)
-  `, [userId, userAddress, ethers.utils.formatEther(amountToSend), tx.hash]);
+  const ethPrice = await getEthPriceUSD();
+  const usdcCharge = parseFloat(FUND_AMOUNT) * ethPrice * 1.01; // +1%
 
-  console.log(`🚀 Funded ${ethers.utils.formatEther(amountToSend)} ETH to ${userAddress} from hot wallet`);
+  await pool.query('BEGIN');
+
+  await pool.query(
+    `INSERT INTO hot_wallet_funding_log (user_id, to_address, amount_eth, tx_hash)
+     VALUES ($1, $2, $3, $4)`,
+    [userId, userAddress, FUND_AMOUNT, tx.hash]
+  );
+
+  await pool.query(
+    `INSERT INTO gas_fees_log (user_id, eth_sent, eth_price_usd, usdc_charged, tx_hash)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [userId, FUND_AMOUNT, ethPrice, usdcCharge.toFixed(6), tx.hash]
+  );
+
+  await pool.query(
+    `UPDATE users SET balance = balance - $1 WHERE user_id = $2`,
+    [usdcCharge.toFixed(6), userId]
+  );
+
+  await pool.query('COMMIT');
+
+  console.log(`🚀 Funded ${FUND_AMOUNT} ETH to ${userAddress}, charged ${usdcCharge.toFixed(2)} USDC`);
 
   return tx.hash;
 }
 
-module.exports = {
-  sendEthFromHotWalletIfNeeded
-};
+module.exports = { sendEthFromHotWalletIfNeeded };
