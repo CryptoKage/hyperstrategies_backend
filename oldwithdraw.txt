@@ -111,3 +111,4 @@ router.post('/confirm', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+
