@@ -19,7 +19,7 @@ async function processWithdrawals() {
   if (res.rows.length === 0) return;
 
   const withdrawal = res.rows[0];
-  const { id, user_id, to_address, amount, token, gas_funded } = withdrawal;
+  const { id, user_id, to_address, amount, token, gas_funded, last_gas_fund_attempt } = withdrawal;
 
   console.log(`⚙️ Processing withdrawal #${id} (${amount} ${token}) to ${to_address}`);
 
@@ -40,63 +40,74 @@ async function processWithdrawals() {
     const contract = new ethers.Contract(tokenData.address, tokenData.abi, userWallet);
     const parsedAmount = ethers.utils.parseUnits(amount.toString(), tokenData.decimals);
 
-    // Try estimating gas (this will fail if there's not enough ETH)
-    let gasLimit, gasPrice, totalGasCost;
+    // Estimate gas cost
     try {
       const txRequest = await contract.populateTransaction.transfer(to_address, parsedAmount);
       txRequest.from = user.eth_address;
 
-      gasLimit = await provider.estimateGas(txRequest);
-      gasPrice = await provider.getGasPrice();
-      totalGasCost = gasLimit.mul(gasPrice);
+      const gasLimit = await provider.estimateGas(txRequest);
+      const gasPrice = await provider.getGasPrice();
+      const totalGasCost = gasLimit.mul(gasPrice);
 
       const ethBalance = await provider.getBalance(user.eth_address);
 
- if (ethBalance.lt(totalGasCost)) {
-  console.log(`⚠️ ${user.eth_address} has insufficient ETH (${ethers.utils.formatEther(ethBalance)}), needs ${ethers.utils.formatEther(totalGasCost)}.`);
+      if (ethBalance.lt(totalGasCost)) {
+        console.log(`⚠️ ${user.eth_address} has insufficient ETH (${ethers.utils.formatEther(ethBalance)}), needs ${ethers.utils.formatEther(totalGasCost)}.`);
 
-  let txHash = null;
+        const now = new Date();
+        const lastAttempt = last_gas_fund_attempt ? new Date(last_gas_fund_attempt) : null;
+        const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
 
-  if (!gas_funded) {
-    txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
+        if (!gas_funded && minutesSinceLast > 2) {
+          const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
+          if (txHash) {
+            console.log(`⛽ Funded gas for ${user.eth_address} with TX: ${txHash}`);
+            await pool.query(`
+              UPDATE withdrawal_queue
+              SET gas_funded = TRUE, retries = retries + 1, status = 'queued', last_gas_fund_attempt = NOW()
+              WHERE id = $1
+            `, [id]);
+          } else {
+            console.log(`⚠️ Hot wallet funding failed or already pending for ${user.eth_address}`);
+            await pool.query(`UPDATE withdrawal_queue SET last_gas_fund_attempt = NOW() WHERE id = $1`, [id]);
+          }
+        } else {
+          console.log(`💤 Already funded or retrying too soon (waited ${minutesSinceLast.toFixed(1)} mins).`);
+        }
 
-    if (txHash) {
-      console.log(`⛽ Funded gas for user ${user.eth_address} with TX: ${txHash}`);
-      await pool.query(`
-        UPDATE withdrawal_queue
-        SET gas_funded = TRUE, retries = retries + 1, status = 'queued'
-        WHERE id = $1
-      `, [id]);
-    } else {
-      console.log(`⚠️ Could not fund ${user.eth_address} with ETH — likely already pending or failed.`);
-    }
-  } else {
-    console.log(`💤 Already funded gas, waiting for ETH to arrive in ${user.eth_address}`);
-  }
-
-  return;
-}
-
+        return;
+      }
     } catch (gasErr) {
-      console.error(`❌ Failed estimating gas: ${gasErr.message}`);
-      if (!gas_funded) {
+      console.error(`❌ Gas estimate failed: ${gasErr.message}`);
+
+      const now = new Date();
+      const lastAttempt = last_gas_fund_attempt ? new Date(last_gas_fund_attempt) : null;
+      const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
+
+      if (!gas_funded && minutesSinceLast > 2) {
         const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
         if (txHash) {
           console.log(`⛽ Funded ETH via hot wallet: ${txHash}`);
           await pool.query(`
-            UPDATE withdrawal_queue SET gas_funded = TRUE, retries = retries + 1, status = 'queued'
+            UPDATE withdrawal_queue
+            SET gas_funded = TRUE, retries = retries + 1, status = 'queued', last_gas_fund_attempt = NOW()
             WHERE id = $1
           `, [id]);
+        } else {
+          console.log(`⚠️ Could not fund gas after estimation failure.`);
+          await pool.query(`UPDATE withdrawal_queue SET last_gas_fund_attempt = NOW() WHERE id = $1`, [id]);
         }
+      } else {
+        console.log(`💤 Skipping gas retry; either already funded or throttled.`);
       }
+
       return;
     }
 
-    // Proceed with the actual transfer
+    // Broadcast transaction
     const tx = await contract.transfer(to_address, parsedAmount);
     console.log(`✅ Broadcasted TX: ${tx.hash}`);
 
-    // Update balances & logs
     await pool.query('BEGIN');
     await pool.query(`
       INSERT INTO withdrawals (user_id, to_address, amount, token, tx_hash, status)
