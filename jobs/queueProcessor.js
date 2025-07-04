@@ -59,7 +59,8 @@ async function processWithdrawals() {
         const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
 
         if (!gas_funded && minutesSinceLast > 2) {
-          const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
+          const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address, token, amount);
+
           if (txHash) {
             console.log(`⛽ Funded gas for ${user.eth_address} with TX: ${txHash}`);
             await pool.query(`
@@ -85,7 +86,8 @@ async function processWithdrawals() {
       const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
 
       if (!gas_funded && minutesSinceLast > 2) {
-        const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address);
+        const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address, token, amount);
+
         if (txHash) {
           console.log(`⛽ Funded ETH via hot wallet: ${txHash}`);
           await pool.query(`
