@@ -8,10 +8,11 @@ const pool = require('../../db');
 
 const hotWallet = new ethers.Wallet(process.env.HOT_WALLET_PRIVATE_KEY, provider);
 
-console.log(`🔁 Checking if ${userAddress} needs ETH for ${amount} ${token}`);
+
 
 
 async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc', amount = '0') {
+console.log(`🔁 Checking if ${userAddress} needs ETH for ${amount} ${token}`);  
   const userBalance = await provider.getBalance(userAddress);
   const userEth = parseFloat(ethers.utils.formatEther(userBalance));
 
