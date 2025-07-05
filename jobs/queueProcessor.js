@@ -88,6 +88,9 @@ async function processWithdrawals() {
       const now = new Date();
       const lastAttempt = last_gas_fund_attempt ? new Date(last_gas_fund_attempt) : null;
       const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
+      
+console.log(`🧪 gas_funded = ${gas_funded}, last_gas_fund_attempt = ${last_gas_fund_attempt}`);
+console.log(`🕒 Minutes since last attempt: ${minutesSinceLast.toFixed(2)}`);
 
       if (!gas_funded && minutesSinceLast > 2) {
         const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address, token, amount);
