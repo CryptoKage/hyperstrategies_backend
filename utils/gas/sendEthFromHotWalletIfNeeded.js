@@ -27,29 +27,26 @@ console.log(`🔁 Checking if ${userAddress} needs ETH for ${amount} ${token}`);
 
   tx.from = userAddress;
 
-  let gasEstimate, gasPrice;
-  try {
-    gasEstimate = await provider.estimateGas(tx);
-    gasPrice = await provider.getGasPrice();
-    console.log(`🧮 Estimated gas: ${gasEstimate.toString()}, price: ${gasPrice.toString()}, total: ${ethers.utils.formatEther(totalGasCost)} ETH`);
-  } catch (err) {
-    console.error('🔻 Gas estimation failed:', err);
-    return null;
-  }
+let gasEstimate, gasPrice, totalGasCost;
+try {
+  gasEstimate = await provider.estimateGas(tx);
+  gasPrice = await provider.getGasPrice();
+  totalGasCost = gasEstimate.mul(gasPrice);
+  console.log(`🧮 Estimated gas: ${gasEstimate.toString()}, price: ${gasPrice.toString()}, total: ${ethers.utils.formatEther(totalGasCost)} ETH`);
+} catch (err) {
+  console.error('🔻 Gas estimation failed:', err);
+  return null;
+}
 
-  const totalGasCost = gasEstimate.mul(gasPrice);
-  
-  // 👉 Increase buffer from 1% to 10%
-  const buffer = totalGasCost.mul(110).div(100); // add 10%
-  const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
+// 👉 Increase buffer from 1% to 10%
+const buffer = totalGasCost.mul(110).div(100);
+const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
 
-  // ✅ Add detailed logging to show why we’re skipping funding
-    if (userEth >= bufferEth) {
-      console.log(`✅ Wallet has ${userEth.toFixed(6)} ETH, which covers buffered gas cost ${bufferEth.toFixed(6)}. Skipping hot wallet funding.`);
-    return null;
-  }
-  
-  if (userEth >= bufferEth) return null; // Sufficient ETH
+if (userEth >= bufferEth) {
+  console.log(`✅ Wallet has ${userEth.toFixed(6)} ETH, which covers buffered gas cost ${bufferEth.toFixed(6)}. Skipping hot wallet funding.`);
+  return null;
+}
+
 
   const ethNeeded = bufferEth - userEth;
 

@@ -93,6 +93,8 @@ console.log(`🧪 gas_funded = ${gas_funded}, last_gas_fund_attempt = ${last_gas
 console.log(`🕒 Minutes since last attempt: ${minutesSinceLast.toFixed(2)}`);
 
       if (!gas_funded && minutesSinceLast > 2) {
+          console.log(`💥 Triggering hot wallet funding because gas_funded=${gas_funded} and ${minutesSinceLast.toFixed(2)} mins have passed`);
+  
         const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address, token, amount);
 
         if (txHash) {
