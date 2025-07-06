@@ -31,12 +31,14 @@ console.log(`🔁 Checking if ${userAddress} needs ETH for ${amount} ${token}`);
   try {
     gasEstimate = await provider.estimateGas(tx);
     gasPrice = await provider.getGasPrice();
+    console.log(`🧮 Estimated gas: ${gasEstimate.toString()}, price: ${gasPrice.toString()}, total: ${ethers.utils.formatEther(totalGasCost)} ETH`);
   } catch (err) {
     console.error('🔻 Gas estimation failed:', err);
     return null;
   }
 
   const totalGasCost = gasEstimate.mul(gasPrice);
+  
   // 👉 Increase buffer from 1% to 10%
   const buffer = totalGasCost.mul(110).div(100); // add 10%
   const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
