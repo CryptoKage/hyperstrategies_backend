@@ -37,9 +37,16 @@ console.log(`🔁 Checking if ${userAddress} needs ETH for ${amount} ${token}`);
   }
 
   const totalGasCost = gasEstimate.mul(gasPrice);
-  const buffer = totalGasCost.mul(101).div(100); // add 1%
+  // 👉 Increase buffer from 1% to 10%
+  const buffer = totalGasCost.mul(110).div(100); // add 10%
   const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
 
+  // ✅ Add detailed logging to show why we’re skipping funding
+    if (userEth >= bufferEth) {
+      console.log(`✅ Wallet has ${userEth.toFixed(6)} ETH, which covers buffered gas cost ${bufferEth.toFixed(6)}. Skipping hot wallet funding.`);
+    return null;
+  }
+  
   if (userEth >= bufferEth) return null; // Sufficient ETH
 
   const ethNeeded = bufferEth - userEth;
