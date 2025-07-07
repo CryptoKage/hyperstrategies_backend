@@ -75,8 +75,8 @@ async function processWithdrawals() {
   }
 
   const tx = await contract.transfer(to_address, parsedAmount, {
-    gasLimit: 50000
-  });
+  gasLimit: 60000
+});
   console.log(`✅ Broadcasted TX: ${tx.hash}`);
 
   await pool.query('BEGIN');
