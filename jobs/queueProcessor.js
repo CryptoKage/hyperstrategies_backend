@@ -33,25 +33,28 @@ async function processWithdrawals() {
   const parsedAmount = ethers.utils.parseUnits(amount.toString(), tokenData.decimals);
 
   try {
-    const txReq = await contract.populateTransaction.transfer(to_address, parsedAmount);
-    txReq.from = user.eth_address;
+    const txRequest = await contract.populateTransaction.transfer(to_address, parsedAmount);
+    txRequest.from = user.eth_address;
 
-    const gasLimit = await provider.estimateGas(txReq);
+    const gasEstimate = await provider.estimateGas(txRequest);
     const gasPrice = await provider.getGasPrice();
-    const totalGasCost = gasLimit.mul(gasPrice);
+    const totalGasCost = gasEstimate.mul(gasPrice);
+
     const ethBalance = await provider.getBalance(user.eth_address);
+    const now = new Date();
+    const lastAttempt = last_gas_fund_attempt ? new Date(last_gas_fund_attempt) : null;
+    const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
+
     console.log(`📊 Gas check: cost=${ethers.utils.formatEther(totalGasCost)}, balance=${ethers.utils.formatEther(ethBalance)}`);
 
     if (ethBalance.lt(totalGasCost)) {
       console.log(`⚠️ Insufficient ETH (${ethers.utils.formatEther(ethBalance)}) for gas cost.`);
-      const now = new Date();
-      const lastAttempt = last_gas_fund_attempt ? new Date(last_gas_fund_attempt) : null;
-      const minutesSinceLast = lastAttempt ? (now - lastAttempt) / 60000 : Infinity;
       console.log(`🧪 gas_funded=${gas_funded}, minutesSinceLast=${minutesSinceLast.toFixed(1)}`);
 
       if (!gas_funded && minutesSinceLast > 2) {
         console.log(`🚀 Triggering hot wallet funding`);
         const txHash = await sendEthFromHotWalletIfNeeded(user_id, user.eth_address, token, amount);
+
         if (txHash) {
           console.log(`⛽ Hot wallet funded tx: ${txHash}`);
           await pool.query(`
@@ -59,24 +62,23 @@ async function processWithdrawals() {
             SET gas_funded = TRUE, retries = retries + 1, status = 'queued', last_gas_fund_attempt = NOW()
             WHERE id = $1
           `, [id]);
-        } else {
-          console.log(`⚠️ No txHash returned — either skip or error`);
-          await pool.query(`UPDATE withdrawal_queue SET last_gas_fund_attempt = NOW() WHERE id = $1`, [id]);
         }
       } else {
-        console.log(`🛑 Skipping funding: !gas_funded=${!gas_funded}, waited>2min=${minutesSinceLast>2}`);
+        console.log(`🛑 Skipping funding: !gas_funded=${!gas_funded}, waited>2min=${minutesSinceLast > 2}`);
       }
-      return; // skip withdraw until funded
+
+      return;
     }
-  } catch (err) {
-    console.error(`❌ Error estimating gas: ${err.message}`);
-    // similar funding logic here if you want...
+  } catch (gasErr) {
+    console.error(`❌ Gas estimate failed: ${gasErr.message}`);
     return;
   }
 
-  // If we reach here, there's enough ETH
-  const tx = await contract.transfer(to_address, parsedAmount);
-  console.log(`✅ Sent withdrawal TX: ${tx.hash}`);
+  const tx = await contract.transfer(to_address, parsedAmount, {
+    gasLimit: 50000
+  });
+  console.log(`✅ Broadcasted TX: ${tx.hash}`);
+
   await pool.query('BEGIN');
   await pool.query(`
     INSERT INTO withdrawals (user_id, to_address, amount, token, tx_hash, status)
