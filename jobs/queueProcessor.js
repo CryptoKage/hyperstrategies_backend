@@ -27,7 +27,7 @@ async function processWithdrawals() {
   const user = userRes.rows[0];
   const decryptedKey = decrypt(user.eth_private_key_encrypted);
   const userWallet = new ethers.Wallet(decryptedKey, provider);
-  const tokenData = tokenMap[token];
+  const tokenData = tokenMap[token.toLowerCase()];
   if (!tokenData) throw new Error(`Unsupported token ${token}`);
   const contract = new ethers.Contract(tokenData.address, tokenData.abi, userWallet);
   const parsedAmount = ethers.utils.parseUnits(amount.toString(), tokenData.decimals);

@@ -1,26 +1,23 @@
 // server/routes/withdraw.js
+
 const express = require('express');
-const { ethers } = require('ethers');
+const { ethers } = require('ethers'); // Correctly imports the full ethers library
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 
 const router = express.Router();
 
 // --- Queue a New Withdrawal Endpoint ---
-// Your existing code - this is correct.
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    // Note: The frontend sends 'toAddress', but your code expects it as 'to_address' in the queue.
-    // It's good practice to align these. Let's handle it here for now.
     const { toAddress, amount, token = 'USDC' } = req.body;
     const userId = req.user.id;
 
-    if (!ethers.utils.isAddress(toAddress)) {
+    // ✅ THE FIX: Use the correct ethers v6 syntax
+    if (!ethers.isAddress(toAddress)) {
       return res.status(400).json({ message: 'Invalid ETH address' });
     }
 
-    // Check balance
-    // This correctly checks the user's main 'balance' column.
     const { rows } = await pool.query(`SELECT balance FROM users WHERE user_id = $1`, [userId]);
     const userBalance = parseFloat(rows[0]?.balance || 0);
     const amountFloat = parseFloat(amount);
@@ -29,7 +26,6 @@ router.post('/', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'Insufficient balance' });
     }
 
-    // Insert into queue
     await pool.query(
       `INSERT INTO withdrawal_queue (user_id, to_address, amount, token)
        VALUES ($1, $2, $3, $4)`,
@@ -50,33 +46,18 @@ router.post('/', authenticateToken, async (req, res) => {
 });
 
 
-// --- ✅ ADDED: Get User's Withdrawal History Endpoint ---
+// --- Get User's Withdrawal History Endpoint ---
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // This query gets records from both the queue and the final 'withdrawals' table,
-    // combines them, and orders them by most recent first.
+    // This query now includes the 'error_message' column for better UX
     const query = `
-      (SELECT 
-        id, 
-        amount, 
-        token, 
-        to_address, 
-        status, 
-        created_at,
-        tx_hash
-      FROM withdrawal_queue WHERE user_id = $1)
+      SELECT id, amount, token, to_address, status, created_at, tx_hash, error_message
+      FROM withdrawal_queue WHERE user_id = $1
       UNION ALL
-      (SELECT 
-        id, 
-        amount, 
-        token, 
-        to_address, 
-        'Sent' as status, -- We hardcode the status for completed withdrawals
-        created_at,
-        tx_hash
-      FROM withdrawals WHERE user_id = $1)
+      SELECT id, amount, token, to_address, 'Sent' as status, created_at, tx_hash, NULL as error_message
+      FROM withdrawals WHERE user_id = $1
       ORDER BY created_at DESC
     `;
 
