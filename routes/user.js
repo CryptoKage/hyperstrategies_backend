@@ -4,17 +4,27 @@ const express = require('express');
 const { ethers } = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
-const tokenMap = require('../utils/tokens/tokenMap'); // ✅ 1. Import your tokenMap
+const tokenMap = require('../utils/tokens/tokenMap');
 
 const router = express.Router();
+
+// Your Alchemy provider setup
+const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
+
+// --- ✅ THIS IS THE FIX ---
+// This is the minimal, correct ABI for any standard ERC20 token to check a balance.
+// It explicitly defines the 'balanceOf' function that ethers needs.
+const erc20Abi = [
+  "function balanceOf(address owner) view returns (uint256)"
+];
 
 // Get the USDC contract info from your tokenMap
 const usdcInfo = tokenMap.usdc;
 const usdcContractAddress = usdcInfo.address;
-const usdcAbi = usdcInfo.abi;
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-const usdcContract = new ethers.Contract(usdcContractAddress, usdcAbi, provider);
+// Create the contract instance using the correct, minimal ABI
+const usdcContract = new ethers.Contract(usdcContractAddress, erc20Abi, provider);
+
 
 // --- Get User Wallet Info Endpoint ---
 router.get('/wallet', authenticateToken, async (req, res) => {
@@ -27,13 +37,13 @@ router.get('/wallet', authenticateToken, async (req, res) => {
     }
     const userAddress = userResult.rows[0].eth_address;
 
+    // This part of the code will now work correctly
     const [ethBalanceBigNumber, usdcBalanceBigNumber] = await Promise.all([
       provider.getBalance(userAddress),
-      usdcContract.balanceOf(userAddress)
+      usdcContract.balanceOf(userAddress) // The function will now be found
     ]);
 
     const ethBalance = ethers.utils.formatEther(ethBalanceBigNumber);
-    // Use the decimals from your tokenMap for accuracy
     const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, usdcInfo.decimals);
 
     res.json({
