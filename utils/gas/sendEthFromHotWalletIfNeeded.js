@@ -26,7 +26,7 @@ async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc',
 
   let gasEstimate, gasPrice, totalGasCost;
     try {
-      gasEstimate = ethers.BigNumber.from(60000); // override fixed limit
+      gasEstimate = ethers.BigNumber.from(100000); // override fixed limit
       gasPrice = await provider.getGasPrice();
       totalGasCost = gasEstimate.mul(gasPrice);
       console.log(`🧮 Using fallback gas: limit=${gasEstimate.toString()}, price=${gasPrice.toString()}, total=${ethers.utils.formatEther(totalGasCost)} ETH`);
@@ -45,7 +45,8 @@ async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc',
   }
 
   const ethNeeded = bufferEth - userEth;
-  console.log(`💸 Funding ${ethNeeded.toFixed(6)} ETH to ${userAddress} for gas`);
+  console.log(`🧾 Funding ${ethNeeded.toFixed(6)} ETH for estimated cost of ${ethers.utils.formatEther(totalGasCost)} ETH`);
+
 
   const txReceipt = await hotWallet.sendTransaction({
     to: userAddress,
