@@ -36,7 +36,7 @@ async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc',
     }
 
 
-  const buffer = totalGasCost.mul(110).div(100); // 10% buffer
+  const buffer = totalGasCost.mul(115).div(100); // 15% buffer
   const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
 
   if (userEth >= bufferEth) {

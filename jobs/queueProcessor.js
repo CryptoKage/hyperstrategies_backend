@@ -36,7 +36,8 @@ async function processWithdrawals() {
     const txRequest = await contract.populateTransaction.transfer(to_address, parsedAmount);
     txRequest.from = user.eth_address;
 
-    const gasEstimate = await provider.estimateGas(txRequest);
+    const FIXED_GAS_LIMIT = ethers.BigNumber.from(60000); // 💡 match what we use in the actual send
+gasEstimate = FIXED_GAS_LIMIT;
     const gasPrice = await provider.getGasPrice();
     const totalGasCost = gasEstimate.mul(gasPrice);
 

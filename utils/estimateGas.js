@@ -25,7 +25,8 @@ async function estimateTokenTransferGas(tokenSymbol, from, to, amount) {
 
     txRequest.from = from;
 
-    const gasEstimate = await provider.estimateGas(txRequest);
+    const FIXED_GAS_LIMIT = ethers.BigNumber.from(60000); // 💡 match what we use in the actual send
+gasEstimate = FIXED_GAS_LIMIT;
     const gasPrice = await provider.getGasPrice();
 
     const ethCost = gasEstimate.mul(gasPrice);
