@@ -16,7 +16,7 @@ async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc',
   const tokenInfo = tokenMap[token];
   const contract = new ethers.Contract(tokenInfo.address, usdcAbi, provider);
 
-  let gasEstimate, gasPrice, totalGasCost;
+  let gasEstimate, feeData, totalGasCost;
   try {
     const tx = await contract.populateTransaction.transfer(
       userAddress,
@@ -25,19 +25,21 @@ async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc',
     tx.from = userAddress;
 
     gasEstimate = await provider.estimateGas(tx);
-    gasPrice = await provider.getGasPrice();
+    feeData = await provider.getFeeData();
+
+    const gasPrice = feeData.maxFeePerGas || await provider.getGasPrice();
     totalGasCost = gasEstimate.mul(gasPrice);
 
-    console.log(`🧮 Estimated gas: limit=${gasEstimate.toString()}, price=${gasPrice.toString()}, total=${ethers.utils.formatEther(totalGasCost)} ETH`);
+    console.log(`🧮 Estimated gas: limit=${gasEstimate}, price=${gasPrice}, total=${ethers.utils.formatEther(totalGasCost)} ETH`);
   } catch (err) {
     console.error('🔻 Gas estimation failed:', err);
     return null;
   }
 
-  const buffer = totalGasCost.mul(110).div(100); // +10%
+  // Minimum buffer to avoid surprises
+  const buffer = totalGasCost.mul(130).div(100); // +30%
   const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
-
-  const MIN_ETH_FOR_GAS = 0.0002; // ⬅️ hard minimum in case gas estimate is too low
+  const MIN_ETH_FOR_GAS = 0.0003; // safer floor
   const requiredEth = Math.max(bufferEth, MIN_ETH_FOR_GAS);
 
   if (userEth >= requiredEth) {
@@ -45,7 +47,8 @@ async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc',
     return null;
   }
 
-  const ethToSend = Math.ceil((requiredEth - userEth) * 1e6) / 1e6; // round up to 6 decimals
+  // Round up ETH to 6 decimals
+  const ethToSend = Math.ceil((requiredEth - userEth) * 1e6) / 1e6;
   console.log(`💸 Funding ${ethToSend} ETH to ${userAddress} for gas`);
 
   const txReceipt = await hotWallet.sendTransaction({
