@@ -24,7 +24,7 @@ router.get('/', authenticateToken, async (req, res) => {
         v.status,
         v.max_cap,
         v.wallet_address,
-        COALESCE(uvp.amount_deposited, 0) AS amount_deposited,
+        COALESCE(uvp.tradable_capital, 0) AS tradable_capital,
         COALESCE(uvp.pnl, 0) AS pnl
       FROM vaults v
       LEFT JOIN user_vault_positions uvp
@@ -34,7 +34,7 @@ router.get('/', authenticateToken, async (req, res) => {
     const allVaults = vaultsResult.rows;
 
     // 3. Total portfolio = user balance + all vault deposits
-    const vaultTotal = allVaults.reduce((sum, vault) => sum + parseFloat(vault.amount_deposited), 0);
+    const vaultTotal = allVaults.reduce((sum, vault) => sum + parseFloat(vault.tradable_capital), 0);
     const totalPortfolioValue = parseFloat(userData.balance) + vaultTotal;
 
     const dashboardData = {

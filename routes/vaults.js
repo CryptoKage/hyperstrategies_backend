@@ -50,13 +50,13 @@ router.post('/invest', authenticateToken, async (req, res) => {
     if (existingPosition.rows.length > 0) {
       // User already has a position, so we add to it
       await client.query(
-        'UPDATE user_vault_positions SET amount_deposited = amount_deposited + $1 WHERE user_id = $2 AND vault_id = $3',
+        'UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3',
         [tradableAmount, userId, vaultId]
       );
     } else {
       // This is the user's first investment in this vault
       await client.query(
-        'INSERT INTO user_vault_positions (user_id, vault_id, amount_deposited) VALUES ($1, $2, $3)',
+        'INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital) VALUES ($1, $2, $3)',
         [userId, vaultId, tradableAmount]
       );
     }
