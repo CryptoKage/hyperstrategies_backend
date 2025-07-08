@@ -14,6 +14,7 @@ dotenv.config();
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const withdrawRoutes = require('./routes/withdraw');
+const vaultsRoutes = require('./routes/vaults');
 require('./passport-setup');
 
 const app = express();
@@ -37,6 +38,7 @@ app.use(passport.session());
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/withdraw', withdrawRoutes);
+app.use('/api/vaults', vaultsRoutes);
 
 // Alchemy test
 (async () => {
