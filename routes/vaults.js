@@ -63,7 +63,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
     
     // 4. Record the 20% as Loyalty Points
     await client.query(
-      'INSERT INTO loyalty_points (user_id, points_amount) VALUES ($1, $2)',
+      'INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)',
       [userId, loyaltyPointsAmount]
     );
 
