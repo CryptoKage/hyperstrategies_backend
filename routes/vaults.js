@@ -1,58 +1,58 @@
 // server/routes/vaults.js
 
 const express = require('express');
+const { ethers } = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 
 const router = express.Router();
 
 // --- Allocate Funds to Vault Endpoint ---
-// This is your existing, correct code.
 router.post('/invest', authenticateToken, async (req, res) => {
   const { vaultId, amount } = req.body;
   const userId = req.user.id;
   const client = await pool.connect();
 
   try {
-    const totalAmount = parseFloat(amount);
-    if (isNaN(totalAmount) || totalAmount <= 0) {
+    // Using BigNumber for precision (assuming 6 decimals for amounts)
+    const totalAmount_BN = ethers.utils.parseUnits(amount.toString(), 6);
+
+    if (totalAmount_BN.isNegative() || totalAmount_BN.isZero()) {
       return res.status(400).json({ error: 'Invalid allocation amount.' });
     }
 
     const userResult = await client.query('SELECT balance FROM users WHERE user_id = $1', [userId]);
-    const availableBalance = parseFloat(userResult.rows[0].balance);
+    const availableBalance_BN = ethers.utils.parseUnits(userResult.rows[0].balance.toString(), 6);
 
-    if (availableBalance < totalAmount) {
+    if (availableBalance_BN.lt(totalAmount_BN)) {
       return res.status(400).json({ error: 'Insufficient funds.' });
     }
 
     await client.query('BEGIN');
 
-    const tradableAmount = totalAmount * 0.80;
-    const bonusPointsAmount = totalAmount * 0.20;
+    const tradableAmount_BN = totalAmount_BN.mul(80).div(100);
+    const bonusPointsAmount_BN = totalAmount_BN.mul(20).div(100);
 
-    await client.query('UPDATE users SET balance = balance - $1 WHERE user_id = $2', [totalAmount, userId]);
+    const newBalance_BN = availableBalance_BN.sub(totalAmount_BN);
+    await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
 
-    const existingPosition = await client.query(
-      'SELECT position_id FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2',
-      [userId, vaultId]
-    );
+    const existingPosition = await client.query('SELECT tradable_capital FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
 
     if (existingPosition.rows.length > 0) {
-      await client.query(
-        'UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3',
-        [tradableAmount, userId, vaultId]
-      );
+      const currentCapital_BN = ethers.utils.parseUnits(existingPosition.rows[0].tradable_capital.toString(), 6);
+      const newCapital_BN = currentCapital_BN.add(tradableAmount_BN);
+      await client.query('UPDATE user_vault_positions SET tradable_capital = $1 WHERE user_id = $2 AND vault_id = $3', [ethers.utils.formatUnits(newCapital_BN, 6), userId, vaultId]);
     } else {
-      await client.query(
-        'INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital) VALUES ($1, $2, $3)',
-        [userId, vaultId, tradableAmount]
-      );
+      await client.query('INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital) VALUES ($1, $2, $3)', [userId, vaultId, ethers.utils.formatUnits(tradableAmount_BN, 6)]);
     }
     
+    await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, ethers.utils.formatUnits(bonusPointsAmount_BN, 6)]);
+
+    // ✅ NEW: Log this action to the vault_transactions table
     await client.query(
-      'INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)',
-      [userId, bonusPointsAmount]
+      `INSERT INTO vault_transactions (user_id, vault_id, transaction_type, amount)
+       VALUES ($1, $2, 'allocation', $3)`,
+      [userId, vaultId, ethers.utils.formatUnits(totalAmount_BN, 6)]
     );
 
     await client.query('COMMIT');
@@ -67,43 +67,38 @@ router.post('/invest', authenticateToken, async (req, res) => {
   }
 });
 
-
-// --- ✅ ADDED: Withdraw From Vault Endpoint ---
+// --- Withdraw From Vault Endpoint ---
 router.post('/withdraw', authenticateToken, async (req, res) => {
   const { vaultId, amount } = req.body;
   const userId = req.user.id;
   const client = await pool.connect();
 
   try {
-    const withdrawAmount = parseFloat(amount);
-    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
-      return res.status(400).json({ error: 'Invalid withdrawal amount.' });
-    }
+    const withdrawAmount_BN = ethers.utils.parseUnits(amount.toString(), 6);
 
     await client.query('BEGIN');
 
-    const positionResult = await client.query(
-      'SELECT tradable_capital FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2',
-      [userId, vaultId]
-    );
+    const positionResult = await client.query('SELECT tradable_capital FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
+    if (positionResult.rows.length === 0) { throw new Error('User does not have a position in this vault.'); }
 
-    if (positionResult.rows.length === 0) {
-      throw new Error('User does not have a position in this vault.');
+    const currentCapital_BN = ethers.utils.parseUnits(positionResult.rows[0].tradable_capital.toString(), 6);
+    if (withdrawAmount_BN.gt(currentCapital_BN)) {
+      return res.status(400).json({ error: 'Withdrawal amount exceeds tradable capital.' });
     }
 
-    const currentCapital = parseFloat(positionResult.rows[0].tradable_capital);
-    if (withdrawAmount > currentCapital) {
-      return res.status(400).json({ error: 'Withdrawal amount exceeds tradable capital in this vault.' });
-    }
+    const newCapital_BN = currentCapital_BN.sub(withdrawAmount_BN);
+    await client.query('UPDATE user_vault_positions SET tradable_capital = $1 WHERE user_id = $2 AND vault_id = $3', [ethers.utils.formatUnits(newCapital_BN, 6), userId, vaultId]);
 
+    const userResult = await client.query('SELECT balance FROM users WHERE user_id = $1', [userId]);
+    const currentBalance_BN = ethers.utils.parseUnits(userResult.rows[0].balance.toString(), 6);
+    const newBalance_BN = currentBalance_BN.add(withdrawAmount_BN);
+    await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
+    
+    // ✅ NEW: Log this action to the vault_transactions table
     await client.query(
-      'UPDATE user_vault_positions SET tradable_capital = tradable_capital - $1 WHERE user_id = $2 AND vault_id = $3',
-      [withdrawAmount, userId, vaultId]
-    );
-
-    await client.query(
-      'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
-      [withdrawAmount, userId]
+      `INSERT INTO vault_transactions (user_id, vault_id, transaction_type, amount)
+       VALUES ($1, $2, 'withdrawal', $3)`,
+      [userId, vaultId, ethers.utils.formatUnits(withdrawAmount_BN, 6)]
     );
 
     await client.query('COMMIT');
@@ -117,6 +112,5 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
     client.release();
   }
 });
-
 
 module.exports = router;
