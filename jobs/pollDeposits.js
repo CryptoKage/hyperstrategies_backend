@@ -1,65 +1,97 @@
 // jobs/pollDeposits.js
+
 const { ethers } = require('ethers');
 const pool = require('../db');
-const { getTokenAddress, getTokenAbi } = require('../utils/withdrawHelpers');
+const { Alchemy, Network } = require('alchemy-sdk'); // We need the full SDK for this
+const tokenMap = require('../utils/tokens/tokenMap');
 
-const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
-console.log('🚀 Using ALCHEMY_RPC_URL:', ALCHEMY_RPC_URL);
+// --- Configuration ---
+const config = {
+  apiKey: process.env.ALCHEMY_API_KEY, // Use your main API Key
+  network: Network.ETH_MAINNET,
+};
+const alchemy = new Alchemy(config);
 
-let provider;
-
+// --- Provider Initialization (Simplified) ---
 async function initializeProvider() {
   try {
-    provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC_URL);
-    const network = await provider.getNetwork();
-    const block = await provider.getBlockNumber();
-    console.log(`🔌 Connected to Ethereum network: ${network.name} (chainId: ${network.chainId})`);
-    console.log(`✅ Alchemy provider connected. Current block number: ${block}`);
+    const block = await alchemy.core.getBlockNumber();
+    console.log(`🔌 Alchemy SDK connected to Ethereum Mainnet. Current block: ${block}`);
   } catch (err) {
-    console.error('❌ Alchemy provider connection failed:', err);
+    console.error('❌ Alchemy SDK connection failed:', err);
   }
 }
 
+// --- Main Polling Function ---
 async function pollDeposits() {
+  console.log('🔄 Checking for new deposits...');
   try {
-    if (!provider) {
-      console.warn('⚠️ Provider not initialized. Skipping deposit check.');
-      return;
-    }
-
-    const { rows: users } = await pool.query(
-      `SELECT user_id, eth_address, balance FROM users WHERE eth_address IS NOT NULL`
-    );
-
-    const usdcAddress = getTokenAddress('usdc');
-    const usdcAbi = getTokenAbi();
-    const usdcContract = new ethers.Contract(usdcAddress, usdcAbi, provider);
+    const { rows: users } = await pool.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
 
     for (const user of users) {
-      const onChainRaw = await usdcContract.balanceOf(user.eth_address);
-      const onChainBalance = parseFloat(ethers.utils.formatUnits(onChainRaw, 6));
-      const dbBalance = parseFloat(user.balance);
+      if (!user.eth_address) continue;
 
-      if (onChainBalance > dbBalance) {
-        const depositAmount = onChainBalance - dbBalance;
+      // Use Alchemy's getAssetTransfers to find all incoming USDC transfers to the user's address
+      const transfers = await alchemy.core.getAssetTransfers({
+        toAddress: user.eth_address,
+        contractAddresses: [tokenMap.usdc.address],
+        excludeZeroValue: true,
+        category: ["erc20"],
+        // For performance, you can add a 'fromBlock' here to only check recent blocks
+      });
 
-        await pool.query('BEGIN');
-        await pool.query(
-          `UPDATE users SET balance = $1 WHERE user_id = $2`,
-          [onChainBalance, user.user_id]
-        );
-        await pool.query(
-          `INSERT INTO deposits (user_id, amount) VALUES ($1, $2)`,
-          [user.user_id, depositAmount]
-        );
-        await pool.query('COMMIT');
+      for (const event of transfers.transfers) {
+        const txHash = event.hash;
+        
+        // Check if we have already processed this transaction
+        const existingDeposit = await pool.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
-        console.log(`💰 Detected USDC deposit of $${depositAmount} for user ${user.user_id}`);
+        if (existingDeposit.rows.length === 0) {
+          // This is a new, unseen deposit
+          const amount = event.value; // This is the exact amount transferred
+          console.log(`✅ New deposit detected for user ${user.user_id}: ${amount} USDC, tx: ${txHash}`);
+
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+
+            // 1. Record the raw deposit with the token and tx_hash
+            await client.query(
+              `INSERT INTO deposits (user_id, amount, token, tx_hash) 
+               VALUES ($1, $2, $3, $4)`,
+              [user.user_id, amount, 'USDC', txHash]
+            );
+
+            // 2. Apply the 80/20 Bonus Points logic
+            const tradableAmount = amount * 0.80;
+            const bonusPointsAmount = amount * 0.20;
+
+            // Add 80% to the user's main available balance
+            await client.query(
+              'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+              [tradableAmount, user.user_id]
+            );
+
+            // Add 20% to the bonus_points table
+            await client.query(
+              'INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)',
+              [user.user_id, bonusPointsAmount]
+            );
+
+            await client.query('COMMIT');
+            console.log(`✅ Successfully processed and credited deposit for tx ${txHash}`);
+
+          } catch (e) {
+            await client.query('ROLLBACK');
+            console.error(`❌ Failed to process database transaction for tx ${txHash}:`, e);
+          } finally {
+            client.release();
+          }
+        }
       }
     }
-  } catch (err) {
-    console.error('Deposit poll error:', err);
-    await pool.query('ROLLBACK');
+  } catch (error) {
+    console.error('❌ Error in pollDeposits job:', error);
   }
 }
 
