@@ -12,26 +12,30 @@ const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_UR
 const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 
-// --- Get User Wallet Info Endpoint ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // We now fetch all three pieces of data in parallel
-    const [userResult, usdcBalanceBigNumber, bonusPointsResult] = await Promise.all([
-      pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]),
-      usdcContract.balanceOf(userResult.rows[0].eth_address), // Assuming userResult is fast
-      // ✅ NEW: Query for the sum of bonus points
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
-    ]);
+    // --- ✅ THIS IS THE FIX ---
+    // We perform the steps sequentially to avoid the race condition.
 
+    // 1. Get user's ETH address first.
+    const userResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
     if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'User wallet not found.' });
     }
     const userAddress = userResult.rows[0].eth_address;
 
-    const ethBalanceBigNumber = await provider.getBalance(userAddress);
+    // 2. Now that we are GUARANTEED to have the address, make the on-chain calls.
+    const [ethBalanceBigNumber, usdcBalanceBigNumber] = await Promise.all([
+      provider.getBalance(userAddress),
+      usdcContract.balanceOf(userAddress)
+    ]);
+    
+    // 3. Query for bonus points.
+    const bonusPointsResult = await pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]);
 
+    // 4. Format all data.
     const ethBalance = ethers.utils.formatEther(ethBalanceBigNumber);
     const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, tokenMap.usdc.decimals);
     const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
@@ -40,7 +44,7 @@ router.get('/wallet', authenticateToken, async (req, res) => {
       address: userAddress,
       ethBalance: parseFloat(ethBalance),
       usdcBalance: parseFloat(usdcBalance),
-      totalBonusPoints: totalBonusPoints // ✅ Send the bonus points to the frontend
+      totalBonusPoints: totalBonusPoints
     });
 
   } catch (err) {
