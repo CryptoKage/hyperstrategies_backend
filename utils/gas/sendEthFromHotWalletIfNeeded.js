@@ -1,70 +1,76 @@
+// jobs/sendEthFromHotWalletIfNeeded.js
+
 const { ethers } = require('ethers');
-const tokenMap = require('../tokens/tokenMap');
-const usdcAbi = require('../tokens/usdcAbi.json');
-const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-const pool = require('../../db');
+const pool = require('../db');
+const tokenMap = require('../utils/tokens/tokenMap');
+const { getProvider } = require('../utils/provider');
 
-const hotWallet = new ethers.Wallet(process.env.HOT_WALLET_PRIVATE_KEY, provider);
+const hotWallet = new ethers.Wallet(process.env.HOT_WALLET_PRIVATE_KEY, getProvider());
 
-async function sendEthFromHotWalletIfNeeded(userId, userAddress, token = 'usdc', amount = '0') {
-  console.log(`🔁 [HotWallet] Checking for user=${userId} at ${userAddress}, amount=${amount} ${token}`);
+async function sendEthFromHotWalletIfNeeded(userId, toAddress, amount, tokenSymbol) {
+  console.log(`🔁 [HotWallet] Checking for user=${userId} at ${toAddress}, amount=${amount} ${tokenSymbol}`);
+  
+  const provider = getProvider();
 
-  const userBalance = await provider.getBalance(userAddress);
-  const userEth = parseFloat(ethers.utils.formatEther(userBalance));
-  console.log(`👤 User wallet balance: ${userEth.toFixed(6)} ETH`);
-
-  const tokenInfo = tokenMap[token];
-  const contract = new ethers.Contract(tokenInfo.address, usdcAbi, provider);
-
-  let gasEstimate, feeData, totalGasCost;
   try {
-    const tx = await contract.populateTransaction.transfer(
-      userAddress,
-      ethers.utils.parseUnits(amount, tokenInfo.decimals)
+    // --- ✅ 1. Input Validation ---
+    if (!tokenSymbol) {
+      throw new Error('Token symbol is undefined or null.');
+    }
+    
+    const tokenData = tokenMap[tokenSymbol.toLowerCase()];
+    if (!tokenData) {
+      // This will give a much clearer error if the token is not in your map
+      throw new Error(`Token "${tokenSymbol}" not found in tokenMap.`);
+    }
+
+    const tokenContract = new ethers.Contract(tokenData.address, tokenData.abi, provider);
+
+    // --- ✅ 2. Defensive Gas Estimation ---
+    const userEthBalance = await provider.getBalance(toAddress);
+    console.log(`👤 User wallet balance: ${ethers.utils.formatEther(userEthBalance)} ETH`);
+
+    // Estimate gas for the ERC20 transfer
+    const gasEstimate = await tokenContract.estimateGas.transfer(
+      toAddress, // For estimation, the recipient doesn't matter as much
+      ethers.utils.parseUnits(amount.toString(), tokenData.decimals)
     );
-    tx.from = userAddress;
+    
+    const gasPrice = await provider.getGasPrice();
+    const estimatedGasCost = gasEstimate.mul(gasPrice);
+    const gasBuffer = estimatedGasCost.div(10); // Add a 10% buffer
+    const totalGasNeeded = estimatedGasCost.add(gasBuffer);
 
-    gasEstimate = await provider.estimateGas(tx);
-    feeData = await provider.getFeeData();
+    console.log(`⛽️ Estimated gas cost for withdrawal: ${ethers.utils.formatEther(totalGasNeeded)} ETH`);
 
-    const gasPrice = feeData.maxFeePerGas || await provider.getGasPrice();
-    totalGasCost = gasEstimate.mul(gasPrice);
+    if (userEthBalance.lt(totalGasNeeded)) {
+      const ethToSend = totalGasNeeded.sub(userEthBalance);
+      console.log(`⚠️ Insufficient ETH. Attempting to fund ${ethers.utils.formatEther(ethToSend)} ETH from hot wallet.`);
 
-    console.log(`🧮 Estimated gas: limit=${gasEstimate}, price=${gasPrice}, total=${ethers.utils.formatEther(totalGasCost)} ETH`);
-  } catch (err) {
-    console.error('🔻 Gas estimation failed:', err);
-    return null;
+      const tx = await hotWallet.sendTransaction({
+        to: toAddress,
+        value: ethToSend,
+      });
+
+      console.log(`💸 ETH Sent! Hot wallet funding tx: ${tx.hash}`);
+      await tx.wait(); // Wait for the transaction to be mined
+      console.log(`✅ ETH funding tx ${tx.hash} confirmed.`);
+
+      // Log the funding action
+      await pool.query(
+        `INSERT INTO hot_wallet_funding_log (user_id, to_address, amount_eth, tx_hash)
+         VALUES ($1, $2, $3, $4)`,
+        [userId, toAddress, ethers.utils.formatEther(ethToSend), tx.hash]
+      );
+    } else {
+      console.log('✅ User has sufficient ETH for gas. No funding needed.');
+    }
+  } catch (error) {
+    // This will now catch the error and log it clearly.
+    console.error(`❌ Gas funding/estimation failed for user ${userId}:`, error.message);
   }
-
-  // Minimum buffer to avoid surprises
-  const buffer = totalGasCost.mul(130).div(100); // +30%
-  const bufferEth = parseFloat(ethers.utils.formatEther(buffer));
-  const MIN_ETH_FOR_GAS = 0.0003; // safer floor
-  const requiredEth = Math.max(bufferEth, MIN_ETH_FOR_GAS);
-
-  if (userEth >= requiredEth) {
-    console.log(`✅ Wallet has ${userEth.toFixed(6)} ETH, covers required ${requiredEth.toFixed(6)} ETH. No funding needed.`);
-    return null;
-  }
-
-  // Round up ETH to 6 decimals
-  const ethToSend = Math.ceil((requiredEth - userEth) * 1e6) / 1e6;
-  console.log(`💸 Funding ${ethToSend} ETH to ${userAddress} for gas`);
-
-  const txReceipt = await hotWallet.sendTransaction({
-    to: userAddress,
-    value: ethers.utils.parseEther(ethToSend.toFixed(6))
-  });
-
-  console.log(`📤 Sent hot wallet TX: ${txReceipt.hash}`);
-
-  await pool.query(
-    `INSERT INTO hot_wallet_funding_log (user_id, to_address, amount_eth, tx_hash)
-     VALUES ($1, $2, $3, $4)`,
-    [userId, userAddress, ethToSend.toFixed(6), txReceipt.hash]
-  );
-
-  return txReceipt.hash;
 }
 
-module.exports = { sendEthFromHotWalletIfNeeded };
+module.exports = {
+  sendEthFromHotWalletIfNeeded,
+};
