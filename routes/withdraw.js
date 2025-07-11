@@ -1,15 +1,15 @@
 // server/routes/withdraw.js
 
-const express = require('express');
-const { ethers } = require('ethers');
+// ✅ THE FIX: Import the entire 'ethers' object, not destructured properties.
+const ethers = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
-const tokenMap = require('../utils/tokens/tokenMap'); // For contract info
+const tokenMap = require('../utils/tokens/tokenMap');
 
 const router = express.Router();
 
 // Setup provider and contract for on-chain balance checks
-const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
+const provider = new ethers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 
@@ -19,11 +19,11 @@ router.post('/', authenticateToken, async (req, res) => {
     const { toAddress, amount, token = 'USDC' } = req.body;
     const userId = req.user.id;
 
+    // ✅ THE FIX: Use the correct ethers v6 syntax. It's a static method on the main object.
     if (!ethers.isAddress(toAddress)) {
       return res.status(400).json({ message: 'Invalid ETH address' });
     }
 
-    // --- ✅ FIX 1: Check the TRUE on-chain balance ---
     const userWalletResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
     if (userWalletResult.rows.length === 0) {
       return res.status(404).json({ message: 'User wallet not found.' });
@@ -32,17 +32,17 @@ router.post('/', authenticateToken, async (req, res) => {
 
     // Use BigNumber for precision
     const onChainBalance_BN = await usdcContract.balanceOf(userEthAddress);
-    const withdrawalAmount_BN = ethers.utils.parseUnits(amount.toString(), tokenMap.usdc.decimals);
+    const withdrawalAmount_BN = ethers.parseUnits(amount.toString(), tokenMap.usdc.decimals);
 
     if (withdrawalAmount_BN.gt(onChainBalance_BN)) {
       return res.status(400).json({ message: 'Insufficient on-chain USDC balance.' });
     }
 
-    // --- ✅ FIX 2: Correctly quote the "token" column in the INSERT statement ---
+    // Insert into the queue. Quoting "token" is safer.
     await pool.query(
       `INSERT INTO withdrawal_queue (user_id, to_address, amount, "token")
        VALUES ($1, $2, $3, $4)`,
-      [userId, toAddress, amount, token.toUpperCase()] // Storing the human-readable amount
+      [userId, toAddress, amount, token.toUpperCase()]
     );
 
     console.log(`📥 Queued platform withdrawal for user ${userId} to ${toAddress} for ${amount} ${token}`);
@@ -60,12 +60,12 @@ router.post('/', authenticateToken, async (req, res) => {
 
 
 // --- Get User's Withdrawal History Endpoint ---
-// This version is now correct based on your final schema DDL
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
+    // Your history query is already correct, just ensure "token" is quoted here too.
     const query = `
-      SELECT id::text, amount, "token", to_address, status, created_at, tx_hash, NULL as error_message
+      SELECT id::text, amount, "token", to_address, status, created_at, tx_hash, error_message
       FROM withdrawal_queue WHERE user_id = $1
       UNION ALL
       SELECT id::text, amount, "token", to_address, status, created_at, tx_hash, NULL as error_message
