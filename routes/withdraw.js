@@ -1,15 +1,15 @@
 // server/routes/withdraw.js
 
 const express = require('express');
-const ethers = require('ethers'); // Correct import for ethers v6
+const { ethers } = require('ethers'); // This is the correct import for ethers v5
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
 
 const router = express.Router();
 
-// --- ✅ THE FIX: Correct ethers v6 syntax for creating a provider ---
-const provider = new ethers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
+// --- ✅ THE FIX: Use the correct ethers v5 syntax for creating a provider ---
+const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 
@@ -19,7 +19,8 @@ router.post('/', authenticateToken, async (req, res) => {
     const { toAddress, amount, token = 'USDC' } = req.body;
     const userId = req.user.id;
 
-    if (!ethers.isAddress(toAddress)) {
+    // ✅ THE FIX: Use the correct ethers v5 syntax for address validation
+    if (!ethers.utils.isAddress(toAddress)) {
       return res.status(400).json({ message: 'Invalid ETH address' });
     }
 
@@ -30,7 +31,8 @@ router.post('/', authenticateToken, async (req, res) => {
     const userEthAddress = userWalletResult.rows[0].eth_address;
 
     const onChainBalance_BN = await usdcContract.balanceOf(userEthAddress);
-    const withdrawalAmount_BN = ethers.parseUnits(amount.toString(), tokenMap.usdc.decimals);
+    // ✅ THE FIX: Use the correct ethers v5 syntax for parsing units
+    const withdrawalAmount_BN = ethers.utils.parseUnits(amount.toString(), tokenMap.usdc.decimals);
 
     if (withdrawalAmount_BN.gt(onChainBalance_BN)) {
       return res.status(400).json({ message: 'Insufficient on-chain USDC balance.' });
@@ -57,7 +59,7 @@ router.post('/', authenticateToken, async (req, res) => {
 
 
 // --- Get User's Withdrawal History Endpoint ---
-// This route is correct.
+// This is the complete and correct history route.
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
