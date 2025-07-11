@@ -1,6 +1,6 @@
 // jobs/pollDeposits.js
 
-const { ethers } = require('ethers'); // We need the full ethers library
+const { ethers } = require('ethers');
 const { Alchemy, Network } = require('alchemy-sdk');
 const pool = require('../db');
 const tokenMap = require('../utils/tokens/tokenMap');
@@ -33,9 +33,6 @@ async function pollDeposits() {
         contractAddresses: [tokenMap.usdc.address],
         excludeZeroValue: true,
         category: ["erc20"],
-        // In a high-volume production environment, you would want to store and use
-        // the latest checked block number (`fromBlock`) for each user to be more efficient.
-        // For now, this is robust.
       });
 
       for (const event of transfers.transfers) {
@@ -43,30 +40,27 @@ async function pollDeposits() {
         const existingDeposit = await pool.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
         if (existingDeposit.rows.length === 0) {
-          // New, unseen deposit found
-          const amountStr = event.value.toString(); // The amount from Alchemy as a string
+          const amountStr = event.value.toString();
           console.log(`✅ New deposit detected for user ${user.user_id}: ${amountStr} USDC, tx: ${txHash}`);
 
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
 
-            // --- ✅ FIX: Using BigNumber math for precision ---
-            // Convert the incoming amount string to a BigNumber, assuming 6 decimals for USDC
             const depositAmount_BN = ethers.utils.parseUnits(amountStr, 6);
+            const depositAmount_formatted = ethers.utils.formatUnits(depositAmount_BN, 6);
 
-            // 1. Record the full, raw deposit using its formatted string value
+            // 1. Record the full, raw deposit
+            // ✅ THE FIX: Storing the token symbol as lowercase 'usdc' for consistency
             await client.query(
-              `INSERT INTO deposits (user_id, amount, token, tx_hash) 
+              `INSERT INTO deposits (user_id, amount, "token", tx_hash) 
                VALUES ($1, $2, $3, $4)`,
-              [user.user_id, ethers.utils.formatUnits(depositAmount_BN, 6), 'USDC', txHash]
+              [user.user_id, depositAmount_formatted, 'usdc', txHash]
             );
 
             // 2. Add 100% of the deposit amount to the user's main 'balance'
-            // To do this safely, we must first get their current balance.
             const userBalanceResult = await client.query('SELECT balance FROM users WHERE user_id = $1 FOR UPDATE', [user.user_id]);
             const currentBalance_BN = ethers.utils.parseUnits(userBalanceResult.rows[0].balance.toString(), 6);
-            
             const newBalance_BN = currentBalance_BN.add(depositAmount_BN);
 
             await client.query(
