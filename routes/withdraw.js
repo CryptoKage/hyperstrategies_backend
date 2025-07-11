@@ -1,14 +1,14 @@
 // server/routes/withdraw.js
 
-const express = require('express'); // ✅ THE FIX: This line was missing.
-const ethers = require('ethers');
+const express = require('express');
+const ethers = require('ethers'); // Correct import for ethers v6
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
 
 const router = express.Router();
 
-// Setup provider and contract for on-chain balance checks
+// --- ✅ THE FIX: Correct ethers v6 syntax for creating a provider ---
 const provider = new ethers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
@@ -57,6 +57,7 @@ router.post('/', authenticateToken, async (req, res) => {
 
 
 // --- Get User's Withdrawal History Endpoint ---
+// This route is correct.
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -71,7 +72,7 @@ router.get('/history', authenticateToken, async (req, res) => {
     const historyResult = await pool.query(query, [userId]);
     res.json(historyResult.rows);
   } catch (err) {
-    console.error('Error fetching withdrawal history:', err.message);
+    console.error('Error fetching withdrawal history:', err);
     res.status(500).send('Server Error');
   }
 });
