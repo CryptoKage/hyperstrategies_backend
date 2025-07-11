@@ -1,6 +1,6 @@
 // server/routes/withdraw.js
 
-// ✅ THE FIX: Import the entire 'ethers' object, not destructured properties.
+const express = require('express'); // ✅ THE FIX: This line was missing.
 const ethers = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
@@ -19,7 +19,6 @@ router.post('/', authenticateToken, async (req, res) => {
     const { toAddress, amount, token = 'USDC' } = req.body;
     const userId = req.user.id;
 
-    // ✅ THE FIX: Use the correct ethers v6 syntax. It's a static method on the main object.
     if (!ethers.isAddress(toAddress)) {
       return res.status(400).json({ message: 'Invalid ETH address' });
     }
@@ -30,7 +29,6 @@ router.post('/', authenticateToken, async (req, res) => {
     }
     const userEthAddress = userWalletResult.rows[0].eth_address;
 
-    // Use BigNumber for precision
     const onChainBalance_BN = await usdcContract.balanceOf(userEthAddress);
     const withdrawalAmount_BN = ethers.parseUnits(amount.toString(), tokenMap.usdc.decimals);
 
@@ -38,7 +36,6 @@ router.post('/', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'Insufficient on-chain USDC balance.' });
     }
 
-    // Insert into the queue. Quoting "token" is safer.
     await pool.query(
       `INSERT INTO withdrawal_queue (user_id, to_address, amount, "token")
        VALUES ($1, $2, $3, $4)`,
@@ -63,7 +60,6 @@ router.post('/', authenticateToken, async (req, res) => {
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    // Your history query is already correct, just ensure "token" is quoted here too.
     const query = `
       SELECT id::text, amount, "token", to_address, status, created_at, tx_hash, error_message
       FROM withdrawal_queue WHERE user_id = $1
@@ -75,7 +71,7 @@ router.get('/history', authenticateToken, async (req, res) => {
     const historyResult = await pool.query(query, [userId]);
     res.json(historyResult.rows);
   } catch (err) {
-    console.error('Error fetching withdrawal history:', err);
+    console.error('Error fetching withdrawal history:', err.message);
     res.status(500).send('Server Error');
   }
 });
