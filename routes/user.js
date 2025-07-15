@@ -105,7 +105,7 @@ router.get('/leaderboard', async (req, res) => {
     // ✅ THE FIX: We now select eth_address as well.
     // We still select username to help the frontend identify the current user.
     const leaderboardResult = await pool.query(
-      `SELECT username, xp, eth_address FROM users ORDER BY xp DESC, created_at ASC LIMIT 25`
+      `SELECT eth_address, xp FROM users WHERE eth_address IS NOT NULL ORDER BY xp DESC, created_at ASC LIMIT 25`
     );
     res.json(leaderboardResult.rows);
   } catch (err) {
