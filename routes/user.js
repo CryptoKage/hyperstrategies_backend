@@ -100,11 +100,12 @@ router.put('/profile', authenticateToken, async (req, res) => {
 
 
 // --- Get Leaderboard Endpoint ---
-// This is public, so it does not use authenticateToken.
 router.get('/leaderboard', async (req, res) => {
   try {
+    // ✅ THE FIX: We now select eth_address as well.
+    // We still select username to help the frontend identify the current user.
     const leaderboardResult = await pool.query(
-      `SELECT username, xp FROM users ORDER BY xp DESC, created_at ASC LIMIT 25`
+      `SELECT username, xp, eth_address FROM users ORDER BY xp DESC, created_at ASC LIMIT 25`
     );
     res.json(leaderboardResult.rows);
   } catch (err) {
