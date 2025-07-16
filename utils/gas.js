@@ -1,22 +1,15 @@
-// /utils/gas.js
+// server/utils/gas.js
 
 const { ethers } = require('ethers');
-const { getProvider } = require('./provider');
 const pool = require('../db');
+// const { getProvider } = require('./provider'); // <-- REMOVED a faulty import.
 
-const provider = getProvider();
+// ✅ Create the provider directly inside this utility file. It has no external dependencies.
+const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const hotWallet = new ethers.Wallet(process.env.HOT_WALLET_PRIVATE_KEY, provider);
 
-// The standard amount of gas to ensure a user's wallet has.
 const GAS_CUSHION_ETH = "0.003";
 
-/**
- * Checks a user's wallet and sends them a standard ETH cushion if they are below the threshold.
- * This is the ONLY function that should send gas from the Hot Wallet.
- * @param {string} userId - The user's UUID
- * @param {string} userAddress - The user's public ETH address
- * @returns {Promise<string|null>} - The transaction hash if funded, otherwise null.
- */
 async function ensureGasCushion(userId, userAddress) {
   try {
     const balance_BN = await provider.getBalance(userAddress);
@@ -28,10 +21,9 @@ async function ensureGasCushion(userId, userAddress) {
       
       const tx = await hotWallet.sendTransaction({
         to: userAddress,
-        value: amountToSend_BN
+        value: amountToSend_BN,
       });
 
-      // Log the funding action
       await pool.query(
         `INSERT INTO hot_wallet_funding_log (user_id, to_address, amount_eth, tx_hash)
          VALUES ($1, $2, $3, $4)`,
@@ -39,7 +31,7 @@ async function ensureGasCushion(userId, userAddress) {
       );
       
       console.log(`✅ Gas funding successful. TX: ${tx.hash}. Waiting for confirmation...`);
-      await tx.wait(1); // Wait for 1 block confirmation
+      await tx.wait(1);
       return tx.hash;
     }
     
@@ -48,7 +40,7 @@ async function ensureGasCushion(userId, userAddress) {
 
   } catch (error) {
     console.error(`❌ Gas funding failed for user ${userId}:`, error.message);
-    return null; // Return null on failure so the calling job can proceed
+    return null;
   }
 }
 
