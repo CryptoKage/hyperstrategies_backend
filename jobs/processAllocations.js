@@ -4,10 +4,10 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 const { decrypt } = require('../utils/walletUtils');
 const tokenMap = require('../utils/tokens/tokenMap');
-const { getProvider } = require('../utils/provider');
-const { ensureGasCushion } = require('../utils/gas'); // Import our new unified utility
+const { ensureGasCushion } = require('../utils/gas'); // ✅ THE FIX: Correctly imports our new utility.
 
-const provider = getProvider();
+// We no longer need to create a provider here; gas.js handles it.
+const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 
 async function processAllocations() {
   console.log('⚙️ Checking for new vault allocations to process...');
@@ -19,15 +19,13 @@ async function processAllocations() {
        WHERE p.status = 'active'`
     );
 
-    if (positionsToProcess.length === 0) {
-      console.log('✅ No new allocations to process.');
-    } else {
+    if (positionsToProcess.length > 0) {
       console.log(`Found ${positionsToProcess.length} allocations to process.`);
       for (const position of positionsToProcess) {
         try {
           console.log(`--- Starting processing for position ID: ${position.position_id} ---`);
           
-          // Step 1: Ensure the user's wallet has gas.
+          // Step 1: Ensure the user's wallet has gas. This is now a single, clean function call.
           await ensureGasCushion(position.user_id, position.eth_address);
 
           // Step 2: Perform the sweeps.
