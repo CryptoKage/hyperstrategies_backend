@@ -1,4 +1,4 @@
-// server/routes/auth.js
+// server/routes/auth.js  (admin version)
 
 const express = require('express');
 const router = express.Router();
