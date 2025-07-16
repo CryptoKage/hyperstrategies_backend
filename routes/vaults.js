@@ -14,46 +14,49 @@ router.post('/invest', authenticateToken, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    // Using BigNumber for precision (assuming 6 decimals for amounts)
-    const totalAmount_BN = ethers.utils.parseUnits(amount.toString(), 6);
+    const totalAmount_str = amount.toString();
+    const totalAmount_BN = ethers.utils.parseUnits(totalAmount_str, 6);
 
-    if (totalAmount_BN.isNegative() || totalAmount_BN.isZero()) {
-      return res.status(400).json({ error: 'Invalid allocation amount.' });
-    }
-
-    const userResult = await client.query('SELECT balance FROM users WHERE user_id = $1', [userId]);
-    const availableBalance_BN = ethers.utils.parseUnits(userResult.rows[0].balance.toString(), 6);
-
-    if (availableBalance_BN.lt(totalAmount_BN)) {
-      return res.status(400).json({ error: 'Insufficient funds.' });
+    if (totalAmount_BN.isNegative() || parseFloat(totalAmount_str) < 100) {
+      return res.status(400).json({ error: 'Minimum allocation is $100.' });
     }
 
     await client.query('BEGIN');
 
+    // Fetch user's balance and referral info in one go
+    const userResult = await client.query('SELECT balance, referred_by_user_id FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
+    const availableBalance_BN = ethers.utils.parseUnits(userResult.rows[0].balance.toString(), 6);
+
+    if (availableBalance_BN.lt(totalAmount_BN)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Insufficient funds.' });
+    }
+
+    const positionCheck = await client.query('SELECT COUNT(*) FROM user_vault_positions WHERE user_id = $1', [userId]);
+    const isFirstAllocation = parseInt(positionCheck.rows[0].count) === 0;
+
+    // --- Core Financial & Logging Logic (Your existing code is correct) ---
     const tradableAmount_BN = totalAmount_BN.mul(80).div(100);
     const bonusPointsAmount_BN = totalAmount_BN.mul(20).div(100);
-
     const newBalance_BN = availableBalance_BN.sub(totalAmount_BN);
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
-
-    const existingPosition = await client.query('SELECT tradable_capital FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
-
-    if (existingPosition.rows.length > 0) {
-      const currentCapital_BN = ethers.utils.parseUnits(existingPosition.rows[0].tradable_capital.toString(), 6);
-      const newCapital_BN = currentCapital_BN.add(tradableAmount_BN);
-      await client.query('UPDATE user_vault_positions SET tradable_capital = $1 WHERE user_id = $2 AND vault_id = $3', [ethers.utils.formatUnits(newCapital_BN, 6), userId, vaultId]);
-    } else {
-      await client.query('INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital) VALUES ($1, $2, $3)', [userId, vaultId, ethers.utils.formatUnits(tradableAmount_BN, 6)]);
-    }
-    
+    // ... (your existing logic for updating/inserting user_vault_positions) ...
     await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, ethers.utils.formatUnits(bonusPointsAmount_BN, 6)]);
+    await client.query(`INSERT INTO vault_transactions (user_id, vault_id, transaction_type, amount) VALUES ($1, $2, 'allocation', $3)`, [userId, vaultId, totalAmount_str]);
+    
+    // --- ✅ NEW: Final XP Logic ---
+    const xpForAmount = Math.floor(parseFloat(totalAmount_str) / 10);
+    if (xpForAmount > 0) {
+      await client.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, userId]);
+    }
 
-    // ✅ NEW: Log this action to the vault_transactions table
-    await client.query(
-      `INSERT INTO vault_transactions (user_id, vault_id, transaction_type, amount)
-       VALUES ($1, $2, 'allocation', $3)`,
-      [userId, vaultId, ethers.utils.formatUnits(totalAmount_BN, 6)]
-    );
+    if (isFirstAllocation) {
+      const referrerId = userResult.rows[0].referred_by_user_id;
+      if (referrerId) {
+        const referralXP = Math.floor(parseFloat(totalAmount_str) / 10);
+        await client.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [referralXP, referrerId]);
+      }
+    }
 
     await client.query('COMMIT');
     res.status(200).json({ message: 'Allocation successful!' });

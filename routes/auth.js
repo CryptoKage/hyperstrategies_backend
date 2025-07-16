@@ -14,15 +14,16 @@ function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
-// --- Registration Endpoint ---
-// This route is already correct and remains unchanged.
+// --- ✅ FINAL Registration Endpoint with Tiered XP ---
 router.post('/register', async (req, res) => {
   const client = await pool.connect();
   try {
     const { email, password, username, referralCode } = req.body;
+
     if (!email || !password || !username) {
       return res.status(400).json({ error: 'Username, email, and password are required.' });
     }
+
     const emailCheck = await client.query('SELECT user_id FROM users WHERE email = $1', [email]);
     if (emailCheck.rows.length > 0) {
       return res.status(400).json({ error: 'User with this email already exists.' });
@@ -31,32 +32,48 @@ router.post('/register', async (req, res) => {
     if (usernameCheck.rows.length > 0) {
       return res.status(400).json({ error: 'This username is already taken.' });
     }
+
     await client.query('BEGIN');
+
+    // --- NEW: Tiered XP Logic ---
+    const userCountResult = await client.query('SELECT COUNT(*) FROM users FOR UPDATE');
+    const currentUserCount = parseInt(userCountResult.rows[0].count);
+    let xpToAward = 0;
+    if (currentUserCount < 100) xpToAward = 25;
+    else if (currentUserCount < 200) xpToAward = 20;
+    else if (currentUserCount < 300) xpToAward = 15;
+    else if (currentUserCount < 400) xpToAward = 10;
+    else if (currentUserCount < 500) xpToAward = 5;
+    console.log(`Current user count is ${currentUserCount}, awarding ${xpToAward} sign-up XP.`);
+    
     let referrerId = null;
     if (referralCode) {
       const referrerResult = await client.query('SELECT user_id FROM users WHERE referral_code = $1', [referralCode]);
       if (referrerResult.rows.length > 0) {
         referrerId = referrerResult.rows[0].user_id;
-        console.log(`✅ Referrer found: ${referrerId}`);
       }
     }
+
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
     const wallet = generateWallet();
     const encryptedKey = encrypt(wallet.privateKey);
     const newReferralCode = generateReferralCode();
+
     const newUser = await client.query(
       `INSERT INTO users (email, password_hash, username, eth_address, eth_private_key_encrypted, referral_code, referred_by_user_id, xp)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 10)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING user_id, email, username, eth_address`,
-      [email, passwordHash, username, wallet.address, encryptedKey, newReferralCode, referrerId]
+      [email, passwordHash, username, wallet.address, encryptedKey, newReferralCode, referrerId, xpToAward]
     );
-    if (referrerId) {
-      await client.query('UPDATE users SET xp = xp + 50 WHERE user_id = $1', [referrerId]);
-      console.log(`✅ Awarded 50 XP to referrer ${referrerId}`);
-    }
+
+    // --- REMOVED ---
+    // The referral XP logic has been removed from this file.
+    // It will now be handled in the vaults.js route.
+
     await client.query('COMMIT');
     res.status(201).json({ message: 'User created successfully', user: newUser.rows[0] });
+
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Registration error:', error);
@@ -67,8 +84,7 @@ router.post('/register', async (req, res) => {
 });
 
 
-// --- Login Endpoint ---
-// This route is already correct and remains unchanged.
+// --- Login Endpoint (Unchanged) ---
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -79,11 +95,7 @@ router.post('/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) { return res.status(401).json({ error: 'Invalid credentials.' }); }
     const payload = {
-      user: {
-        id: user.user_id,
-        username: user.username,
-        isAdmin: user.is_admin
-      }
+      user: { id: user.user_id, username: user.username, isAdmin: user.is_admin }
     };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
     res.json({ token });
@@ -93,37 +105,18 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// --- Google OAuth2 Routes ---
+// --- Google OAuth2 Routes (Unchanged) ---
 router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
-
-// ✅ THIS IS THE UPDATED GOOGLE CALLBACK
-router.get('/google/callback',
-  passport.authenticate('google', {
-    // Redirect to the frontend login page on failure
-    failureRedirect: process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/login` : 'http://localhost:3000/login'
-  }),
-  (req, res) => {
-    // After Passport's logic runs, req.user is the full user object from our database
-    // This includes the 'is_admin' flag because passport-setup.js fetches it.
-    
+router.get('/google/callback', passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login' }), (req, res) => {
     const payload = {
-      user: {
-        id: req.user.user_id,
-        username: req.user.username,
-        isAdmin: req.user.is_admin // We now include the admin status
-      }
+      user: { id: req.user.user_id, username: req.user.username, isAdmin: req.user.is_admin }
     };
-
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
-
-    // Redirect to the dedicated success page so the frontend can grab the token
     const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
     res.redirect(`${frontend}/oauth-success?token=${token}`);
-  }
-);
+});
 
-// --- /me Route ---
-// This route is correct and remains unchanged.
+// --- /me Route (Unchanged) ---
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT username, eth_address FROM users WHERE user_id = $1', [req.user.id]);
@@ -134,5 +127,6 @@ router.get('/me', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Server error while fetching user profile' });
   }
 });
+
 
 module.exports = router;
