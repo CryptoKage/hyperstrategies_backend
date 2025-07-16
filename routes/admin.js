@@ -3,18 +3,18 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
-const { ethers } = require('ethers');
-// ✅ THE FIX: The path should be '../utils/provider'
-const { getProvider } = require('../utils/provider'); 
+const { ethers } = require('ethers'); // Import ethers directly
 const authenticateToken = require('../middleware/authenticateToken');
 const isAdmin = require('../middleware/isAdmin');
+
+// ✅ THE FIX: Create the provider directly in this file, removing the need for the broken import.
+const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 
 router.use(authenticateToken, isAdmin);
 
 router.get('/dashboard-stats', async (req, res) => {
   try {
-    const provider = getProvider();
-
+    // We no longer need to call getProvider()
     const [
       userCount,
       totalAvailable,
@@ -30,7 +30,6 @@ router.get('/dashboard-stats', async (req, res) => {
       pool.query(`SELECT COUNT(*) FROM withdrawal_queue WHERE status = 'queued';`),
       pool.query(`SELECT d.amount, d.token, u.username, d.detected_at FROM deposits d JOIN users u ON d.user_id = u.user_id ORDER BY d.detected_at DESC LIMIT 5;`),
       pool.query(`SELECT w.amount, w.token, u.username, w.created_at FROM withdrawal_queue w JOIN users u ON w.user_id = u.user_id ORDER BY w.created_at DESC LIMIT 5;`),
-      // This requires HOT_WALLET_ADDRESS to be in your .env
       provider.getBalance(process.env.HOT_WALLET_ADDRESS)
     ]);
 
@@ -50,7 +49,7 @@ router.get('/dashboard-stats', async (req, res) => {
     console.error("Admin dashboard error:", err);
     res.status(500).json({ 
       error: "Failed to fetch admin stats", 
-      databaseConnected: false, // We can assume DB failed or something else
+      databaseConnected: false,
       alchemyConnected: false 
     });
   }
