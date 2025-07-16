@@ -5,7 +5,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const session = require('express-session');
 const passport = require('passport');
-const { ethers } = require('ethers');
+const ethers = require('ethers'); // Use the main ethers import
 
 // Load env vars
 dotenv.config();
@@ -30,7 +30,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: true,
-  cookie: { secure: false } // set to true in prod with HTTPS
+  cookie: { secure: false }
 }));
 
 app.use(passport.initialize());
@@ -45,32 +45,38 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/user', userRoutes);
 
 
-// Alchemy test
-(async () => {
+// Start server
+app.listen(PORT, async () => {
+  console.log(`Server is running on port ${PORT}`);
+
   try {
+    // Correct ethers v5 syntax for the test
     const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const block = await provider.getBlockNumber();
     console.log(`✅ Alchemy provider connected. Current block number: ${block}`);
   } catch (err) {
     console.error('❌ Alchemy provider connection failed:', err);
   }
-})();
 
-// Start server
-app.listen(PORT, async () => {
-  console.log(`Server is running on port ${PORT}`);
+  // --- Initialize All Background Jobs ---
+  console.log('🕒 Initializing background jobs...');
 
-  // Start polling job
-  const { pollDeposits, initializeProvider } = require('./jobs/pollDeposits');
-  await initializeProvider();
-
+  // Job 1: Poll for new platform deposits
+  const { pollDeposits } = require('./jobs/pollDeposits');
   setInterval(() => {
     pollDeposits();
-  }, 30_000);
+  }, 30000); // 30 seconds
 
+  // Job 2: Process platform withdrawal queue
   const { processWithdrawals } = require('./jobs/queueProcessor');
+  setInterval(() => {
+    processWithdrawals();
+  }, 45000); // 45 seconds
 
-setInterval(() => {
-  processWithdrawals();
-}, 45_000); // run every 45s
+  // Job 3: Process vault allocations (the sweep job)
+  const { processAllocations } = require('./jobs/processAllocations');
+  const FOUR_HOURS_IN_MS = 4 * 60 * 60 * 1000;
+  setInterval(() => {
+    processAllocations();
+  }, FOUR_HOURS_IN_MS); // 4 hours
 });
