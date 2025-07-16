@@ -83,14 +83,32 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) { return res.status(401).json({ error: 'Invalid credentials.' }); }
-    const result = await pool.query('SELECT user_id, username, email, password_hash FROM users WHERE email = $1', [email]);
+
+    // ✅ NEW: We now also fetch the is_admin status
+    const result = await pool.query(
+      'SELECT user_id, username, email, password_hash, is_admin FROM users WHERE email = $1',
+      [email]
+    );
+
     if (result.rows.length === 0) { return res.status(401).json({ error: 'Invalid credentials.' }); }
+
     const user = result.rows[0];
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) { return res.status(401).json({ error: 'Invalid credentials.' }); }
-    const payload = { user: { id: user.user_id, username: user.username } };
-    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' }); // Using 8h for demo
+
+    // ✅ NEW: Add the is_admin flag to the token payload
+    const payload = {
+      user: {
+        id: user.user_id,
+        username: user.username,
+        isAdmin: user.is_admin // Include the admin status
+      }
+    };
+
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+
     res.json({ token });
+
   } catch (error) {
     console.error('Login error:', error.message);
     res.status(500).json({ error: 'Server error during login.' });
