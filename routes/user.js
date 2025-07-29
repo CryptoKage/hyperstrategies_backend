@@ -116,14 +116,15 @@ router.get('/leaderboard', async (req, res) => {
 
 router.get('/my-rank', authenticateToken, async (req, res) => {
   try {
-   
     const authenticatedUserId = req.user.id;
 
-   
-    const fetchUserRankQuery = `
-      SELECT user_rank FROM (
+    // --- ANNOTATION: The query has been updated. ---
+    // We now select both 'user_rank' and 'user_xp' from our subquery.
+    const fetchUserRankAndXpQuery = `
+      SELECT user_rank, user_xp FROM (
         SELECT 
           user_id, 
+          xp as user_xp,
           RANK() OVER (ORDER BY xp DESC, created_at ASC) as user_rank
         FROM 
           users
@@ -131,15 +132,18 @@ router.get('/my-rank', authenticateToken, async (req, res) => {
       WHERE user_id = $1;
     `;
 
-    const { rows } = await pool.query(fetchUserRankQuery, [authenticatedUserId]);
+    const { rows } = await pool.query(fetchUserRankAndXpQuery, [authenticatedUserId]);
 
     if (rows.length === 0) {
       return res.status(404).json({ msg: 'User rank could not be determined.' });
     }
-  
+
     const currentUserRank = rows[0].user_rank;
-    res.json({ rank: currentUserRank 
-      
+    const currentUserXp = rows[0].user_xp; // 
+
+    res.json({ 
+      rank: currentUserRank,
+      xp: currentUserXp 
     });
 
   } catch (err) {
@@ -147,5 +151,3 @@ router.get('/my-rank', authenticateToken, async (req, res) => {
     res.status(500).send('Server Error');
   }
 });
-
-module.exports = router;
