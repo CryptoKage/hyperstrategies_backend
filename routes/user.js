@@ -152,4 +152,68 @@ router.get('/my-rank', authenticateToken, async (req, res) => {
   }
 });
 
+router.put('/referral-code', authenticateToken, async (req, res) => {
+  const { desiredCode } = req.body;
+  const authenticatedUserId = req.user.id;
+
+  // --- 1. Validation and Sanitization ---
+  if (!desiredCode || typeof desiredCode !== 'string') {
+    return res.status(400).json({ message: 'A referral code must be provided.' });
+  }
+
+  // Sanitize the input: lowercase, alphanumeric only.
+  const sanitizedCode = desiredCode.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  if (sanitizedCode.length < 3 || sanitizedCode.length > 15) {
+    return res.status(400).json({ message: 'Code must be between 3 and 15 alphanumeric characters.' });
+  }
+
+  // Our system's final referral code format.
+  const finalReferralCode = `HS-${sanitizedCode}`;
+
+  // --- 2. Database Checks and Update ---
+  try {
+    // Check if the user is even allowed to change their code.
+    // We could add logic here later, e.g., "only changeable once" or "requires 100 XP".
+    // For now, we'll allow it.
+
+    // Check if the desired final code already exists.
+    const existingCodeResult = await pool.query(
+      'SELECT user_id FROM users WHERE referral_code = $1',
+      [finalReferralCode]
+    );
+
+    if (existingCodeResult.rows.length > 0) {
+      // If the code belongs to someone else, it's taken.
+      if (existingCodeResult.rows[0].user_id !== authenticatedUserId) {
+        return res.status(409).json({ message: 'This referral code is already taken. Please try another.' });
+      }
+      // If it belongs to the current user, it's already set. No need to update.
+      return res.status(200).json({ 
+        message: 'This is already your referral code.',
+        referralCode: finalReferralCode 
+      });
+    }
+
+    // --- 3. If all checks pass, update the database ---
+    await pool.query(
+      'UPDATE users SET referral_code = $1 WHERE user_id = $2',
+      [finalReferralCode, authenticatedUserId]
+    );
+
+    res.status(200).json({
+      message: 'Success! Your new referral link is ready.',
+      referralCode: finalReferralCode
+    });
+
+  } catch (err) {
+    // This will catch the UNIQUE constraint error if two users try to set the same code at the exact same time.
+    if (err.code === '23505') { // PostgreSQL unique_violation error code
+      return res.status(409).json({ message: 'This referral code was just claimed. Please try another.' });
+    }
+    console.error("Error updating referral code:", err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
