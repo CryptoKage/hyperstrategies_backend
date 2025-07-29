@@ -80,4 +80,16 @@ app.listen(PORT, async () => {
   setInterval(() => {
     processAllocations();
   }, FOUR_HOURS_IN_MS); // 4 hours
+
+  //   // Job 4: Award time-weighted staking XP and update tiers
+  const { processTimeWeightedRewards } = require('./jobs/awardStakingXP');
+  const TWENTY_FOUR_HOURS_IN_MS = 24 * 60 * 60 * 1000;
+  setInterval(() => {
+    processTimeWeightedRewards();
+  }, TWENTY_FOUR_HOURS_IN_MS); // Runs once every 24 hours
+
+  // You might want to run it once on startup for testing purposes
+  processTimeWeightedRewards(); 
+
+  //
 });
