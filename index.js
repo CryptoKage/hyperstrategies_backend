@@ -45,6 +45,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/user', userRoutes);
 
 
+
 // Start server
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);

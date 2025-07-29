@@ -114,5 +114,38 @@ router.get('/leaderboard', async (req, res) => {
   }
 });
 
+router.get('/my-rank', authenticateToken, async (req, res) => {
+  try {
+   
+    const authenticatedUserId = req.user.id;
+
+   
+    const fetchUserRankQuery = `
+      SELECT user_rank FROM (
+        SELECT 
+          user_id, 
+          RANK() OVER (ORDER BY xp DESC, created_at ASC) as user_rank
+        FROM 
+          users
+      ) as ranked_users
+      WHERE user_id = $1;
+    `;
+
+    const { rows } = await pool.query(fetchUserRankQuery, [authenticatedUserId]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ msg: 'User rank could not be determined.' });
+    }
+  
+    const currentUserRank = rows[0].user_rank;
+    res.json({ rank: currentUserRank 
+      
+    });
+
+  } catch (err) {
+    console.error("Error fetching user rank:", err.message);
+    res.status(500).send('Server Error');
+  }
+});
 
 module.exports = router;
