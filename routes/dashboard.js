@@ -17,7 +17,7 @@ router.get('/', authenticateToken, async (req, res) => {
     console.time('VaultsQuery');
     const vaultsResult = await pool.query(`
       SELECT 
-        v.vault_id, v.name, v.description, v.strategy_description, v.risk_level, v.status,
+        v.vault_id, v.name, v.description, v.strategy_description, v.risk_level, v.status, v.image_url,
         COALESCE(uvp.tradable_capital, 0) AS tradable_capital,
         COALESCE(uvp.pnl, 0) AS pnl
       FROM vaults v
