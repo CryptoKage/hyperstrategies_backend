@@ -164,4 +164,38 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
   }
 });
 
+router.put('/positions/:vaultId/compound', authenticateToken, async (req, res) => {
+  try {
+    const { vaultId } = req.params;
+    const { autoCompound } = req.body;
+    const userId = req.user.id;
+
+    // --- Validation ---
+    if (typeof autoCompound !== 'boolean') {
+      return res.status(400).json({ message: 'Invalid autoCompound value. Must be true or false.' });
+    }
+
+    // --- Database Update ---
+    const result = await pool.query(
+      `UPDATE user_vault_positions
+       SET auto_compound = $1
+       WHERE user_id = $2 AND vault_id = $3`,
+      [autoCompound, userId, vaultId]
+    );
+
+    // Check if any row was actually updated. If not, the user doesn't have a position there.
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'No active position found in this vault.' });
+    }
+    
+    res.status(200).json({ 
+      message: `Auto-compounding has been turned ${autoCompound ? 'ON' : 'OFF'}.`
+    });
+
+  } catch (err) {
+    console.error('Error updating auto-compound setting:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
