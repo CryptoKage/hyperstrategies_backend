@@ -91,5 +91,11 @@ app.listen(PORT, async () => {
   // You might want to run it once on startup for testing purposes
   processTimeWeightedRewards(); 
 
-  //
+  // Job 5: Process pending INTERNAL vault withdrawals
+  const { processPendingVaultWithdrawals } = require('./jobs/processVaultWithdrawals');
+  const SIXTY_SECONDS_IN_MS = 60 * 1000;
+  setInterval(() => {
+    processPendingVaultWithdrawals();
+  }, SIXTY_SECONDS_IN_MS); // Runs once every minute
+
 });

@@ -79,9 +79,88 @@ router.post('/archive-sweep/:position_id', async (req, res) => {
     }
     res.status(200).json({ message: `Position ${position_id} has been successfully archived.` });
   } catch (err) {
-    // ✅ THE FIX: The catch block now has the correct syntax.
+   
     console.error('Error archiving sweep:', err.message);
     res.status(500).send('Server Error');
+  }
+});
+
+router.post('/distribute-profit', async (req, res) => {
+  const { vault_id, total_profit_amount } = req.body;
+  const adminUserId = req.user.id; // For logging
+  const client = await pool.connect();
+
+  // --- 1. Validation ---
+  if (!vault_id || !total_profit_amount || parseFloat(total_profit_amount) <= 0) {
+    return res.status(400).json({ message: 'Vault ID and a positive total profit amount are required.' });
+  }
+  
+  console.log(`[Admin] Profit distribution initiated by admin ${adminUserId} for vault ${vault_id} with total profit of ${total_profit_amount}.`);
+
+  try {
+    await client.query('BEGIN');
+
+    // --- 2. Fetch all active participants and their capital in the specified vault ---
+    const { rows: participants } = await client.query(
+      `SELECT user_id, tradable_capital, auto_compound 
+       FROM user_vault_positions 
+       WHERE vault_id = $1 AND status = 'in_trade'`,
+      [vault_id]
+    );
+
+    if (participants.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'No active participants found in this vault to distribute profits to.' });
+    }
+
+    // --- 3. Calculate total capital in the vault to determine ownership percentages ---
+    const totalCapitalInVault = participants.reduce((sum, p) => sum + parseFloat(p.tradable_capital), 0);
+    if (totalCapitalInVault <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Cannot distribute profit, total capital in vault is zero.' });
+    }
+
+    // --- 4. Loop through each participant, calculate their share, and distribute ---
+    for (const participant of participants) {
+      const ownershipPercentage = parseFloat(participant.tradable_capital) / totalCapitalInVault;
+      const profitShare = ownershipPercentage * parseFloat(total_profit_amount);
+
+      if (profitShare <= 0) continue; // Skip if their share is zero
+
+      let description = '';
+      if (participant.auto_compound) {
+        // Add profit to their vault position (Auto-Compound ON)
+        await client.query(
+          'UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3',
+          [profitShare, participant.user_id, vault_id]
+        );
+        description = `Auto-compounded ${profitShare.toFixed(2)} USDC profit in Vault ${vault_id}.`;
+      } else {
+        // Add profit to their main available balance (Auto-Compound OFF - "Harvest")
+        await client.query(
+          'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+          [profitShare, participant.user_id]
+        );
+        description = `Harvested ${profitShare.toFixed(2)} USDC profit from Vault ${vault_id} to main balance.`;
+      }
+
+      // Log the transaction for the user's history
+      await client.query(
+        `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
+         VALUES ($1, 'PROFIT_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
+        [participant.user_id, description, profitShare]
+      );
+    }
+    
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Successfully distributed $${total_profit_amount} in profits to ${participants.length} participants in vault ${vault_id}.` });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`[Admin] Profit distribution failed for vault ${vault_id}:`, err);
+    res.status(500).send('Server Error');
+  } finally {
+    client.release();
   }
 });
 
