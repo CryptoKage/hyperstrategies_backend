@@ -145,4 +145,67 @@ router.post('/distribute-profit', async (req, res) => {
     }
 });
 
+router.get('/users/search', async (req, res) => {
+  const { query } = req.query;
+  if (!query || query.length < 3) {
+    return res.status(400).json({ message: 'Search query must be at least 3 characters long.' });
+  }
+
+  try {
+    // The ILIKE operator is case-insensitive, and '%' is a wildcard.
+    const searchQuery = `
+      SELECT user_id, username, email, eth_address 
+      FROM users 
+      WHERE 
+        username ILIKE $1 OR 
+        email ILIKE $1 OR 
+        eth_address ILIKE $1
+      LIMIT 10;
+    `;
+    const { rows } = await pool.query(searchQuery, [`%${query}%`]);
+    res.json(rows);
+  } catch (err) {
+    console.error('Admin user search error:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
+
+// @route   GET /api/admin/users/:userId
+// @desc    Get full details for a single user
+// @access  Admin
+router.get('/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    // Use Promise.all to fetch all user-related data concurrently for efficiency
+    const [
+      userDetails,
+      userPositions,
+      userActivity
+    ] = await Promise.all([
+      pool.query('SELECT * FROM users WHERE user_id = $1', [userId]),
+      pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1 ORDER BY entry_date DESC', [userId]),
+      pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
+    ]);
+
+    if (userDetails.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    // We don't want to send sensitive info like private keys or password hashes, even to an admin.
+    const { password_hash, encrypted_private_key, ...safeUserDetails } = userDetails.rows[0];
+    
+    res.json({
+      details: safeUserDetails,
+      positions: userPositions.rows,
+      activity: userActivity.rows
+    });
+
+  } catch (err) {
+    console.error(`Error fetching details for user ${userId}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
