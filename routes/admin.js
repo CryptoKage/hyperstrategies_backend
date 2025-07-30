@@ -208,4 +208,61 @@ router.get('/users/:userId', async (req, res) => {
   }
 });
 
+router.get('/deposits', async (req, res) => {
+  try {
+    // --- Pagination Parameters ---
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15;
+    const offset = (page - 1) * limit;
+    
+    // --- Search & Sort Parameters (optional) ---
+    const searchTerm = req.query.search || '';
+    const sortBy = req.query.sortBy || 'detected_at';
+    const sortOrder = req.query.sortOrder === 'ASC' ? 'ASC' : 'DESC';
+
+    // --- Build the Query ---
+    let query = `
+      SELECT
+        d.id,
+        d.user_id,
+        u.username,
+        u.email,
+        d.amount,
+        d.token,
+        d.tx_hash,
+        d.detected_at
+      FROM
+        deposits d
+      JOIN
+        users u ON d.user_id = u.user_id
+    `;
+    
+    const queryParams = [];
+    if (searchTerm) {
+      query += ` WHERE u.username ILIKE $1 OR u.email ILIKE $1 OR d.tx_hash ILIKE $1`;
+      queryParams.push(`%${searchTerm}%`);
+    }
+
+    query += ` ORDER BY ${sortBy} ${sortOrder} LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
+    queryParams.push(limit, offset);
+
+    // Also get the total count for pagination controls on the frontend
+    const totalResult = await pool.query('SELECT COUNT(*) FROM deposits;');
+    const totalDeposits = parseInt(totalResult.rows[0].count, 10);
+    
+    const { rows: deposits } = await pool.query(query, queryParams);
+
+    res.json({
+      deposits,
+      totalCount: totalDeposits,
+      totalPages: Math.ceil(totalDeposits / limit),
+      currentPage: page
+    });
+
+  } catch (err) {
+    console.error('Error fetching deposits for admin:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
