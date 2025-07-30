@@ -20,9 +20,8 @@ const getFeePercentageForTier = (accountTier) => {
   }
 };
 
-// --- Allocate Funds to Vault Endpoint (UPGRADED) ---
+// --- Allocate Funds to Vault Endpoint (UPGRADED V2) ---
 router.post('/invest', authenticateToken, async (req, res) => {
-  // --- ANNOTATION --- Renamed to /allocate for clarity, but /invest is fine too. Let's stick with /invest for now.
   const { vaultId, amount } = req.body;
   const userId = req.user.id;
   const client = await pool.connect();
@@ -35,12 +34,17 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // --- ANNOTATION --- We now fetch the user's account_tier along with their balance.
-    const userResult = await client.query('SELECT balance, referred_by_user_id, account_tier FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
-    if (userResult.rows.length === 0) {
-      throw new Error("User not found during allocation.");
-    }
+    // --- ANNOTATION --- We now run two queries in parallel to get user and vault data.
+    const [userResult, vaultResult] = await Promise.all([
+      client.query('SELECT balance, referred_by_user_id, account_tier FROM users WHERE user_id = $1 FOR UPDATE', [userId]),
+      client.query('SELECT fee_percentage FROM vaults WHERE vault_id = $1', [vaultId])
+    ]);
+    
+    if (userResult.rows.length === 0) throw new Error("User not found during allocation.");
+    if (vaultResult.rows.length === 0) throw new Error(`Vault with ID ${vaultId} not found.`);
+
     const userData = userResult.rows[0];
+    const vaultData = vaultResult.rows[0];
     
     const availableBalance_BN = ethers.utils.parseUnits(userData.balance.toString(), 6);
     const totalAmount_BN = ethers.utils.parseUnits(totalAmount_str, 6);
@@ -50,28 +54,35 @@ router.post('/invest', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient funds.' });
     }
 
-    // --- ANNOTATION --- New Fee Logic based on Account Tier
-    const feePercentage = getFeePercentageForTier(userData.account_tier);
-    const feeMultiplier = Math.round(feePercentage * 100); // e.g., 20, 18, 16
+    // --- ANNOTATION --- New Dynamic Fee Logic
+    // 1. Get the vault's base fee from the database.
+    const baseFeePercentage = parseFloat(vaultData.fee_percentage); // e.g., 0.20
+    
+    // 2. Calculate the tier-based discount.
+    // Tiers 1,2,3,4 provide discounts of 0%, 2%, 4%, 6% respectively
+    const discountPercentage = (userData.account_tier - 1) * 0.02; 
+    
+    // 3. Calculate the final, effective fee.
+    let finalFeePercentage = baseFeePercentage - discountPercentage;
+    // Ensure the fee doesn't go below a minimum (e.g., 10%)
+    finalFeePercentage = Math.max(0.10, finalFeePercentage); 
+
+    const feeMultiplier = Math.round(finalFeePercentage * 100);
     
     const bonusPointsAmount_BN = totalAmount_BN.mul(feeMultiplier).div(100);
-    const tradableAmount_BN = totalAmount_BN.sub(bonusPointsAmount_BN); // Tradable is now Total - Fee
+    const tradableAmount_BN = totalAmount_BN.sub(bonusPointsAmount_BN);
     
     const newBalance_BN = availableBalance_BN.sub(totalAmount_BN);
 
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
     
-    // --- ANNOTATION --- New Lock-in Period Logic
-    // We calculate the expiration date here. This applies to all allocations for now.
-    // We can add a check for `vaultId` if some vaults shouldn't have locks.
     const lockExpiresAt = new Date();
-    lockExpiresAt.setMonth(lockExpiresAt.getMonth() + 1); // Add 1 month
+    lockExpiresAt.setMonth(lockExpiresAt.getMonth() + 1);
 
     const existingPosition = await client.query('SELECT tradable_capital FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
     if (existingPosition.rows.length > 0) {
       const currentCapital_BN = ethers.utils.parseUnits(existingPosition.rows[0].tradable_capital.toString(), 6);
       const newCapital_BN = currentCapital_BN.add(tradableAmount_BN);
-      // We also update the lock-in period on new deposits to an existing position.
       await client.query('UPDATE user_vault_positions SET tradable_capital = $1, lock_expires_at = $2 WHERE user_id = $3 AND vault_id = $4', [ethers.utils.formatUnits(newCapital_BN, 6), lockExpiresAt, userId, vaultId]);
     } else {
       await client.query('INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital, lock_expires_at, status) VALUES ($1, $2, $3, $4, $5)', [userId, vaultId, ethers.utils.formatUnits(tradableAmount_BN, 6), lockExpiresAt, 'active']);
@@ -79,10 +90,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
     
     await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, ethers.utils.formatUnits(bonusPointsAmount_BN, 6)]);
     
-    // --- ANNOTATION --- Old vault_transactions logic can be replaced by our new activity log
-    // await client.query(`INSERT INTO vault_transactions ...`); // This is now deprecated
-
-    // --- ANNOTATION --- New Activity Log Entry
     const allocationDescription = `Allocated ${parseFloat(totalAmount_str).toFixed(2)} USDC to Vault ${vaultId}.`;
     await client.query(
       `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
@@ -90,13 +97,14 @@ router.post('/invest', authenticateToken, async (req, res) => {
       [userId, allocationDescription, totalAmount_str]
     );
 
-    // XP Logic (No changes needed here yet)
+    // --- XP Logic (no changes needed) ---
     const xpForAmount = Math.floor(parseFloat(totalAmount_str) / 10);
     if (xpForAmount > 0) {
       await client.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, userId]);
-      // We will add the tier calculation logic to the background job later.
     }
-    if (parseInt((await client.query('SELECT COUNT(*) FROM user_vault_positions WHERE user_id = $1', [userId])).rows[0].count) === 1) { // A better check for first allocation
+    const positionCheck = await client.query('SELECT COUNT(*) FROM user_vault_positions WHERE user_id = $1', [userId]);
+    const isFirstAllocation = parseInt(positionCheck.rows[0].count) === 1;
+    if (isFirstAllocation) {
       const referrerId = userData.referred_by_user_id;
       if (referrerId) {
         const referralXP = Math.floor(parseFloat(totalAmount_str) / 10);
