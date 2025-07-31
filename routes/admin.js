@@ -10,14 +10,14 @@ const { processAllocations } = require('../jobs/processAllocations');
 
 router.use(authenticateToken, isAdmin);
 
-// --- Get Full Admin Dashboard Stats Endpoint (UPGRADED) ---
+// --- Get Full Admin Dashboard Stats Endpoint ---
 router.get('/dashboard-stats', async (req, res) => {
   try {
     const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const [
       userCount, totalAvailable, totalInVaults, hotWalletBalance_BN, 
       recentDeposits, recentWithdrawals, failedSweeps, 
-      pendingVaultWithdrawals // This is our new query
+      pendingVaultWithdrawals
     ] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM users;'),
       pool.query('SELECT SUM(balance) as total FROM users;'),
@@ -43,9 +43,9 @@ router.get('/dashboard-stats', async (req, res) => {
       databaseConnected: true,
       alchemyConnected: true,
       recentDeposits: recentDeposits.rows,
-      recentWithdrawals: recentWithdrawals.rows, // External platform withdrawals
+      recentWithdrawals: recentWithdrawals.rows,
       failedSweeps: failedSweeps.rows,
-      pendingVaultWithdrawals: pendingVaultWithdrawals.rows // New data for the admin UI
+      pendingVaultWithdrawals: pendingVaultWithdrawals.rows
     });
   } catch (err) {
     console.error("Admin dashboard error:", err);
@@ -55,7 +55,7 @@ router.get('/dashboard-stats', async (req, res) => {
 
 // --- Endpoint to manually trigger the allocation sweep job ---
 router.post('/trigger-sweep', (req, res) => {
-  console.log(`[Admin] Manual sweep triggered by admin user: ${req.user.id}`); // Using user.id for better logging
+  console.log(`[Admin] Manual sweep triggered by admin user: ${req.user.id}`);
   processAllocations();
   res.status(202).json({ message: 'Allocation sweep job has been successfully triggered. Check server logs for progress.' });
 });
@@ -91,177 +91,91 @@ router.post('/archive-sweep/:position_id', async (req, res) => {
   }
 });
 
-// --- Endpoint for Profit Distribution ---
+// --- Endpoint for Profit Distribution (FINAL VERSION) ---
 router.post('/distribute-profit', async (req, res) => {
-    const { vault_id, total_profit_amount } = req.body;
-    const client = await pool.connect();
-    console.log(`[Admin] Profit distribution initiated by admin ${req.user.id} for vault ${vault_id} with total profit of ${total_profit_amount}.`);
+  const { vault_id, total_profit_amount } = req.body;
+  const adminUserId = req.user.id;
+  const client = await pool.connect();
 
-    if (!vault_id || !total_profit_amount || parseFloat(total_profit_amount) <= 0) {
-        return res.status(400).json({ message: 'Vault ID and a positive total profit amount are required.' });
+  if (!vault_id || !total_profit_amount || parseFloat(total_profit_amount) <= 0) {
+    return res.status(400).json({ message: 'Vault ID and a positive total profit amount are required.' });
+  }
+  
+  console.log(`[Admin] Profit distribution initiated by admin ${adminUserId} for vault ${vault_id} with total profit of ${total_profit_amount}.`);
+
+  try {
+    await client.query('BEGIN');
+
+    const vaultResult = await client.query('SELECT performance_fee_percentage FROM vaults WHERE vault_id = $1', [vault_id]);
+    if (vaultResult.rows.length === 0) throw new Error(`Vault ${vault_id} not found.`);
+    const basePerfFee = parseFloat(vaultResult.rows[0].performance_fee_percentage);
+
+    const { rows: participants } = await client.query(
+      `SELECT p.user_id, p.tradable_capital, p.auto_compound, u.account_tier 
+       FROM user_vault_positions p
+       JOIN users u ON p.user_id = u.user_id
+       WHERE p.vault_id = $1 AND p.status = 'in_trade'`,
+      [vault_id]
+    );
+
+    if (participants.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'No active participants found in this vault to distribute profits to.' });
     }
-    
-    try {
-        await client.query('BEGIN');
-        const { rows: participants } = await client.query(
-            `SELECT user_id, tradable_capital, auto_compound FROM user_vault_positions WHERE vault_id = $1 AND status = 'in_trade'`,
-            [vault_id]
-        );
-        if (participants.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ message: 'No active participants found in this vault.' });
-        }
-        const totalCapitalInVault = participants.reduce((sum, p) => sum + parseFloat(p.tradable_capital), 0);
-        if (totalCapitalInVault <= 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'Cannot distribute profit, total capital in vault is zero.' });
-        }
-        for (const participant of participants) {
-            const ownershipPercentage = parseFloat(participant.tradable_capital) / totalCapitalInVault;
-            const profitShare = ownershipPercentage * parseFloat(total_profit_amount);
-            if (profitShare <= 0) continue;
 
-            let description = '';
-            if (participant.auto_compound) {
-                await client.query('UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3', [profitShare, participant.user_id, vault_id]);
-                description = `Auto-compounded ${profitShare.toFixed(2)} USDC profit in Vault ${vault_id}.`;
-            } else {
-                await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [profitShare, participant.user_id]);
-                description = `Harvested ${profitShare.toFixed(2)} USDC profit from Vault ${vault_id} to main balance.`;
-            }
-            await client.query(
-                `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'PROFIT_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
-                [participant.user_id, description, profitShare]
-            );
-        }
-        await client.query('COMMIT');
-        res.status(200).json({ message: `Successfully distributed $${total_profit_amount} in profits to ${participants.length} participants in vault ${vault_id}.` });
-    } catch (err) {
+    const totalCapitalInVault = participants.reduce((sum, p) => sum + parseFloat(p.tradable_capital), 0);
+    if (totalCapitalInVault <= 0) {
         await client.query('ROLLBACK');
-        console.error(`[Admin] Profit distribution failed for vault ${vault_id}:`, err);
-        res.status(500).send('Server Error');
-    } finally {
-        client.release();
-    }
-});
-
-router.get('/users/search', async (req, res) => {
-  const { query } = req.query;
-  if (!query || query.length < 3) {
-    return res.status(400).json({ message: 'Search query must be at least 3 characters long.' });
-  }
-
-  try {
-    // The ILIKE operator is case-insensitive, and '%' is a wildcard.
-    const searchQuery = `
-      SELECT user_id, username, email, eth_address 
-      FROM users 
-      WHERE 
-        username ILIKE $1 OR 
-        email ILIKE $1 OR 
-        eth_address ILIKE $1
-      LIMIT 10;
-    `;
-    const { rows } = await pool.query(searchQuery, [`%${query}%`]);
-    res.json(rows);
-  } catch (err) {
-    console.error('Admin user search error:', err);
-    res.status(500).send('Server Error');
-  }
-});
-
-
-// @route   GET /api/admin/users/:userId
-// @desc    Get full details for a single user
-// @access  Admin
-router.get('/users/:userId', async (req, res) => {
-  const { userId } = req.params;
-
-  try {
-    // Use Promise.all to fetch all user-related data concurrently for efficiency
-    const [
-      userDetails,
-      userPositions,
-      userActivity
-    ] = await Promise.all([
-      pool.query('SELECT * FROM users WHERE user_id = $1', [userId]),
-      pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1 ORDER BY entry_date DESC', [userId]),
-      pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
-    ]);
-
-    if (userDetails.rows.length === 0) {
-      return res.status(404).json({ message: 'User not found.' });
+        return res.status(400).json({ message: 'Cannot distribute profit, total capital in vault is zero.' });
     }
 
-    // We don't want to send sensitive info like private keys or password hashes, even to an admin.
-    const { password_hash, encrypted_private_key, ...safeUserDetails } = userDetails.rows[0];
-    
-    res.json({
-      details: safeUserDetails,
-      positions: userPositions.rows,
-      activity: userActivity.rows
-    });
+    for (const participant of participants) {
+      const ownershipPercentage = parseFloat(participant.tradable_capital) / totalCapitalInVault;
+      const grossProfitShare = ownershipPercentage * parseFloat(total_profit_amount);
 
-  } catch (err) {
-    console.error(`Error fetching details for user ${userId}:`, err);
-    res.status(500).send('Server Error');
-  }
-});
+      // --- NEW PERFORMANCE FEE LOGIC ---
+      let finalPerfFee = basePerfFee;
+      // Special rule for Vault 2 (ApeCoin) and high-tier users
+      if (parseInt(vault_id, 10) === 2 && participant.account_tier >= 4) {
+        finalPerfFee = 0.30; // 30% performance fee instead of the base 40%
+      }
+      
+      const feeAmount = grossProfitShare * finalPerfFee;
+      const netProfitForUser = grossProfitShare - feeAmount;
 
-router.get('/deposits', async (req, res) => {
-  try {
-    // --- Pagination Parameters ---
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 15;
-    const offset = (page - 1) * limit;
-    
-    // --- Search & Sort Parameters (optional) ---
-    const searchTerm = req.query.search || '';
-    const sortBy = req.query.sortBy || 'detected_at';
-    const sortOrder = req.query.sortOrder === 'ASC' ? 'ASC' : 'DESC';
+      if (netProfitForUser <= 0) continue;
 
-    // --- Build the Query ---
-    let query = `
-      SELECT
-        d.id,
-        d.user_id,
-        u.username,
-        u.email,
-        d.amount,
-        d.token,
-        d.tx_hash,
-        d.detected_at
-      FROM
-        deposits d
-      JOIN
-        users u ON d.user_id = u.user_id
-    `;
-    
-    const queryParams = [];
-    if (searchTerm) {
-      query += ` WHERE u.username ILIKE $1 OR u.email ILIKE $1 OR d.tx_hash ILIKE $1`;
-      queryParams.push(`%${searchTerm}%`);
+      let description = '';
+      if (participant.auto_compound) {
+        await client.query(
+          'UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3',
+          [netProfitForUser, participant.user_id, vault_id]
+        );
+        description = `Auto-compounded ${netProfitForUser.toFixed(2)} USDC profit in Vault ${vault_id}.`;
+      } else {
+        await client.query(
+          'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+          [netProfitForUser, participant.user_id]
+        );
+        description = `Harvested ${netProfitForUser.toFixed(2)} USDC profit from Vault ${vault_id} to main balance.`;
+      }
+
+      await client.query(
+        `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
+         VALUES ($1, 'PROFIT_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
+        [participant.user_id, description, netProfitForUser]
+      );
     }
-
-    query += ` ORDER BY ${sortBy} ${sortOrder} LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
-    queryParams.push(limit, offset);
-
-    // Also get the total count for pagination controls on the frontend
-    const totalResult = await pool.query('SELECT COUNT(*) FROM deposits;');
-    const totalDeposits = parseInt(totalResult.rows[0].count, 10);
     
-    const { rows: deposits } = await pool.query(query, queryParams);
-
-    res.json({
-      deposits,
-      totalCount: totalDeposits,
-      totalPages: Math.ceil(totalDeposits / limit),
-      currentPage: page
-    });
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Successfully distributed $${total_profit_amount} in profits to ${participants.length} participants in vault ${vault_id}.` });
 
   } catch (err) {
-    console.error('Error fetching deposits for admin:', err);
+    await client.query('ROLLBACK');
+    console.error(`[Admin] Profit distribution failed for vault ${vault_id}:`, err);
     res.status(500).send('Server Error');
+  } finally {
+    client.release();
   }
 });
 
