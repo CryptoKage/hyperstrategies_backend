@@ -6,40 +6,49 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
+const axios = require('axios'); // For CoinGecko API
 
 // --- Setup for On-Chain Lookups ---
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
+// --- NEW --- Create a contract instance for APE coin, assuming it's in your tokenMap
+const apeContract = new ethers.Contract(tokenMap.ape.address, erc20Abi, provider);
 
-// --- Get User Wallet Info Endpoint ---
+// --- Get User Wallet Info Endpoint (CORRECTED VERSION) ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // 1. Get user's ETH address first.
     const userResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
     if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'User wallet not found.' });
     }
     const userAddress = userResult.rows[0].eth_address;
 
-    // 2. Now, make the on-chain calls and DB calls in parallel.
-    const [ethBalanceBigNumber, usdcBalanceBigNumber, bonusPointsResult] = await Promise.all([
-      provider.getBalance(userAddress),
+    // --- CORRECTION ---
+    // The Promise.all array was structured incorrectly. This is the correct syntax.
+    // We fetch USDC balance, APE balance, Bonus Points, and APE Price all at the same time.
+    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult, apePriceResponse] = await Promise.all([
       usdcContract.balanceOf(userAddress),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
+      apeContract.balanceOf(userAddress),
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
+      axios.get('https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd')
     ]);
     
-    // 3. Format all data.
-    const ethBalance = ethers.utils.formatEther(ethBalanceBigNumber);
+    // --- CORRECTION ---
+    // The data is formatted after the Promise.all has successfully completed.
     const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, tokenMap.usdc.decimals);
+    const apeBalance = ethers.utils.formatUnits(apeBalanceBigNumber, tokenMap.ape.decimals);
     const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
+    const apePriceUsd = apePriceResponse.data.apecoin.usd;
 
+    // The JSON response now correctly includes the APE data and removes the ETH balance.
     res.json({
       address: userAddress,
-      ethBalance: parseFloat(ethBalance),
       usdcBalance: parseFloat(usdcBalance),
+      apeBalance: parseFloat(apeBalance),
+      apePrice: apePriceUsd,
       totalBonusPoints: totalBonusPoints
     });
 
@@ -53,8 +62,9 @@ router.get('/wallet', authenticateToken, async (req, res) => {
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
+    // --- NEW --- Also select the account_tier
     const result = await pool.query(
-      'SELECT username, email, bio, xp, referral_code FROM users WHERE user_id = $1',
+      'SELECT username, email, bio, xp, referral_code, account_tier FROM users WHERE user_id = $1',
       [userId]
     );
     if (result.rows.length === 0) {
@@ -71,7 +81,8 @@ router.get('/profile', authenticateToken, async (req, res) => {
 router.put('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { username, bio } = req.body;
+    // --- NEW --- Only accept username, bio is deprecated
+    const { username } = req.body;
 
     if (!username || username.length < 3) {
       return res.status(400).json({ error: 'Username must be at least 3 characters.' });
@@ -85,9 +96,10 @@ router.put('/profile', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Username is already taken.' });
     }
 
+    // --- NEW --- Query no longer updates bio
     await pool.query(
-      'UPDATE users SET username = $1, bio = $2 WHERE user_id = $3',
-      [username, bio, userId]
+      'UPDATE users SET username = $1 WHERE user_id = $2',
+      [username, userId]
     );
     
     res.status(200).json({ message: 'Profile updated successfully!' });
@@ -102,8 +114,6 @@ router.put('/profile', authenticateToken, async (req, res) => {
 // --- Get Leaderboard Endpoint ---
 router.get('/leaderboard', async (req, res) => {
   try {
-    // ✅ THE FIX: We now select eth_address as well.
-    // We still select username to help the frontend identify the current user.
     const leaderboardResult = await pool.query(
       `SELECT eth_address, xp FROM users WHERE eth_address IS NOT NULL ORDER BY xp DESC, created_at ASC LIMIT 25`
     );
@@ -114,12 +124,10 @@ router.get('/leaderboard', async (req, res) => {
   }
 });
 
+// --- Get My Rank Endpoint ---
 router.get('/my-rank', authenticateToken, async (req, res) => {
   try {
     const authenticatedUserId = req.user.id;
-
-    // --- ANNOTATION: The query has been updated. ---
-    // We now select both 'user_rank' and 'user_xp' from our subquery.
     const fetchUserRankAndXpQuery = `
       SELECT user_rank, user_xp FROM (
         SELECT 
@@ -131,26 +139,22 @@ router.get('/my-rank', authenticateToken, async (req, res) => {
       ) as ranked_users
       WHERE user_id = $1;
     `;
-
     const { rows } = await pool.query(fetchUserRankAndXpQuery, [authenticatedUserId]);
-
     if (rows.length === 0) {
       return res.status(404).json({ msg: 'User rank could not be determined.' });
     }
-
     const currentUserRank = rows[0].user_rank;
-    const currentUserXp = rows[0].user_xp; // 
-
+    const currentUserXp = rows[0].user_xp;
     res.json({ 
       rank: currentUserRank,
       xp: currentUserXp 
     });
-
   } catch (err) {
     console.error("Error fetching user rank:", err.message);
     res.status(500).send('Server Error');
   }
 });
+
 
 router.put('/referral-code', authenticateToken, async (req, res) => {
   const { desiredCode } = req.body;
