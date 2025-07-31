@@ -17,7 +17,7 @@ router.get('/', authenticateToken, async (req, res) => {
       pool.query('SELECT username, balance, eth_address, account_tier FROM users WHERE user_id = $1', [userId]),
 
       // Query 2: Get all available vaults, filtered and ordered correctly
-      pool.query("SELECT * FROM vaults WHERE status = 'active' ORDER BY vault_id ASC"),
+     pool.query("SELECT * FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
 
       // Query 3: Get all of the user's specific vault positions with all details
       pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1', [userId]),
