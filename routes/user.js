@@ -6,16 +6,42 @@ const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
 const axios = require('axios');
-const erc20Abi = require('../utils/abis/erc20.json'); // --- NEW: Import the ABI from our file
+const erc20Abi = require('../utils/abis/erc20.json');
 
 // --- Setup for On-Chain Lookups ---
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-// The rest of this file is now correct because it uses the full erc20Abi for both contracts
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 const apeContract = new ethers.Contract(tokenMap.ape.address, erc20Abi, provider);
 
+// --- NEW --- Simple In-Memory Cache for CoinGecko Price
+const priceCache = {
+  apePrice: null,
+  lastFetched: null,
+  cacheDuration: 5 * 60 * 1000, // 5 minutes in milliseconds
+};
 
-// --- Get User Wallet Info Endpoint (CORRECTED VERSION) ---
+// --- NEW --- Helper function to get the APE price, using the cache
+async function getApePrice() {
+  const now = Date.now();
+  // If we have a cached price AND the cache is not expired, return the cached price
+  if (priceCache.apePrice && priceCache.lastFetched && (now - priceCache.lastFetched < priceCache.cacheDuration)) {
+    console.log('Serving APE price from cache.');
+    return priceCache.apePrice;
+  }
+  
+  // Otherwise, fetch a fresh price from the API
+  console.log('Fetching fresh APE price from CoinGecko...');
+  const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd');
+  const price = response.data.apecoin.usd;
+  
+  // Update the cache
+  priceCache.apePrice = price;
+  priceCache.lastFetched = now;
+  
+  return price;
+}
+
+// --- Get User Wallet Info Endpoint (UPGRADED WITH CACHING) ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -26,24 +52,18 @@ router.get('/wallet', authenticateToken, async (req, res) => {
     }
     const userAddress = userResult.rows[0].eth_address;
 
-    // --- CORRECTION ---
-    // The Promise.all array was structured incorrectly. This is the correct syntax.
-    // We fetch USDC balance, APE balance, Bonus Points, and APE Price all at the same time.
-    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult, apePriceResponse] = await Promise.all([
+    // We now call our caching function instead of axios directly inside the Promise.all
+    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult, apePriceUsd] = await Promise.all([
       usdcContract.balanceOf(userAddress),
       apeContract.balanceOf(userAddress),
       pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
-      axios.get('https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd')
+      getApePrice() // Use our new caching helper function
     ]);
     
-    // --- CORRECTION ---
-    // The data is formatted after the Promise.all has successfully completed.
     const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, tokenMap.usdc.decimals);
     const apeBalance = ethers.utils.formatUnits(apeBalanceBigNumber, tokenMap.ape.decimals);
     const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
-    const apePriceUsd = apePriceResponse.data.apecoin.usd;
 
-    // The JSON response now correctly includes the APE data and removes the ETH balance.
     res.json({
       address: userAddress,
       usdcBalance: parseFloat(usdcBalance),
@@ -53,6 +73,8 @@ router.get('/wallet', authenticateToken, async (req, res) => {
     });
 
   } catch (err) {
+    // This is the catch block where the res.status(500) lives.
+    // It catches errors from any of the `await` calls inside the `try` block.
     console.error('Error fetching wallet data:', err.message);
     res.status(500).send('Server Error');
   }
@@ -62,7 +84,6 @@ router.get('/wallet', authenticateToken, async (req, res) => {
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    // --- NEW --- Also select the account_tier
     const result = await pool.query(
       'SELECT username, email, bio, xp, referral_code, account_tier FROM users WHERE user_id = $1',
       [userId]
