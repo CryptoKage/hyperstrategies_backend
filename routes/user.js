@@ -1,19 +1,19 @@
 // server/routes/user.js
-
 const express = require('express');
 const router = express.Router();
 const { ethers } = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
-const axios = require('axios'); // For CoinGecko API
+const axios = require('axios');
+const erc20Abi = require('../utils/abis/erc20.json'); // --- NEW: Import the ABI from our file
 
 // --- Setup for On-Chain Lookups ---
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
+// The rest of this file is now correct because it uses the full erc20Abi for both contracts
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
-// --- NEW --- Create a contract instance for APE coin, assuming it's in your tokenMap
 const apeContract = new ethers.Contract(tokenMap.ape.address, erc20Abi, provider);
+
 
 // --- Get User Wallet Info Endpoint (CORRECTED VERSION) ---
 router.get('/wallet', authenticateToken, async (req, res) => {

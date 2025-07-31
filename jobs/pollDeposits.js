@@ -46,7 +46,7 @@ async function pollDeposits() {
       try {
         const transfers = await alchemy.core.getAssetTransfers({
           toAddress: user.eth_address,
-          contractAddresses: [tokenMap.usdc.address],
+          contractAddresses: [tokenMap.usdc.address, tokenMap.ape.address],
           excludeZeroValue: true,
           category: ["erc20"],
           fromBlock: `0x${(fromBlock + 1).toString(16)}`,
