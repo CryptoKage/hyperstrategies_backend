@@ -14,6 +14,10 @@ const tokenMap = {
     address: '0xdac17f958d2ee523a2206206994597c13d831ec7',
     decimals: 6,
     abi: usdcAbi // temporarily reuse until USDT ABI added
+  },
+  ape: {
+    address: '0x4d224452801ACEd8B2F0aebE155379bb5D594381',
+    decimals: 18
   }
 };
 
