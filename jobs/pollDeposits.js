@@ -29,84 +29,79 @@ async function pollDeposits() {
     const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
     const latestBlock = await alchemy.core.getBlockNumber();
 
-    const lookbackBlocks = 10; // A safe buffer for API data lag
+    const lookbackBlocks = 10;
     const fromBlock = lastProcessedBlock - lookbackBlocks;
     const toBlock = latestBlock;
 
-    console.log(`Scanning from block #${fromBlock} to #${toBlock} (last processed: #${lastProcessedBlock})`);
+    console.log(`Scanning from block #${fromBlock} to #${toBlock}`);
 
     if (fromBlock >= toBlock) {
       console.log('No new blocks to scan.');
-      if (client) client.release();
+      if(client) client.release();
       return;
     }
 
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     if (users.length === 0) {
-      console.log('No users with registered addresses to check.');
-      if (client) client.release();
+      console.log('No users with addresses to check.');
+      if(client) client.release();
       return;
     }
+    
+    // --- THIS IS THE CORRECT, ROBUST LOGIC ---
+    // We loop through each user and check their address individually.
+    for (const user of users) {
+      try {
+        const transfers = await alchemy.core.getAssetTransfers({
+          toAddress: user.eth_address,
+          contractAddresses: [tokenMap.usdc.address], // Only looking for USDC
+          excludeZeroValue: true,
+          // This category includes all types of transfers, including internal ones from contracts like Relay
+          category: [AssetTransfersCategory.ERC20], 
+          fromBlock: ethers.utils.hexlify(fromBlock),
+          toBlock: ethers.utils.hexlify(toBlock)
+        });
 
-    // --- THIS IS THE ROBUST QUERY ---
-    const allTransfers = await alchemy.core.getAssetTransfers({
-      fromBlock: ethers.utils.hexlify(fromBlock),
-      toBlock: ethers.utils.hexlify(toBlock),
-      // Ask for all types of ERC20 transfers (external, internal, etc.)
-      category: [AssetTransfersCategory.ERC20],
-      // We are no longer filtering by a 'toAddress' in the API call
-    });
+        if (transfers.transfers.length > 0) {
+          console.log(`[DEBUG] Found ${transfers.transfers.length} potential USDC transfers for user ${user.user_id}`);
+        }
 
-    console.log(`[DEBUG] Found ${allTransfers.transfers.length} total ERC20 transfers in block range to filter.`);
+        for (const event of transfers.transfers) {
+          const txHash = event.hash;
+          // This check prevents double-counting deposits, making our look-back safe.
+          const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
-    // Create a fast lookup map of our user addresses (case-insensitive)
-    const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
-
-    for (const event of allTransfers.transfers) {
-      const toAddress = event.to?.toLowerCase();
-
-      // Check if the destination of this transfer is one of our users
-      if (userAddressMap.has(toAddress)) {
-        const userId = userAddressMap.get(toAddress);
-        const txHash = event.hash;
-        
-        // Prevent double-counting from our look-back window
-        const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
-        if (existingDeposit.rows.length === 0) {
-          
-          const tokenSymbol = (event.asset || '').toLowerCase();
-          const tokenInfo = tokenMap[tokenSymbol];
-
-          // For now, we only care about USDC. We can expand this later.
-          if (!tokenInfo || tokenSymbol !== 'usdc') {
-            continue;
-          }
-
-          const rawAmount = event.value;
-          const amountStr = parseFloat(rawAmount).toFixed(tokenInfo.decimals);
-
-          console.log(`✅ New USDC deposit detected for user ${userId}: ${amountStr}, tx: ${txHash}`);
-          
-          await client.query('BEGIN');
-          try {
-            await client.query(
-              `INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`,
-              [userId, amountStr, txHash]
-            );
-            await client.query(
-              'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
-              [amountStr, userId]
-            );
-            await client.query('COMMIT');
-            console.log(`✅ Successfully processed deposit for tx ${txHash}`);
-          } catch (dbError) {
-            await client.query('ROLLBACK');
-            console.error(`Database error processing tx ${txHash}:`, dbError);
+          if (existingDeposit.rows.length === 0) {
+            const rawAmount = event.value;
+            const amountStr = parseFloat(rawAmount).toFixed(tokenMap.usdc.decimals);
+            
+            console.log(`✅ New USDC deposit detected for user ${user.user_id}: ${amountStr}, tx: ${txHash}`);
+            
+            await client.query('BEGIN');
+            try {
+              await client.query(
+                `INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`,
+                [user.user_id, amountStr, txHash]
+              );
+              await client.query(
+                'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+                [amountStr, user.user_id]
+              );
+              await client.query('COMMIT');
+              console.log(`✅ Successfully processed deposit for tx ${txHash}`);
+            } catch (dbError) {
+              await client.query('ROLLBACK');
+              console.error(`Database error processing tx ${txHash}:`, dbError);
+            }
           }
         }
+      } catch (e) {
+        console.error(`❌ Failed to fetch transfers for user ${user.user_id}:`, e.message);
+        // We continue to the next user even if one fails
       }
     }
 
+    // Update the system state with the latest block we've scanned up to.
     await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
     console.log(`✅ Finished scan. Next scan will start from block #${toBlock}`);
 
