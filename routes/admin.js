@@ -14,11 +14,7 @@ router.use(authenticateToken, isAdmin);
 router.get('/dashboard-stats', async (req, res) => {
   try {
     const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-    const [
-      userCount, totalAvailable, totalInVaults, hotWalletBalance_BN, 
-      recentDeposits, recentWithdrawals, failedSweeps, 
-      pendingVaultWithdrawals
-    ] = await Promise.all([
+    const [ userCount, totalAvailable, totalInVaults, hotWalletBalance_BN, recentDeposits, recentWithdrawals, failedSweeps, pendingVaultWithdrawals ] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM users;'),
       pool.query('SELECT SUM(balance) as total FROM users;'),
       pool.query('SELECT SUM(tradable_capital) as total FROM user_vault_positions;'),
@@ -26,13 +22,7 @@ router.get('/dashboard-stats', async (req, res) => {
       pool.query(`SELECT d.amount, u.username, d.detected_at FROM deposits d JOIN users u ON d.user_id = u.user_id ORDER BY d.detected_at DESC LIMIT 5;`),
       pool.query(`SELECT w.amount, u.username, w.created_at FROM withdrawal_queue w JOIN users u ON w.user_id = u.user_id ORDER BY w.created_at DESC LIMIT 5;`),
       pool.query(`SELECT p.position_id, u.username, p.tradable_capital FROM user_vault_positions p JOIN users u ON p.user_id = u.user_id WHERE p.status = 'sweep_failed';`),
-      pool.query(`
-        SELECT log.activity_id, log.amount_primary, log.description, u.username, log.created_at
-        FROM user_activity_log log
-        JOIN users u ON log.user_id = u.user_id
-        WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING'
-        ORDER BY log.created_at ASC;
-      `)
+      pool.query(`SELECT log.activity_id, log.amount_primary, log.description, u.username, log.created_at FROM user_activity_log log JOIN users u ON log.user_id = u.user_id WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING' ORDER BY log.created_at ASC;`)
     ]);
 
     res.json({
@@ -77,10 +67,7 @@ router.post('/archive-sweep/:position_id', async (req, res) => {
   try {
     const { position_id } = req.params;
     console.log(`[Admin] Archiving failed sweep for position ${position_id} by ${req.user.id}`);
-    const { rowCount } = await pool.query(
-      "UPDATE user_vault_positions SET status = 'archived' WHERE position_id = $1 AND status = 'sweep_failed'",
-      [position_id]
-    );
+    const { rowCount } = await pool.query( "UPDATE user_vault_positions SET status = 'archived' WHERE position_id = $1 AND status = 'sweep_failed'", [position_id] );
     if (rowCount === 0) {
       return res.status(404).json({ error: 'Failed sweep for the given position not found.' });
     }
@@ -91,7 +78,7 @@ router.post('/archive-sweep/:position_id', async (req, res) => {
   }
 });
 
-// --- Endpoint for Profit Distribution (FINAL VERSION) ---
+// --- Endpoint for Profit Distribution (with Revenue Logging) ---
 router.post('/distribute-profit', async (req, res) => {
   const { vault_id, total_profit_amount } = req.body;
   const adminUserId = req.user.id;
@@ -129,42 +116,50 @@ router.post('/distribute-profit', async (req, res) => {
         return res.status(400).json({ message: 'Cannot distribute profit, total capital in vault is zero.' });
     }
 
+    // --- NEW --- Variable to track total performance fee for this distribution
+    let totalPerformanceFee = 0;
+
     for (const participant of participants) {
       const ownershipPercentage = parseFloat(participant.tradable_capital) / totalCapitalInVault;
       const grossProfitShare = ownershipPercentage * parseFloat(total_profit_amount);
 
-      // --- NEW PERFORMANCE FEE LOGIC ---
       let finalPerfFee = basePerfFee;
-      // Special rule for Vault 2 (ApeCoin) and high-tier users
       if (parseInt(vault_id, 10) === 2 && participant.account_tier >= 4) {
-        finalPerfFee = 0.30; // 30% performance fee instead of the base 40%
+        finalPerfFee = 0.30;
       }
       
       const feeAmount = grossProfitShare * finalPerfFee;
       const netProfitForUser = grossProfitShare - feeAmount;
+      
+      // Add this distribution's fee to our running total
+      if (feeAmount > 0) {
+        totalPerformanceFee += feeAmount;
+      }
 
       if (netProfitForUser <= 0) continue;
 
       let description = '';
       if (participant.auto_compound) {
-        await client.query(
-          'UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3',
-          [netProfitForUser, participant.user_id, vault_id]
-        );
+        await client.query('UPDATE user_vault_positions SET tradable_capital = tradable_capital + $1 WHERE user_id = $2 AND vault_id = $3', [netProfitForUser, participant.user_id, vault_id]);
         description = `Auto-compounded ${netProfitForUser.toFixed(2)} USDC profit in Vault ${vault_id}.`;
       } else {
-        await client.query(
-          'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
-          [netProfitForUser, participant.user_id]
-        );
+        await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [netProfitForUser, participant.user_id]);
         description = `Harvested ${netProfitForUser.toFixed(2)} USDC profit from Vault ${vault_id} to main balance.`;
       }
 
       await client.query(
-        `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
-         VALUES ($1, 'PROFIT_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
+        `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'PROFIT_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
         [participant.user_id, description, netProfitForUser]
       );
+    }
+    
+    // --- NEW --- After the loop, log the single, total performance fee revenue
+    if (totalPerformanceFee > 0) {
+        const revenueNote = `Total performance fee from ${participants.length} users in vault ${vault_id}.`;
+        await client.query(
+            `INSERT INTO platform_revenue (source, amount, notes, related_vault_id) VALUES ('PERFORMANCE_FEE', $1, $2, $3)`,
+            [totalPerformanceFee, revenueNote, vault_id]
+        );
     }
     
     await client.query('COMMIT');

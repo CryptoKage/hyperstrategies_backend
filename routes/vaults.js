@@ -7,7 +7,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 
 const router = express.Router();
 
-// --- Allocate Funds to Vault Endpoint (FINAL VERSION) ---
+// --- Allocate Funds to Vault Endpoint (with Revenue Logging) ---
 router.post('/invest', authenticateToken, async (req, res) => {
   const { vaultId, amount } = req.body;
   const userId = req.user.id;
@@ -23,7 +23,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
     const [userResult, vaultResult] = await Promise.all([
       client.query('SELECT balance, referred_by_user_id, account_tier FROM users WHERE user_id = $1 FOR UPDATE', [userId]),
-      // This query now fetches the new is_fee_tier_based flag
       client.query('SELECT fee_percentage, is_fee_tier_based FROM vaults WHERE vault_id = $1', [vaultId])
     ]);
     
@@ -41,17 +40,14 @@ router.post('/invest', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient funds.' });
     }
 
-    // --- NEW FEE LOGIC ---
     let finalFeePercentage;
-    const baseFeePercentage = parseFloat(vaultData.fee_percentage); // e.g., 0.20 for Core, 0.10 for Ape
+    const baseFeePercentage = parseFloat(vaultData.fee_percentage);
 
     if (vaultData.is_fee_tier_based) {
-      // Logic for vaults like Core1, where fees are discounted by tier
       const discountPercentage = (userData.account_tier - 1) * 0.02; 
       finalFeePercentage = baseFeePercentage - discountPercentage;
-      finalFeePercentage = Math.max(0.10, finalFeePercentage); // Enforce a minimum 10% fee
+      finalFeePercentage = Math.max(0.10, finalFeePercentage);
     } else {
-      // Logic for vaults like ApeCoin, where the fee is a flat rate
       finalFeePercentage = baseFeePercentage;
     }
 
@@ -59,6 +55,8 @@ router.post('/invest', authenticateToken, async (req, res) => {
     const bonusPointsAmount_BN = totalAmount_BN.mul(feeMultiplier).div(100);
     const tradableAmount_BN = totalAmount_BN.sub(bonusPointsAmount_BN);
     const newBalance_BN = availableBalance_BN.sub(totalAmount_BN);
+    
+    const depositFeeAmount = ethers.utils.formatUnits(bonusPointsAmount_BN, 6);
 
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
     
@@ -74,7 +72,17 @@ router.post('/invest', authenticateToken, async (req, res) => {
       await client.query('INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital, lock_expires_at, status) VALUES ($1, $2, $3, $4, $5)', [userId, vaultId, ethers.utils.formatUnits(tradableAmount_BN, 6), lockExpiresAt, 'active']);
     }
     
-    await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, ethers.utils.formatUnits(bonusPointsAmount_BN, 6)]);
+    await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, depositFeeAmount]);
+    
+    // --- THIS IS THE NEWLY ADDED CODE ---
+    // Log this deposit fee as platform revenue
+    const revenueNote = `Deposit fee from user ${userId} for vault ${vaultId}.`;
+    await client.query(
+      `INSERT INTO platform_revenue (source, amount, notes, related_user_id, related_vault_id)
+       VALUES ('DEPOSIT_FEE', $1, $2, $3, $4)`,
+      [depositFeeAmount, revenueNote, userId, vaultId]
+    );
+    // --- END OF NEW CODE ---
     
     const allocationDescription = `Allocated ${parseFloat(totalAmount_str).toFixed(2)} USDC to Vault ${vaultId}.`;
     await client.query(
