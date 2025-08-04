@@ -23,41 +23,47 @@ const priceCache = {
 // --- NEW --- Helper function to get the APE price, using the cache
 async function getApePrice() {
   const now = Date.now();
-  // If we have a cached price AND the cache is not expired, return the cached price
-  if (priceCache.apePrice && priceCache.lastFetched && (now - priceCache.lastFetched < priceCache.cacheDuration)) {
-    console.log('Serving APE price from cache.');
+  if (priceCache.apePrice && (now - priceCache.lastFetched < priceCache.cacheDuration)) {
     return priceCache.apePrice;
   }
   
-  // Otherwise, fetch a fresh price from the API
-  console.log('Fetching fresh APE price from CoinGecko...');
-  const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd');
-  const price = response.data.apecoin.usd;
-  
-  // Update the cache
-  priceCache.apePrice = price;
-  priceCache.lastFetched = now;
-  
-  return price;
+  try {
+    console.log('Fetching fresh APE price from CoinGecko...');
+    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd');
+    const price = response.data.apecoin.usd;
+    priceCache.apePrice = price;
+    priceCache.lastFetched = now;
+    return price;
+  } catch (error) {
+    console.error('CoinGecko API call failed:', error.message);
+    // --- KEY FIX --- If the API call fails, but we have an old cached price, serve the old price.
+    // This prevents the whole wallet page from crashing if CoinGecko is down or rate limiting.
+    if (priceCache.apePrice) {
+      console.warn('Serving STALE APE price from cache due to API failure.');
+      return priceCache.apePrice;
+    }
+    // If we have no cached price and the API fails, we have to throw an error.
+    throw new Error('Could not fetch APE price.');
+  }
 }
 
-// --- Get User Wallet Info Endpoint (UPGRADED WITH CACHING) ---
+// --- UPGRADED /wallet Endpoint ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-
     const userResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User wallet not found.' });
-    }
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User wallet not found.' });
+    
     const userAddress = userResult.rows[0].eth_address;
 
-    // We now call our caching function instead of axios directly inside the Promise.all
-    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult, apePriceUsd] = await Promise.all([
+    // We now fetch the price FIRST.
+    const apePriceUsd = await getApePrice();
+
+    // Then we fetch the on-chain and DB data.
+    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult] = await Promise.all([
       usdcContract.balanceOf(userAddress),
       apeContract.balanceOf(userAddress),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
-      getApePrice() // Use our new caching helper function
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
     ]);
     
     const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, tokenMap.usdc.decimals);
@@ -73,9 +79,7 @@ router.get('/wallet', authenticateToken, async (req, res) => {
     });
 
   } catch (err) {
-    // This is the catch block where the res.status(500) lives.
-    // It catches errors from any of the `await` calls inside the `try` block.
-    console.error('Error fetching wallet data:', err.message);
+    console.error('Error in /wallet endpoint:', err.message);
     res.status(500).send('Server Error');
   }
 });
