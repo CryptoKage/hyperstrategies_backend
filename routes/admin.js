@@ -179,4 +179,96 @@ router.post('/distribute-profit', async (req, res) => {
   }
 });
 
+// @route   GET /api/admin/users/search
+// @desc    Search for users by username, email, or wallet address
+// @access  Admin
+router.get('/users/search', async (req, res) => {
+  const { query } = req.query;
+  if (!query || query.length < 3) {
+    return res.status(400).json({ message: 'Search query must be at least 3 characters long.' });
+  }
+
+  try {
+    const searchQuery = `
+      SELECT user_id, username, email, eth_address 
+      FROM users 
+      WHERE 
+        username ILIKE $1 OR 
+        email ILIKE $1 OR 
+        eth_address ILIKE $1
+      LIMIT 10;
+    `;
+    const { rows } = await pool.query(searchQuery, [`%${query}%`]);
+    res.json(rows);
+  } catch (err) {
+    console.error('Admin user search error:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
+router.get('/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const [userDetails, userPositions, userActivity] = await Promise.all([
+      pool.query('SELECT * FROM users WHERE user_id = $1', [userId]),
+      pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1 ORDER BY entry_date DESC', [userId]),
+      pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
+    ]);
+
+    if (userDetails.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const { password_hash, encrypted_private_key, ...safeUserDetails } = userDetails.rows[0];
+    
+    res.json({
+      details: safeUserDetails,
+      positions: userPositions.rows,
+      activity: userActivity.rows
+    });
+
+  } catch (err) {
+    console.error(`Error fetching details for user ${userId}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   GET /api/admin/deposits
+// @desc    Get a paginated list of all deposits
+// @access  Admin
+router.get('/deposits', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15;
+    const offset = (page - 1) * limit;
+    const searchTerm = req.query.search || '';
+
+    let query = `
+      SELECT d.id, d.user_id, u.username, u.email, d.amount, d.token, d.tx_hash, d.detected_at
+      FROM deposits d JOIN users u ON d.user_id = u.user_id
+    `;
+    const queryParams = [];
+    if (searchTerm) {
+      query += ` WHERE u.username ILIKE $1 OR u.email ILIKE $1 OR d.tx_hash ILIKE $1`;
+      queryParams.push(`%${searchTerm}%`);
+    }
+    query += ` ORDER BY detected_at DESC LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
+    queryParams.push(limit, offset);
+
+    const totalResult = await pool.query('SELECT COUNT(*) FROM deposits;');
+    const { rows: deposits } = await pool.query(query, queryParams);
+
+    res.json({
+      deposits,
+      totalCount: parseInt(totalResult.rows[0].count, 10),
+      totalPages: Math.ceil(parseInt(totalResult.rows[0].count, 10) / limit),
+      currentPage: page
+    });
+  } catch (err) {
+    console.error('Error fetching deposits for admin:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
