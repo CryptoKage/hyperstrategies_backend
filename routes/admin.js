@@ -271,4 +271,54 @@ router.get('/deposits', async (req, res) => {
   }
 });
 
+// @route   GET /api/admin/vault-positions
+// @desc    Get a paginated list of all user vault positions
+// @access  Admin
+router.get('/vault-positions', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15;
+    const offset = (page - 1) * limit;
+
+    // This query joins with the users and vaults tables to get names
+    const positionsQuery = `
+      SELECT
+        uvp.position_id,
+        uvp.user_id,
+        u.username,
+        uvp.vault_id,
+        v.name as vault_name,
+        uvp.tradable_capital,
+        uvp.status,
+        uvp.lock_expires_at,
+        uvp.entry_date
+      FROM
+        user_vault_positions uvp
+      JOIN
+        users u ON uvp.user_id = u.user_id
+      JOIN
+        vaults v ON uvp.vault_id = v.vault_id
+      ORDER BY
+        uvp.entry_date DESC
+      LIMIT $1 OFFSET $2;
+    `;
+    
+    const totalResult = await pool.query('SELECT COUNT(*) FROM user_vault_positions;');
+    const totalPositions = parseInt(totalResult.rows[0].count, 10);
+    
+    const { rows: positions } = await pool.query(positionsQuery, [limit, offset]);
+
+    res.json({
+      positions,
+      totalCount: totalPositions,
+      totalPages: Math.ceil(totalPositions / limit),
+      currentPage: page
+    });
+
+  } catch (err) {
+    console.error('Error fetching vault positions for admin:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
