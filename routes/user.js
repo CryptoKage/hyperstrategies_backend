@@ -13,18 +13,16 @@ const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_UR
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 const apeContract = new ethers.Contract(tokenMap.ape.address, erc20Abi, provider);
 
-// --- UPGRADED --- Robust In-Memory Cache for CoinGecko Price
 const priceCache = {
   apePrice: null,
-  lastFetched: 0, // Use 0 to indicate it has never been fetched
-  cacheDuration: 5 * 60 * 1000, // 5 minutes
+  lastFetched: 0,
+  cacheDuration: 5 * 60 * 1000,
 };
 
-// --- UPGRADED --- More robust helper function to get the APE price
+// --- FINAL, ROBUST Caching Function ---
 async function getApePrice() {
   const now = Date.now();
   if (priceCache.apePrice && (now - priceCache.lastFetched < priceCache.cacheDuration)) {
-    console.log('Serving APE price from cache.');
     return priceCache.apePrice;
   }
   
@@ -39,14 +37,15 @@ async function getApePrice() {
     console.error('CoinGecko API call failed:', error.message);
     if (priceCache.apePrice) {
       console.warn('Serving STALE APE price from cache due to API failure.');
-      return priceCache.apePrice; // Serve old data if we have it
+      return priceCache.apePrice;
     }
-    // If we have no cached price and the API fails, throw an error to fail gracefully.
-    throw new Error('Could not fetch critical price data.');
+    // If we have NO cached price and the API fails, return a safe default instead of crashing.
+    console.error('CRITICAL: Could not fetch APE price and no cache is available.');
+    return 0; // Return 0 as a safe fallback
   }
 }
 
-// --- Get User Wallet Info Endpoint (UPGRADED WITH ROBUST CACHING) ---
+// --- FINAL, ROBUST /wallet Endpoint ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -56,14 +55,12 @@ router.get('/wallet', authenticateToken, async (req, res) => {
     }
     const userAddress = userResult.rows[0].eth_address;
 
-    // Fetch price first, allowing it to fail gracefully if cache exists
-    const apePriceUsd = await getApePrice();
-
-    // Then fetch on-chain and DB data
-    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult] = await Promise.all([
+    // Fetch all data in parallel. getApePrice() will handle its own errors gracefully.
+    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult, apePriceUsd] = await Promise.all([
       usdcContract.balanceOf(userAddress),
       apeContract.balanceOf(userAddress),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
+      getApePrice()
     ]);
     
     const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, tokenMap.usdc.decimals);
@@ -77,6 +74,7 @@ router.get('/wallet', authenticateToken, async (req, res) => {
       apePrice: apePriceUsd,
       totalBonusPoints: totalBonusPoints
     });
+
   } catch (err) {
     console.error('Error in /wallet endpoint:', err.message);
     res.status(500).send('Server Error');
