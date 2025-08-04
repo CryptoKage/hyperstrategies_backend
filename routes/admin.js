@@ -327,4 +327,46 @@ router.get('/users/:userId/bonus-points', async (req, res) => {
   }
 });
 
+router.get('/treasury-report', async (req, res) => {
+  try {
+    const [
+      depositFeeRevenueResult,
+      performanceFeeRevenueResult,
+      totalCapitalInVaultsResult,
+      totalOutstandingBonusPointsResult
+    ] = await Promise.all([
+      // Sum up all revenue from deposit fees
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM platform_revenue WHERE source = 'DEPOSIT_FEE'"),
+      // Sum up all revenue from performance fees
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM platform_revenue WHERE source = 'PERFORMANCE_FEE'"),
+      // Calculate total user capital currently in vaults (a liability)
+      pool.query("SELECT COALESCE(SUM(tradable_capital), 0) as total FROM user_vault_positions WHERE status = 'in_trade'"),
+      // Calculate total outstanding bonus points (a future liability)
+      pool.query("SELECT COALESCE(SUM(points_amount), 0) as total FROM bonus_points")
+    ]);
+
+    const depositFeeRevenue = parseFloat(depositFeeRevenueResult.rows[0].total);
+    const performanceFeeRevenue = parseFloat(performanceFeeRevenueResult.rows[0].total);
+    const totalCapitalInVaults = parseFloat(totalCapitalInVaultsResult.rows[0].total);
+    const totalOutstandingBonusPoints = parseFloat(totalOutstandingBonusPointsResult.rows[0].total);
+
+    res.json({
+      revenue: {
+        depositFees: depositFeeRevenue,
+        performanceFees: performanceFeeRevenue,
+        total: depositFeeRevenue + performanceFeeRevenue
+      },
+      liabilities: {
+        userCapitalInVaults: totalCapitalInVaults,
+        bonusPoints: totalOutstandingBonusPoints
+      },
+      netPosition: (depositFeeRevenue + performanceFeeRevenue) - totalOutstandingBonusPoints
+    });
+
+  } catch (err) {
+    console.error('Error fetching treasury report:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
