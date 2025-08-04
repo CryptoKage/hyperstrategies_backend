@@ -25,9 +25,6 @@ async function pollDeposits() {
   const client = await pool.connect();
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
-    
-    // --- THIS IS THE FIX ---
-    // The variable name is 'lastCheckedBlockResult', not 'lastChecked-block-result'
     let fromBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
     
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
@@ -35,7 +32,7 @@ async function pollDeposits() {
 
     if (fromBlock >= latestBlock) {
         console.log('No new blocks to scan.');
-        if(client) client.release(); // Release client and exit
+        if(client) client.release();
         return;
     }
 
@@ -52,14 +49,25 @@ async function pollDeposits() {
           toBlock: `0x${latestBlock.toString(16)}`
         });
 
+        if (transfers.transfers.length > 0) {
+            console.log(`[DEBUG] Found ${transfers.transfers.length} potential transfers for user ${user.user_id}`);
+        }
+
         for (const event of transfers.transfers) {
           const txHash = event.hash;
           const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
           if (existingDeposit.rows.length === 0) {
+            
+            console.log(`[DEBUG] Processing new event. Asset: '${event.asset}', Value: ${event.value}`);
+
             const tokenSymbol = (event.asset || '').toLowerCase();
             const tokenInfo = tokenMap[tokenSymbol];
-            if (!tokenInfo) continue;
+
+            if (!tokenInfo) {
+              console.warn(`[WARN] Unrecognized token asset '${event.asset}'. Skipping.`);
+              continue;
+            }
 
             const rawAmount = event.value;
             const amountStr = parseFloat(rawAmount).toFixed(tokenInfo.decimals);
@@ -82,11 +90,10 @@ async function pollDeposits() {
             }
 
             await client.query('COMMIT');
-            console.log(`✅ Successfully credited deposit for tx ${txHash}`);
+            console.log(`✅ Successfully processed deposit for tx ${txHash}`);
           }
         }
       } catch (e) {
-        // Only rollback if a transaction was actually started
         if(client) await client.query('ROLLBACK').catch(err => console.error('Rollback failed:', err));
         console.error(`❌ Failed to process deposits for user ${user.user_id}, continuing...`, e);
       }
