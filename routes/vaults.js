@@ -1,11 +1,14 @@
+// server/routes/vaults.js
+
 const express = require('express');
 const { ethers } = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
+const tokenMap = require('../utils/tokens/tokenMap'); // We need tokenMap for decimals
 
 const router = express.Router();
 
-// --- Allocate Funds to Vault Endpoint (FINAL with Treasury Ledger Split) ---
+// --- Allocate Funds to Vault Endpoint (FINAL with safe parsing) ---
 router.post('/invest', authenticateToken, async (req, res) => {
   const { vaultId, amount } = req.body;
   const userId = req.user.id;
@@ -30,8 +33,11 @@ router.post('/invest', authenticateToken, async (req, res) => {
     const userData = userResult.rows[0];
     const vaultData = vaultResult.rows[0];
     
-    const availableBalance_BN = ethers.utils.parseUnits(userData.balance.toString(), 6);
-    const totalAmount_BN = ethers.utils.parseUnits(totalAmount_str, 6);
+    // --- THIS IS THE FIX ---
+    // We safely round the user's balance from the DB before parsing it with ethers.
+    const userBalanceSafeString = parseFloat(userData.balance).toFixed(tokenMap.usdc.decimals);
+    const availableBalance_BN = ethers.utils.parseUnits(userBalanceSafeString, tokenMap.usdc.decimals);
+    const totalAmount_BN = ethers.utils.parseUnits(totalAmount_str, tokenMap.usdc.decimals);
 
     if (availableBalance_BN.lt(totalAmount_BN)) {
       await client.query('ROLLBACK');
@@ -75,17 +81,11 @@ router.post('/invest', authenticateToken, async (req, res) => {
     
     await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, depositFeeAmount]);
     
-    // --- CORRECTED TREASURY LEDGER LOGIC ---
     const depositFeeSplits = {
-      'DEPOSIT_FEES_LP_SEEDING': 0.01,
-      'DEPOSIT_FEES_LP_REWARDS': 0.15,
-      'DEPOSIT_FEES_TEAM': 0.25,
-      'DEPOSIT_FEES_TREASURY': 0.20,
-      'DEPOSIT_FEES_COMMUNITY': 0.20,
-      'DEPOSIT_FEES_BUYBACK': 0.10,
+      'DEPOSIT_FEES_LP_SEEDING': 0.01, 'DEPOSIT_FEES_LP_REWARDS': 0.15, 'DEPOSIT_FEES_TEAM': 0.25,
+      'DEPOSIT_FEES_TREASURY': 0.20, 'DEPOSIT_FEES_COMMUNITY': 0.20, 'DEPOSIT_FEES_BUYBACK': 0.10,
       'DEPOSIT_FEES_STRATEGIC': 0.09
     };
-    
     await client.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'`, [depositFeeAmount]);
     const totalDesc = `Total Deposit Fee of ${depositFeeAmount} from user ${userId}.`;
     await client.query(`INSERT INTO treasury_transactions (to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'), $1, $2)`, [depositFeeAmount, totalDesc]);
@@ -95,13 +95,9 @@ router.post('/invest', authenticateToken, async (req, res) => {
       if (splitAmount > 0) {
         await client.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = $2`, [splitAmount, ledgerName]);
         const splitDesc = `Allocated ${depositFeeSplits[ledgerName]*100}% of deposit fee to ${ledgerName}.`;
-        await client.query(
-          `INSERT INTO treasury_transactions (from_ledger_id, to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'), (SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = $1), $2, $3)`,
-          [ledgerName, splitAmount, splitDesc]
-        );
+        await client.query( `INSERT INTO treasury_transactions (from_ledger_id, to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'), (SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = $1), $2, $3)`, [ledgerName, splitAmount, splitDesc] );
       }
     }
-    // --- END OF TREASURY LOGIC ---
 
     const allocationDescription = `Allocated ${parseFloat(totalAmount_str).toFixed(2)} USDC to Vault ${vaultId}.`;
     await client.query(
