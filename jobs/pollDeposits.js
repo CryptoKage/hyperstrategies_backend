@@ -22,89 +22,76 @@ async function initializeProvider() {
 }
 
 async function pollDeposits() {
-  console.log('🔄 Checking for new deposits...');
+  console.log('🔄 Checking for new deposits by comparing balances...');
   const client = await pool.connect();
   try {
-    const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
-    const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
-    const latestBlock = await alchemy.core.getBlockNumber();
+    // 1. Get all users with their last known on-chain balance
+    const { rows: users } = await client.query(
+      'SELECT user_id, eth_address, last_known_usdc_balance FROM users WHERE eth_address IS NOT NULL'
+    );
 
-    const lookbackBlocks = 10;
-    const fromBlock = lastProcessedBlock - lookbackBlocks;
-    const toBlock = latestBlock;
-
-    console.log(`Scanning from block #${fromBlock} to #${toBlock}`);
-
-    if (fromBlock >= toBlock) {
-      console.log('No new blocks to scan.');
-      if(client) client.release();
-      return;
-    }
-
-    const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     if (users.length === 0) {
       console.log('No users with addresses to check.');
-      if(client) client.release();
       return;
     }
-    
-    // --- THIS IS THE CORRECT, ROBUST LOGIC ---
-    // We loop through each user and check their address individually.
+
+    // 2. Loop through each user and check their current on-chain balance
     for (const user of users) {
       try {
-        const transfers = await alchemy.core.getAssetTransfers({
-          toAddress: user.eth_address,
-          contractAddresses: [tokenMap.usdc.address], // Only looking for USDC
-          excludeZeroValue: true,
-          // This category includes all types of transfers, including internal ones from contracts like Relay
-          category: [AssetTransfersCategory.ERC20], 
-          fromBlock: ethers.utils.hexlify(fromBlock),
-          toBlock: ethers.utils.hexlify(toBlock)
-        });
+        const response = await alchemy.core.getTokenBalances(user.eth_address, [tokenMap.usdc.address]);
+        const usdcBalanceData = response.tokenBalances[0];
 
-        if (transfers.transfers.length > 0) {
-          console.log(`[DEBUG] Found ${transfers.transfers.length} potential USDC transfers for user ${user.user_id}`);
+        if (usdcBalanceData.error) {
+          console.error(`Error fetching balance for ${user.eth_address}:`, usdcBalanceData.error);
+          continue; // Skip to the next user
         }
 
-        for (const event of transfers.transfers) {
-          const txHash = event.hash;
-          // This check prevents double-counting deposits, making our look-back safe.
-          const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
+        const onChainBalance_BN = ethers.BigNumber.from(usdcBalanceData.tokenBalance);
+        const lastKnownBalance_BN = ethers.utils.parseUnits(user.last_known_usdc_balance.toString(), tokenMap.usdc.decimals);
 
-          if (existingDeposit.rows.length === 0) {
-            const rawAmount = event.value;
-            const amountStr = parseFloat(rawAmount).toFixed(tokenMap.usdc.decimals);
+        // 3. If the current balance is greater than our last known balance, a deposit has occurred.
+        if (onChainBalance_BN.gt(lastKnownBalance_BN)) {
+          const depositAmount_BN = onChainBalance_BN.sub(lastKnownBalance_BN);
+          const depositAmountStr = ethers.utils.formatUnits(depositAmount_BN, tokenMap.usdc.decimals);
+
+          console.log(`✅ New deposit detected for user ${user.user_id}: ${depositAmountStr} USDC`);
+          
+          await client.query('BEGIN');
+          try {
+            // 4. Update the user's main available balance on the platform
+            await client.query(
+              'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+              [depositAmountStr, user.user_id]
+            );
+
+            // 5. CRITICAL: Update their last_known_usdc_balance to the new on-chain balance
+            const newOnChainBalanceStr = ethers.utils.formatUnits(onChainBalance_BN, tokenMap.usdc.decimals);
+            await client.query(
+              'UPDATE users SET last_known_usdc_balance = $1 WHERE user_id = $2',
+              [newOnChainBalanceStr, user.user_id]
+            );
             
-            console.log(`✅ New USDC deposit detected for user ${user.user_id}: ${amountStr}, tx: ${txHash}`);
+            // We can optionally log this in the deposits table for auditing, but it requires a tx_hash.
+            // For now, let's just log it to the main activity log.
+            const description = `Detected on-chain deposit of ${depositAmountStr} USDC.`;
+            await client.query(
+              `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
+               VALUES ($1, 'ON_CHAIN_DEPOSIT', $2, $3, 'USDC', 'COMPLETED')`,
+              [user.user_id, description, depositAmountStr]
+            );
             
-            await client.query('BEGIN');
-            try {
-              await client.query(
-                `INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`,
-                [user.user_id, amountStr, txHash]
-              );
-              await client.query(
-                'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
-                [amountStr, user.user_id]
-              );
-              await client.query('COMMIT');
-              console.log(`✅ Successfully processed deposit for tx ${txHash}`);
-            } catch (dbError) {
-              await client.query('ROLLBACK');
-              console.error(`Database error processing tx ${txHash}:`, dbError);
-            }
+            await client.query('COMMIT');
+            console.log(`✅ Successfully credited ${depositAmountStr} USDC for user ${user.user_id}`);
+
+          } catch (dbError) {
+            await client.query('ROLLBACK');
+            console.error('Database error processing deposit:', dbError);
           }
         }
       } catch (e) {
-        console.error(`❌ Failed to fetch transfers for user ${user.user_id}:`, e.message);
-        // We continue to the next user even if one fails
+        console.error(`❌ Failed to check balance for user ${user.user_id} (${user.eth_address}):`, e.message);
       }
     }
-
-    // Update the system state with the latest block we've scanned up to.
-    await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
-    console.log(`✅ Finished scan. Next scan will start from block #${toBlock}`);
-
   } catch (error) {
     console.error('❌ Major error in pollDeposits job:', error);
   } finally {
