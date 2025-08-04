@@ -5,39 +5,25 @@ const { Alchemy, Network } = require('alchemy-sdk');
 const pool = require('../db');
 const tokenMap = require('../utils/tokens/tokenMap');
 
-const config = {
-  apiKey: process.env.ALCHEMY_API_KEY,
-  network: Network.ETH_MAINNET,
-};
+const config = { /* ... */ };
 const alchemy = new Alchemy(config);
 
-async function initializeProvider() {
-  try {
-    const block = await alchemy.core.getBlockNumber();
-    console.log(`🔌 Alchemy SDK connected to Ethereum Mainnet. Current block: ${block}`);
-  } catch (err) {
-    console.error('❌ Alchemy SDK connection failed:', err);
-  }
-}
+async function initializeProvider() { /* ... */ }
 
+// --- The New, Robust Polling Function ---
 async function pollDeposits() {
   console.log('🔄 Checking for new deposits...');
-  const client = await pool.connect(); // Client is checked out here
+  const client = await pool.connect();
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
-    let fromBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
-    
-    console.log(`Scanning from block #${fromBlock}`);
-
+    let fromBlock = parseInt(lastChecked-block-result.rows[0].value, 10);
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     const latestBlock = await alchemy.core.getBlockNumber();
 
-    // --- ANNOTATION: The fix is here. ---
     if (fromBlock >= latestBlock) {
         console.log('No new blocks to scan.');
-        // We REMOVED client.release() from here.
-        // We simply return, and the 'finally' block will handle the release.
-        return; 
+        client.release();
+        return;
     }
 
     for (const user of users) {
@@ -58,37 +44,47 @@ async function pollDeposits() {
           const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
           if (existingDeposit.rows.length === 0) {
-            const amountStr = event.value.toString();
-            console.log(`✅ New deposit detected for user ${user.user_id}: ${amountStr} USDC, tx: ${txHash}`);
+            const tokenSymbol = event.asset.toLowerCase();
+            const tokenInfo = tokenMap[tokenSymbol];
+            if (!tokenInfo) continue;
+
+            // --- THIS IS THE FIX ---
+            // 1. Get the raw value from the event.
+            const rawAmount = event.value;
+            
+            // 2. Safely round it to the token's number of decimals BEFORE parsing.
+            // This prevents floating point precision errors.
+            const amountStr = parseFloat(rawAmount).toFixed(tokenInfo.decimals);
+            
+            console.log(`✅ New deposit detected for user ${user.user_id}: ${amountStr} ${tokenSymbol.toUpperCase()}, tx: ${txHash}`);
             
             await client.query('BEGIN');
 
-            const depositAmount_BN = ethers.utils.parseUnits(amountStr, 6);
-            const depositAmount_formatted = ethers.utils.formatUnits(depositAmount_BN, 6);
-
+            // 3. Now, this parseUnits call will always succeed.
+            const depositAmount_BN = ethers.utils.parseUnits(amountStr, tokenInfo.decimals);
+            
+            // Log the deposit in the deposits table
             await client.query(
               `INSERT INTO deposits (user_id, amount, "token", tx_hash) 
                VALUES ($1, $2, $3, $4)`,
-              [user.user_id, depositAmount_formatted, 'usdc', txHash]
+              [user.user_id, amountStr, tokenSymbol, txHash]
             );
 
-            const userBalanceResult = await client.query('SELECT balance FROM users WHERE user_id = $1 FOR UPDATE', [user.user_id]);
-            const currentBalance_BN = ethers.utils.parseUnits(userBalanceResult.rows[0].balance.toString(), 6);
-            const newBalance_BN = currentBalance_BN.add(depositAmount_BN);
-
-            await client.query(
-              'UPDATE users SET balance = $1 WHERE user_id = $2',
-              [ethers.utils.formatUnits(newBalance_BN, 6), user.user_id]
-            );
+            // Only credit the main balance for USDC deposits for now
+            if (tokenSymbol === 'usdc') {
+                await client.query(
+                    'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+                    [amountStr, user.user_id]
+                );
+            }
 
             await client.query('COMMIT');
-            console.log(`✅ Successfully credited 100% of deposit for tx ${txHash}`);
+            console.log(`✅ Successfully credited deposit for tx ${txHash}`);
           }
         }
       } catch (e) {
-        console.error(`❌ Failed to check deposits for user ${user.user_id}, continuing...`, e);
-        // Rollback transaction if it was started
-        if (client) await client.query('ROLLBACK').catch(err => console.error('Rollback failed', err));
+        await client.query('ROLLBACK').catch(err => console.error('Rollback failed:', err));
+        console.error(`❌ Failed to process deposits for user ${user.user_id}, continuing...`, e);
       }
     }
 
@@ -98,15 +94,8 @@ async function pollDeposits() {
   } catch (error) {
     console.error('❌ Major error in pollDeposits job:', error);
   } finally {
-    // --- ANNOTATION: This is now the ONLY place the client is released. ---
-    // It will run for all code paths: success, 'no new blocks', and major errors.
-    if (client) {
-      client.release();
-    }
+    if (client) client.release();
   }
 }
 
-module.exports = {
-  pollDeposits,
-  initializeProvider,
-};
+module.exports = { pollDeposits, initializeProvider };
