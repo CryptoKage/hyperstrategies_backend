@@ -492,23 +492,13 @@ router.post('/buyback-points', async (req, res) => {
 // @route   GET /api/admin/vaults/:vaultId/details
 // @desc    Get detailed information for a single vault and all its participants
 // @access  Admin
+// @route   GET /api/admin/vaults/:vaultId/details (UPGRADED)
 router.get('/vaults/:vaultId/details', async (req, res) => {
   const { vaultId } = req.params;
-
   try {
-    // We fetch vault info and the full list of participants in parallel
     const [vaultDetailsResult, participantsResult] = await Promise.all([
       pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
-      pool.query(
-        `SELECT 
-           p.position_id, u.user_id, u.username, p.tradable_capital, 
-           p.pnl, p.high_water_mark, p.auto_compound, p.status
-         FROM user_vault_positions p
-         JOIN users u ON p.user_id = u.user_id
-         WHERE p.vault_id = $1
-         ORDER BY u.username ASC`,
-        [vaultId]
-      )
+      pool.query( `SELECT p.position_id, u.user_id, u.username, p.tradable_capital, p.pnl, p.high_water_mark, p.auto_compound, p.status FROM user_vault_positions p JOIN users u ON p.user_id = u.user_id WHERE p.vault_id = $1 ORDER BY u.username ASC`, [vaultId] )
     ]);
 
     if (vaultDetailsResult.rows.length === 0) {
@@ -518,9 +508,11 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
     const vaultDetails = vaultDetailsResult.rows[0];
     const participants = participantsResult.rows;
 
-    // Calculate some aggregate stats
     const totalCapital = participants.reduce((sum, p) => sum + parseFloat(p.tradable_capital), 0);
     const totalPnl = participants.reduce((sum, p) => sum + parseFloat(p.pnl), 0);
+    
+    // --- NEW --- Calculate the current average PnL percentage
+    const currentPnlPercentage = (totalCapital > 0) ? (totalPnl / totalCapital) * 100 : 0;
     
     res.json({
       vault: vaultDetails,
@@ -528,10 +520,10 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
       stats: {
         participantCount: participants.length,
         totalCapital: totalCapital,
-        totalPnl: totalPnl
+        totalPnl: totalPnl,
+        currentPnlPercentage: currentPnlPercentage // Add to response
       }
     });
-
   } catch (err) {
     console.error(`Error fetching details for vault ${vaultId}:`, err);
     res.status(500).send('Server Error');
