@@ -8,6 +8,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 const router = express.Router();
 
 // --- Allocate Funds to Vault Endpoint (with Revenue Logging) ---
+// --- Allocate Funds to Vault Endpoint (with High-Water Mark Logic) ---
 router.post('/invest', authenticateToken, async (req, res) => {
   const { vaultId, amount } = req.body;
   const userId = req.user.id;
@@ -55,7 +56,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
     const bonusPointsAmount_BN = totalAmount_BN.mul(feeMultiplier).div(100);
     const tradableAmount_BN = totalAmount_BN.sub(bonusPointsAmount_BN);
     const newBalance_BN = availableBalance_BN.sub(totalAmount_BN);
-    
     const depositFeeAmount = ethers.utils.formatUnits(bonusPointsAmount_BN, 6);
 
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
@@ -63,26 +63,57 @@ router.post('/invest', authenticateToken, async (req, res) => {
     const lockExpiresAt = new Date();
     lockExpiresAt.setMonth(lockExpiresAt.getMonth() + 1);
 
-    const existingPosition = await client.query('SELECT tradable_capital FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
+    // --- MODIFIED LOGIC FOR HIGH-WATER MARK ---
+    const existingPosition = await client.query('SELECT position_id, tradable_capital, high_water_mark FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2 FOR UPDATE', [userId, vaultId]);
+    
     if (existingPosition.rows.length > 0) {
-      const currentCapital_BN = ethers.utils.parseUnits(existingPosition.rows[0].tradable_capital.toString(), 6);
+      // Logic for adding funds to an EXISTING position
+      const currentPosition = existingPosition.rows[0];
+      const currentCapital_BN = ethers.utils.parseUnits(currentPosition.tradable_capital.toString(), 6);
+      const currentHWM_BN = ethers.utils.parseUnits(currentPosition.high_water_mark.toString(), 6);
+      
       const newCapital_BN = currentCapital_BN.add(tradableAmount_BN);
-      await client.query('UPDATE user_vault_positions SET tradable_capital = $1, lock_expires_at = $2 WHERE user_id = $3 AND vault_id = $4', [ethers.utils.formatUnits(newCapital_BN, 6), lockExpiresAt, userId, vaultId]);
+      const newHWM_BN = currentHWM_BN.add(tradableAmount_BN); // Increase HWM by the new capital
+
+      await client.query(
+        'UPDATE user_vault_positions SET tradable_capital = $1, high_water_mark = $2, lock_expires_at = $3 WHERE position_id = $4', 
+        [
+          ethers.utils.formatUnits(newCapital_BN, 6), 
+          ethers.utils.formatUnits(newHWM_BN, 6), 
+          lockExpiresAt,
+          currentPosition.position_id
+        ]
+      );
     } else {
-      await client.query('INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital, lock_expires_at, status) VALUES ($1, $2, $3, $4, $5)', [userId, vaultId, ethers.utils.formatUnits(tradableAmount_BN, 6), lockExpiresAt, 'active']);
+      // Logic for creating a NEW position
+      // The initial high_water_mark is set equal to the initial tradable_capital.
+      await client.query(
+        `INSERT INTO user_vault_positions 
+         (user_id, vault_id, tradable_capital, status, lock_expires_at, high_water_mark) 
+         VALUES ($1, $2, $3, 'active', $4, $5)`, 
+        [
+          userId, 
+          vaultId, 
+          ethers.utils.formatUnits(tradableAmount_BN, 6), 
+          lockExpiresAt, 
+          ethers.utils.formatUnits(tradableAmount_BN, 6) // Set initial HWM
+        ]
+      );
     }
     
     await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [userId, depositFeeAmount]);
     
-    // --- THIS IS THE NEWLY ADDED CODE ---
-    // Log this deposit fee as platform revenue
-    const revenueNote = `Deposit fee from user ${userId} for vault ${vaultId}.`;
-    await client.query(
-      `INSERT INTO platform_revenue (source, amount, notes, related_user_id, related_vault_id)
-       VALUES ('DEPOSIT_FEE', $1, $2, $3, $4)`,
-      [depositFeeAmount, revenueNote, userId, vaultId]
+        await client.query(
+      `UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'`,
+      [depositFeeAmount]
     );
-    // --- END OF NEW CODE ---
+
+    const ledgerDesc = `Deposit fee of ${depositFeeAmount} from user ${userId} for vault ${vaultId}.`;
+    await client.query(
+      `INSERT INTO treasury_transactions (to_ledger_id, amount, description)
+       VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'), $1, $2)`,
+      [depositFeeAmount, ledgerDesc]
+    );
     
     const allocationDescription = `Allocated ${parseFloat(totalAmount_str).toFixed(2)} USDC to Vault ${vaultId}.`;
     await client.query(
