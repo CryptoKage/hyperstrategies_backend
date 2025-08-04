@@ -80,14 +80,31 @@ router.get('/wallet', authenticateToken, async (req, res) => {
   }
 });
 
-// --- Get User Profile Endpoint ---
+// --- Get User Profile Endpoint (UPGRADED) ---
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const result = await pool.query(
-      'SELECT username, email, bio, xp, referral_code, account_tier FROM users WHERE user_id = $1',
-      [userId]
-    );
+    // --- NEW --- This query now also sums up the user's bonus points
+    const profileQuery = `
+      SELECT
+        u.username,
+        u.email,
+        u.bio,
+        u.xp,
+        u.referral_code,
+        u.account_tier,
+        COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+      FROM
+        users u
+      LEFT JOIN
+        bonus_points bp ON u.user_id = bp.user_id
+      WHERE
+        u.user_id = $1
+      GROUP BY
+        u.user_id;
+    `;
+    const result = await pool.query(profileQuery, [userId]);
+
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found.' });
     }

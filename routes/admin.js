@@ -321,4 +321,15 @@ router.get('/vault-positions', async (req, res) => {
   }
 });
 
+router.get('/users/:userId/bonus-points', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]);
+    res.json({ totalBonusPoints: parseFloat(result.rows[0].total_bonus_points) });
+  } catch (err) {
+    console.error(`Error fetching bonus points for user ${userId}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
