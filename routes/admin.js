@@ -489,4 +489,103 @@ router.post('/buyback-points', async (req, res) => {
   }
 });
 
+// @route   GET /api/admin/vaults/:vaultId/details
+// @desc    Get detailed information for a single vault and all its participants
+// @access  Admin
+router.get('/vaults/:vaultId/details', async (req, res) => {
+  const { vaultId } = req.params;
+
+  try {
+    // We fetch vault info and the full list of participants in parallel
+    const [vaultDetailsResult, participantsResult] = await Promise.all([
+      pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
+      pool.query(
+        `SELECT 
+           p.position_id, u.user_id, u.username, p.tradable_capital, 
+           p.pnl, p.high_water_mark, p.auto_compound, p.status
+         FROM user_vault_positions p
+         JOIN users u ON p.user_id = u.user_id
+         WHERE p.vault_id = $1
+         ORDER BY u.username ASC`,
+        [vaultId]
+      )
+    ]);
+
+    if (vaultDetailsResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Vault not found.' });
+    }
+
+    const vaultDetails = vaultDetailsResult.rows[0];
+    const participants = participantsResult.rows;
+
+    // Calculate some aggregate stats
+    const totalCapital = participants.reduce((sum, p) => sum + parseFloat(p.tradable_capital), 0);
+    const totalPnl = participants.reduce((sum, p) => sum + parseFloat(p.pnl), 0);
+    
+    res.json({
+      vault: vaultDetails,
+      participants: participants,
+      stats: {
+        participantCount: participants.length,
+        totalCapital: totalCapital,
+        totalPnl: totalPnl
+      }
+    });
+
+  } catch (err) {
+    console.error(`Error fetching details for vault ${vaultId}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   POST /api/admin/vaults/:vaultId/update-pnl
+// @desc    Update the PnL for all participants in a vault by a percentage
+// @access  Admin
+router.post('/vaults/:vaultId/update-pnl', async (req, res) => {
+  const { vaultId } = req.params;
+  const { pnlPercentage } = req.body;
+  const client = await pool.connect();
+
+  const pnlPercent = parseFloat(pnlPercentage);
+  if (isNaN(pnlPercent)) {
+    return res.status(400).json({ message: 'A valid number for PnL percentage is required.' });
+  }
+
+  try {
+    await client.query('BEGIN');
+
+    // Get all active positions to update
+    const { rows: positions } = await client.query(
+      `SELECT position_id, tradable_capital FROM user_vault_positions WHERE vault_id = $1 AND status = 'in_trade'`,
+      [vaultId]
+    );
+
+    if (positions.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'No active positions found in this vault to update.' });
+    }
+
+    // Loop through each position and update its PnL
+    for (const position of positions) {
+      const capital = parseFloat(position.tradable_capital);
+      const newPnlValue = capital * (pnlPercent / 100.0);
+
+      await client.query(
+        'UPDATE user_vault_positions SET pnl = $1 WHERE position_id = $2',
+        [newPnlValue, position.position_id]
+      );
+    }
+    
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Successfully updated PnL for ${positions.length} positions in vault ${vaultId} to ${pnlPercent}%.` });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`Error updating PnL for vault ${vaultId}:`, err);
+    res.status(500).send('Server Error');
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
