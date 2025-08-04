@@ -1,4 +1,5 @@
 // server/routes/user.js
+
 const express = require('express');
 const router = express.Router();
 const { ethers } = require('ethers');
@@ -8,22 +9,22 @@ const tokenMap = require('../utils/tokens/tokenMap');
 const axios = require('axios');
 const erc20Abi = require('../utils/abis/erc20.json');
 
-// --- Setup for On-Chain Lookups ---
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 const apeContract = new ethers.Contract(tokenMap.ape.address, erc20Abi, provider);
 
-// --- NEW --- Simple In-Memory Cache for CoinGecko Price
+// --- UPGRADED --- Robust In-Memory Cache for CoinGecko Price
 const priceCache = {
   apePrice: null,
-  lastFetched: null,
-  cacheDuration: 5 * 60 * 1000, // 5 minutes in milliseconds
+  lastFetched: 0, // Use 0 to indicate it has never been fetched
+  cacheDuration: 5 * 60 * 1000, // 5 minutes
 };
 
-// --- NEW --- Helper function to get the APE price, using the cache
+// --- UPGRADED --- More robust helper function to get the APE price
 async function getApePrice() {
   const now = Date.now();
   if (priceCache.apePrice && (now - priceCache.lastFetched < priceCache.cacheDuration)) {
+    console.log('Serving APE price from cache.');
     return priceCache.apePrice;
   }
   
@@ -36,30 +37,29 @@ async function getApePrice() {
     return price;
   } catch (error) {
     console.error('CoinGecko API call failed:', error.message);
-    // --- KEY FIX --- If the API call fails, but we have an old cached price, serve the old price.
-    // This prevents the whole wallet page from crashing if CoinGecko is down or rate limiting.
     if (priceCache.apePrice) {
       console.warn('Serving STALE APE price from cache due to API failure.');
-      return priceCache.apePrice;
+      return priceCache.apePrice; // Serve old data if we have it
     }
-    // If we have no cached price and the API fails, we have to throw an error.
-    throw new Error('Could not fetch APE price.');
+    // If we have no cached price and the API fails, throw an error to fail gracefully.
+    throw new Error('Could not fetch critical price data.');
   }
 }
 
-// --- UPGRADED /wallet Endpoint ---
+// --- Get User Wallet Info Endpoint (UPGRADED WITH ROBUST CACHING) ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const userResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
-    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User wallet not found.' });
-    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User wallet not found.' });
+    }
     const userAddress = userResult.rows[0].eth_address;
 
-    // We now fetch the price FIRST.
+    // Fetch price first, allowing it to fail gracefully if cache exists
     const apePriceUsd = await getApePrice();
 
-    // Then we fetch the on-chain and DB data.
+    // Then fetch on-chain and DB data
     const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult] = await Promise.all([
       usdcContract.balanceOf(userAddress),
       apeContract.balanceOf(userAddress),
@@ -77,38 +77,26 @@ router.get('/wallet', authenticateToken, async (req, res) => {
       apePrice: apePriceUsd,
       totalBonusPoints: totalBonusPoints
     });
-
   } catch (err) {
     console.error('Error in /wallet endpoint:', err.message);
     res.status(500).send('Server Error');
   }
 });
 
-// --- Get User Profile Endpoint (UPGRADED) ---
+// --- Get User Profile Endpoint ---
+// This version is the correct, up-to-date one.
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    // --- NEW --- This query now also sums up the user's bonus points
     const profileQuery = `
-      SELECT
-        u.username,
-        u.email,
-        u.bio,
-        u.xp,
-        u.referral_code,
-        u.account_tier,
-        COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
-      FROM
-        users u
-      LEFT JOIN
-        bonus_points bp ON u.user_id = bp.user_id
-      WHERE
-        u.user_id = $1
-      GROUP BY
-        u.user_id;
+      SELECT u.username, u.email, u.bio, u.xp, u.referral_code, u.account_tier,
+             COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+      FROM users u
+      LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
+      WHERE u.user_id = $1
+      GROUP BY u.user_id;
     `;
     const result = await pool.query(profileQuery, [userId]);
-
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found.' });
     }
