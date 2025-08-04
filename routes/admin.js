@@ -412,4 +412,81 @@ router.get('/treasury-report', async (req, res) => {
   }
 });
 
+router.post('/buyback-points', async (req, res) => {
+  const { buybackAmountUSD } = req.body;
+  const adminUserId = req.user.id;
+  const client = await pool.connect();
+
+  const amountToBuyBack = parseFloat(buybackAmountUSD);
+  if (!amountToBuyBack || amountToBuyBack <= 0) {
+    return res.status(400).json({ message: 'A positive amount is required.' });
+  }
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Check if the treasury has enough funds in the buyback ledgers
+    const buybackLedgersResult = await client.query(
+      `SELECT SUM(balance) as total FROM treasury_ledgers WHERE ledger_name IN ('COMMUNITY_GROWTH_INCENTIVES', 'DEPOSIT_FEES_BUYBACK')`
+    );
+    const availableBuybackFunds = parseFloat(buybackLedgersResult.rows[0].total);
+
+    if (availableBuybackFunds < amountToBuyBack) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: `Insufficient funds for buyback. Available: $${availableBuybackFunds.toFixed(2)}` });
+    }
+
+    // 2. Fetch all users who have bonus points and the total amount of points
+    const { rows: pointHolders } = await client.query(`
+        SELECT user_id, SUM(points_amount) as total_points
+        FROM bonus_points
+        GROUP BY user_id
+        HAVING SUM(points_amount) > 0
+    `);
+    const totalOutstandingPoints = pointHolders.reduce((sum, holder) => sum + parseFloat(holder.total_points), 0);
+    
+    if (totalOutstandingPoints === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'No outstanding bonus points to buy back.' });
+    }
+    
+    // 3. Loop through each holder, calculate their share, and process the buy-back
+    for (const holder of pointHolders) {
+      const ownershipPercentage = parseFloat(holder.total_points) / totalOutstandingPoints;
+      const userBuybackAmount = amountToBuyBack * ownershipPercentage;
+      
+      const xpToAward = userBuybackAmount * 0.1;
+      
+      // Credit user's main balance with USDC
+      await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [userBuybackAmount, holder.user_id]);
+      // Debit their bonus points by inserting a negative transaction
+      await client.query('INSERT INTO bonus_points (user_id, points_amount) VALUES ($1, $2)', [holder.user_id, -userBuybackAmount]);
+      // Award XP and re-calculate tier
+      const userXpResult = await client.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2 RETURNING xp', [xpToAward, holder.user_id]);
+      const { calculateUserTier } = require('../utils/tierUtils');
+      const newTier = calculateUserTier(parseFloat(userXpResult.rows[0].xp));
+      await client.query('UPDATE users SET account_tier = $1 WHERE user_id = $2', [newTier, holder.user_id]);
+      
+      // Log for user's history
+      const description = `Platform bought back ${userBuybackAmount.toFixed(2)} Bonus Points for ${userBuybackAmount.toFixed(2)} USDC.`;
+      await client.query( `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, amount_secondary, symbol_secondary, status) VALUES ($1, 'BONUS_POINT_BUYBACK', $2, $3, 'USDC', $4, 'XP', 'COMPLETED')`, [holder.user_id, description, userBuybackAmount, xpToAward]);
+    }
+    
+    // 4. Log the expense in the treasury
+    const expenseDesc = `Bonus Point Buy-Back of $${amountToBuyBack.toFixed(2)} initiated by admin ${adminUserId}.`;
+    await client.query(`UPDATE treasury_ledgers SET balance = balance - $1 WHERE ledger_name = 'COMMUNITY_GROWTH_INCENTIVES'`, [amountToBuyBack]); // Assuming we pull from this ledger first
+    await client.query(`INSERT INTO treasury_transactions (from_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'COMMUNITY_GROWTH_INCENTIVES'), $1, $2)`, [amountToBuyBack, expenseDesc]);
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Successfully executed buy-back of $${amountToBuyBack.toFixed(2)} across ${pointHolders.length} users.` });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`[Admin] Bonus Point buy-back failed:`, err);
+    res.status(500).send('Server Error');
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
