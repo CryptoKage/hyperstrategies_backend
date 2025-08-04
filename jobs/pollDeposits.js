@@ -11,7 +11,7 @@ const alchemy = new Alchemy(config);
 async function initializeProvider() { /* ... */ }
 
 async function pollDeposits() {
-  console.log('🔄 Checking for new USDC deposits...');
+  console.log('🔄 Checking for new deposits...');
   const client = await pool.connect();
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
@@ -25,48 +25,57 @@ async function pollDeposits() {
       return;
     }
 
-    // --- SIMPLIFIED LOGIC ---
-    // We are now ONLY querying for USDC deposits.
-    const transfers = await alchemy.core.getAssetTransfers({
-      toAddress: users.map(u => u.eth_address), // Check all user addresses in one go
-      contractAddresses: [tokenMap.usdc.address],
-      excludeZeroValue: true,
-      category: ["erc20"],
-      fromBlock: `0x${(fromBlock + 1).toString(16)}`,
-      toBlock: `0x${latestBlock.toString(16)}`
-    });
+    // --- REVERTED TO THE LOOPING METHOD ---
+    // This is more robust and supported by the Alchemy API.
+    for (const user of users) {
+      if (!user.eth_address) continue;
 
-    if (transfers.transfers.length > 0) {
-      console.log(`[DEBUG] Found ${transfers.transfers.length} total potential USDC transfers.`);
-    }
+      try {
+        const transfers = await alchemy.core.getAssetTransfers({
+          toAddress: user.eth_address, // Query one user at a time
+          contractAddresses: [tokenMap.usdc.address], // Simplified back to USDC only for now
+          excludeZeroValue: true,
+          category: ["erc20"],
+          fromBlock: `0x${(fromBlock + 1).toString(16)}`,
+          toBlock: `0x${latestBlock.toString(16)}`
+        });
 
-    for (const event of transfers.transfers) {
-      const txHash = event.hash;
-      const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
+        if (transfers.transfers.length > 0) {
+          console.log(`[DEBUG] Found ${transfers.transfers.length} potential transfers for user ${user.user_id}`);
+        }
 
-      if (existingDeposit.rows.length === 0) {
-        const user = users.find(u => u.eth_address.toLowerCase() === event.to.toLowerCase());
-        if (!user) continue; // Skip if it's a transfer to an address we don't recognize
+        for (const event of transfers.transfers) {
+          const txHash = event.hash;
+          const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
-        const rawAmount = event.value;
-        const amountStr = parseFloat(rawAmount).toFixed(tokenMap.usdc.decimals);
-        
-        console.log(`✅ New USDC deposit detected for user ${user.user_id}: ${amountStr}, tx: ${txHash}`);
-        
-        await client.query('BEGIN');
+          if (existingDeposit.rows.length === 0) {
+            const tokenSymbol = (event.asset || '').toLowerCase();
+            if (tokenSymbol !== 'usdc') continue; // Ensure we only process USDC
 
-        await client.query(
-          `INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`,
-          [user.user_id, amountStr, txHash]
-        );
+            const tokenInfo = tokenMap[tokenSymbol];
+            if (!tokenInfo) continue;
 
-        await client.query(
-          'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
-          [amountStr, user.user_id]
-        );
-
-        await client.query('COMMIT');
-        console.log(`✅ Successfully processed deposit for tx ${txHash}`);
+            const rawAmount = event.value;
+            const amountStr = parseFloat(rawAmount).toFixed(tokenInfo.decimals);
+            
+            console.log(`✅ New USDC deposit detected for user ${user.user_id}: ${amountStr}, tx: ${txHash}`);
+            
+            await client.query('BEGIN');
+            await client.query(
+              `INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`,
+              [user.user_id, amountStr, txHash]
+            );
+            await client.query(
+              'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+              [amountStr, user.user_id]
+            );
+            await client.query('COMMIT');
+            console.log(`✅ Successfully processed deposit for tx ${txHash}`);
+          }
+        }
+      } catch (e) {
+        if(client) await client.query('ROLLBACK').catch(err => console.error('Rollback failed:', err));
+        console.error(`❌ Failed to process deposits for user ${user.user_id}, continuing...`, e);
       }
     }
 
@@ -74,7 +83,6 @@ async function pollDeposits() {
     console.log(`✅ Finished scan. Next scan will start from block #${latestBlock}`);
 
   } catch (error) {
-    // --- BETTER ERROR LOGGING ---
     console.error('❌ Major error in pollDeposits job:', error);
   } finally {
     if (client) client.release();
