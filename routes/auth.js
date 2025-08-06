@@ -61,25 +61,46 @@ router.post('/register', async (req, res) => {
     const newReferralCode = generateReferralCode();
 
     // --- THIS IS THE FINAL, CORRECT INSERT STATEMENT ---
-    const newUserQuery = `
+   const newUserQuery = `
       INSERT INTO users (
-        email, password_hash, username, eth_address, eth_private_key_encrypted, 
-        referral_code, referred_by_user_id, xp, balance, 
-        account_tier, theme, is_admin
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.00, 1, 'dark', false)
+        email, 
+        password_hash, 
+        username, 
+        google_id, 
+        balance, 
+        eth_address, 
+        eth_private_key_encrypted, 
+        referred_by_user_id, 
+        xp, 
+        bio, 
+        theme, 
+        referral_code, 
+        is_admin, 
+        account_tier
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
       RETURNING user_id, email, username, eth_address`;
       
     const newUserParams = [
-      email, passwordHash, username, wallet.address, encryptedKey, 
-      newReferralCode, referrerId, xpToAward
+      email,                  // $1
+      passwordHash,           // $2
+      username,               // $3
+      null,                   // $4: google_id
+      0.00,                   // $5: balance
+      wallet.address,         // $6: eth_address
+      encryptedKey,           // $7: eth_private_key_encrypted
+      referrerId,             // $8: referred_by_user_id
+      xpToAward,              // $9: xp
+      null,                   // $10: bio
+      'dark',                 // $11: theme
+      newReferralCode,        // $12: referral_code
+      false,                  // $13: is_admin
+      1                       // $14: account_tier
     ];
     
     const newUser = await client.query(newUserQuery, newUserParams);
 
     await client.query('COMMIT');
-    
     res.status(201).json({ message: 'User created successfully', user: newUser.rows[0] });
-
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('REGISTRATION PROCESS FAILED:', error); 
@@ -91,7 +112,42 @@ router.post('/register', async (req, res) => {
 
 // --- Standard Login ---
 router.post('/login', async (req, res) => {
-  // ... (This function is correct and unchanged)
+  try {
+    const { email, password } = req.body;
+    console.log(`[Login Attempt] for email: ${email}`);
+
+    if (!email || !password) {
+      return res.status(401).json({ error: 'Invalid credentials.' });
+    }
+    
+    const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin FROM users WHERE email = $1', [email]);
+    
+    if (result.rows.length === 0) {
+      console.log(`[Login Failed] No user found for email: ${email}`);
+      return res.status(401).json({ error: 'Invalid credentials.' });
+    }
+    
+    const user = result.rows[0];
+    
+    console.log(`[Login Attempt] User found. Comparing password for user ID: ${user.user_id}`);
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    console.log(`[Login Attempt] Password match result: ${isMatch}`);
+    
+    if (!isMatch) {
+      console.log(`[Login Failed] Password mismatch for user ID: ${user.user_id}`);
+      return res.status(401).json({ error: 'Invalid credentials.' });
+    }
+    
+    const payload = { user: { id: user.user_id, username: user.username, isAdmin: user.is_admin } };
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+    
+    console.log(`[Login Success] JWT generated for user ID: ${user.user_id}`);
+    res.json({ token });
+
+  } catch (error) {
+    console.error('[Login Error]', error);
+    res.status(500).json({ error: 'Server error during login.' });
+  }
 });
 
 // --- Google OAuth2 ---
