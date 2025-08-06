@@ -4,24 +4,31 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 const { decrypt } = require('../utils/walletUtils');
 const tokenMap = require('../utils/tokens/tokenMap');
-const { ensureGasCushion } = require('../utils/gas'); // ✅ THE FIX: Import our new, unified gas utility
+const { ensureGasCushion } = require('../utils/gas');
+const erc20Abi = require('../utils/abis/erc20.json'); // Import the shared ABI
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 
 async function processWithdrawals() {
   console.log('🔄 Checking withdrawal queue...');
   const client = await pool.connect();
+  
+  // --- THIS IS THE FIX ---
+  // We declare 'withdrawal' here, in the higher scope.
+  let withdrawal = null;
+
   try {
-    // Get the oldest, queued withdrawal
-    const { rows: queued } = await client.query(
+    const { rows: queuedWithdrawals } = await client.query(
       `SELECT * FROM withdrawal_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`
     );
 
-    if (queued.length === 0) {
-      return; // No pending withdrawals
+    if (queuedWithdrawals.length === 0) {
+      if (client) client.release(); // Release client early if no work
+      return;
     }
 
-    const withdrawal = queued[0];
+    // Assign the found withdrawal to our higher-scope variable
+    withdrawal = queuedWithdrawals[0];
     const { id, user_id, to_address, amount, token } = withdrawal;
 
     console.log(`⚙️ Processing withdrawal #${id}: ${amount} ${token} → ${to_address}`);
@@ -30,18 +37,19 @@ async function processWithdrawals() {
     const { rows: users } = await client.query('SELECT eth_address, eth_private_key_encrypted FROM users WHERE user_id = $1', [user_id]);
     const user = users[0];
 
-    // ✅ THE FIX: Use the unified gas funder
+    // Note: ensureGasCushion will be addressed later as requested.
     await ensureGasCushion(user_id, user.eth_address);
 
     const privateKey = decrypt(user.eth_private_key_encrypted);
     const wallet = new ethers.Wallet(privateKey, provider);
     const tokenInfo = tokenMap[token.toLowerCase()];
-    const contract = new ethers.Contract(tokenInfo.address, tokenInfo.abi, wallet);
+    
+    // Use the shared, correct ABI
+    const contract = new ethers.Contract(tokenInfo.address, erc20Abi, wallet);
 
     const tx = await contract.transfer(
       to_address,
-      ethers.utils.parseUnits(amount.toString(), tokenInfo.decimals),
-      { gasLimit: 100000 } // Set a safe gas limit
+      ethers.utils.parseUnits(amount.toString(), tokenInfo.decimals)
     );
 
     console.log(`💸 Withdrawal transaction sent: ${tx.hash}`);
@@ -49,23 +57,24 @@ async function processWithdrawals() {
     console.log(`✅ Withdrawal tx confirmed: ${tx.hash}`);
     
     await client.query('BEGIN');
-    // Move from queue to final table
     await client.query(`DELETE FROM withdrawal_queue WHERE id = $1`, [id]);
     await client.query(
-      `INSERT INTO withdrawals (id, user_id, to_address, amount, token, tx_hash, status)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'sent')`,
+      `INSERT INTO withdrawals (user_id, to_address, amount, token, tx_hash, status)
+       VALUES ($1, $2, $3, $4, $5, 'sent')`,
       [user_id, to_address, amount, token, tx.hash]
     );
     await client.query('COMMIT');
 
   } catch (err) {
     console.error(`❌ FAILED to process withdrawal:`, err.message);
-    // If a specific withdrawal ID was being processed, mark it as failed
-    if (client && queued && queued[0]) {
-      await client.query(`UPDATE withdrawal_queue SET status = 'failed', error_message = $1 WHERE id = $2`, [err.message, queued[0].id]);
+    // --- THIS IS THE FIX ---
+    // We now check our higher-scope 'withdrawal' variable.
+    if (client && withdrawal) {
+      console.log(`Marking withdrawal #${withdrawal.id} as failed.`);
+      await client.query(`UPDATE withdrawal_queue SET status = 'failed', error_message = $1 WHERE id = $2`, [err.message, withdrawal.id]);
     }
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 

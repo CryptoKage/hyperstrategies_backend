@@ -22,9 +22,15 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
+const userQuery = `
+      SELECT ROUND(balance::numeric, 6) as balance, referred_by_user_id, account_tier 
+      FROM users WHERE user_id = $1 FOR UPDATE
+    `;
+    const vaultQuery = 'SELECT fee_percentage, is_fee_tier_based FROM vaults WHERE vault_id = $1';
+
     const [userResult, vaultResult] = await Promise.all([
-      client.query('SELECT balance, referred_by_user_id, account_tier FROM users WHERE user_id = $1 FOR UPDATE', [userId]),
-      client.query('SELECT fee_percentage, is_fee_tier_based FROM vaults WHERE vault_id = $1', [vaultId])
+      client.query(userQuery, [userId]),
+      client.query(vaultQuery, [vaultId])
     ]);
     
     if (userResult.rows.length === 0) throw new Error("User not found during allocation.");
@@ -33,8 +39,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
     const userData = userResult.rows[0];
     const vaultData = vaultResult.rows[0];
     
-    // --- THIS IS THE FIX ---
-    // We safely round the user's balance from the DB before parsing it with ethers.
     const userBalanceSafeString = parseFloat(userData.balance).toFixed(tokenMap.usdc.decimals);
     const availableBalance_BN = ethers.utils.parseUnits(userBalanceSafeString, tokenMap.usdc.decimals);
     const totalAmount_BN = ethers.utils.parseUnits(totalAmount_str, tokenMap.usdc.decimals);
@@ -68,12 +72,19 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
     const existingPosition = await client.query('SELECT position_id, tradable_capital, high_water_mark FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2 FOR UPDATE', [userId, vaultId]);
     
+    // --- THIS IS THE CORRECTED IF/ELSE STRUCTURE ---
     if (existingPosition.rows.length > 0) {
       const currentPosition = existingPosition.rows[0];
-      const currentCapital_BN = ethers.utils.parseUnits(currentPosition.tradable_capital.toString(), 6);
-      const currentHWM_BN = ethers.utils.parseUnits(currentPosition.high_water_mark.toString(), 6);
+      
+      const currentCapitalSafeString = parseFloat(currentPosition.tradable_capital).toFixed(tokenMap.usdc.decimals);
+      const currentHWMSafeString = parseFloat(currentPosition.high_water_mark).toFixed(tokenMap.usdc.decimals);
+
+      const currentCapital_BN = ethers.utils.parseUnits(currentCapitalSafeString, 6);
+      const currentHWM_BN = ethers.utils.parseUnits(currentHWMSafeString, 6);
+      
       const newCapital_BN = currentCapital_BN.add(tradableAmount_BN);
       const newHWM_BN = currentHWM_BN.add(tradableAmount_BN);
+
       await client.query( 'UPDATE user_vault_positions SET tradable_capital = $1, high_water_mark = $2, lock_expires_at = $3 WHERE position_id = $4', [ ethers.utils.formatUnits(newCapital_BN, 6), ethers.utils.formatUnits(newHWM_BN, 6), lockExpiresAt, currentPosition.position_id ] );
     } else {
       await client.query( `INSERT INTO user_vault_positions (user_id, vault_id, tradable_capital, status, lock_expires_at, high_water_mark) VALUES ($1, $2, $3, 'active', $4, $5)`, [ userId, vaultId, ethers.utils.formatUnits(tradableAmount_BN, 6), lockExpiresAt, ethers.utils.formatUnits(tradableAmount_BN, 6) ] );
