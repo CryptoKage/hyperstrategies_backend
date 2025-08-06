@@ -9,24 +9,31 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // --- ANNOTATION --- We'll use Promise.all to run our database queries in parallel.
-    // This is much more efficient than running them one after another.
-
-    const [userResult, vaultsResult, positionsResult, bonusPointsResult] = await Promise.all([
-      // Query 1: Get user data, including the new account_tier
+    // --- We run all queries in parallel for maximum efficiency ---
+    const [
+      userResult, 
+      vaultsResult, 
+      positionsResult, 
+      bonusPointsResult,
+      // --- NEW EFFICIENT QUERY ---
+      // This single query gets the two sums we need, replacing the old 'reduce' logic.
+      portfolioSumsResult 
+    ] = await Promise.all([
       pool.query('SELECT username, balance, eth_address, account_tier FROM users WHERE user_id = $1', [userId]),
-
-      // Query 2: Get all available vaults, filtered and ordered correctly
-     pool.query("SELECT * FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
-
-      // Query 3: Get all of the user's specific vault positions with all details
+      pool.query("SELECT * FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
       pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1', [userId]),
-      
-      // Query 4: Get total bonus points
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
+      // --- NEW QUERY DEFINITION ---
+      pool.query(
+        `SELECT 
+           COALESCE(SUM(tradable_capital), 0) as total_capital, 
+           COALESCE(SUM(pnl), 0) as total_pnl 
+         FROM user_vault_positions 
+         WHERE user_id = $1 AND status IN ('in_trade', 'active')`,
+        [userId]
+      )
     ]);
 
-    // --- ANNOTATION --- Error handling and data extraction
     if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'User not found.' });
     }
@@ -36,21 +43,22 @@ router.get('/', authenticateToken, async (req, res) => {
     const userPositions = positionsResult.rows;
     const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
 
-    // --- ANNOTATION --- Calculations for total value
-    const investedValue = userPositions.reduce((sum, position) => sum + parseFloat(position.tradable_capital), 0);
-    const totalPortfolioValue = parseFloat(userData.balance) + investedValue;
-
-    // --- ANNOTATION --- Constructing the final JSON payload
-    // This structure now matches exactly what the new frontend components expect.
+    // --- Extracting the new values from our new query ---
+    const totalCapitalInVaults = parseFloat(portfolioSumsResult.rows[0].total_capital);
+    const totalUnrealizedPnl = parseFloat(portfolioSumsResult.rows[0].total_pnl);
+    
+    // --- Constructing the final JSON payload ---
     const dashboardData = {
       username: userData.username,
       depositAddress: userData.eth_address,
       availableBalance: parseFloat(userData.balance),
-      totalPortfolioValue: totalPortfolioValue,
       totalBonusPoints: totalBonusPoints,
-      accountTier: userData.account_tier, // The user's tier level
-      vaults: availableVaults,             // The list of all available vaults (ordered and filtered)
-      userPositions: userPositions        // The user's specific positions with lock_expires_at etc.
+      accountTier: userData.account_tier,
+      vaults: availableVaults,
+      userPositions: userPositions,
+      // --- ADDING THE NEW FIELDS FOR THE FRONTEND ---
+      totalCapitalInVaults: totalCapitalInVaults,
+      totalUnrealizedPnl: totalUnrealizedPnl
     };
 
     res.json(dashboardData);
