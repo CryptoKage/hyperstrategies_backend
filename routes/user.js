@@ -86,19 +86,38 @@ router.get('/wallet', authenticateToken, async (req, res) => {
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const profileQuery = `
-      SELECT u.username, u.email, u.bio, u.xp, u.referral_code, u.account_tier,
-             COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
-      FROM users u
-      LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
-      WHERE u.user_id = $1
-      GROUP BY u.user_id;
-    `;
-    const result = await pool.query(profileQuery, [userId]);
-    if (result.rows.length === 0) {
+
+    // We now run two queries in parallel to get all profile data at once
+    const [profileResult, stakedResult] = await Promise.all([
+      // This query is slightly simplified to remove the deprecated 'bio' field
+      pool.query(`
+        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier,
+               COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+        FROM users u
+        LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
+        WHERE u.user_id = $1
+        GROUP BY u.user_id;
+      `, [userId]),
+      // This is the NEW query to get the total capital for calculating XP rate
+      pool.query(
+        "SELECT COALESCE(SUM(tradable_capital), 0) as total FROM user_vault_positions WHERE user_id = $1 AND status IN ('in_trade', 'active')",
+        [userId]
+      )
+    ]);
+
+    if (profileResult.rows.length === 0) {
       return res.status(404).json({ error: 'User not found.' });
     }
-    res.json(result.rows[0]);
+
+    const profileData = profileResult.rows[0];
+    const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
+
+    // Add the new field to the response object before sending
+    res.json({
+      ...profileData, // Keep all the original profile data
+      total_staked_capital: totalStakedCapital, // Add our new value
+    });
+    
   } catch (err) {
     console.error('Error fetching profile data:', err.message);
     res.status(500).send('Server Error');
@@ -257,31 +276,26 @@ router.get('/xp-history', authenticateToken, async (req, res) => {
     const limit = 20;
     const offset = (page - 1) * limit;
 
-    // --- THIS QUERY IS NOW CORRECTED ---
-    // The OR conditions are wrapped in parentheses to ensure the user_id filter applies to all of them.
+    // The SQL query now filters OUT the daily staking bonus
     const historyQuery = `
       SELECT
         activity_id,
-        activity_type,
         description,
         amount_primary,
-        symbol_primary,
         created_at
       FROM
         user_activity_log
       WHERE
         user_id = $1 AND
         ( 
-          activity_type LIKE 'XP_%' OR 
-          (activity_type = 'BONUS_POINT_BUYBACK' AND symbol_primary = 'USDC')
-        )
+          activity_type LIKE 'XP_%' AND
+          activity_type != 'XP_STAKING_BONUS'
+        ) OR 
+        (activity_type = 'BONUS_POINT_BUYBACK' AND symbol_primary = 'USDC')
       ORDER BY
         created_at DESC
       LIMIT $2 OFFSET $3;
     `;
-    
-    // Note: I also corrected the BONUS_POINT_BUYBACK check to look at symbol_primary.
-    // In that transaction, the USDC is primary, and the XP is secondary.
     
     const { rows } = await pool.query(historyQuery, [userId, limit, offset]);
     
