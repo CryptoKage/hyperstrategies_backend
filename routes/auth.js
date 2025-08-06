@@ -14,7 +14,7 @@ function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
-// --- Registration Endpoint (DEFINITIVE VERSION) ---
+// --- Registration Endpoint (DEFINITIVE V3 - Matches DDL) ---
 router.post('/register', async (req, res) => {
   const { email, password, username, referralCode } = req.body;
   
@@ -41,7 +41,9 @@ router.post('/register', async (req, res) => {
     
     let xpToAward = 0;
     if (currentUserCount < 100) xpToAward = 25;
-    // ... (tiered XP logic) ...
+    else if (currentUserCount < 200) xpToAward = 20;
+    else if (currentUserCount < 300) xpToAward = 15;
+    else if (currentUserCount < 400) xpToAward = 10;
     else if (currentUserCount < 500) xpToAward = 5;
 
     let referrerId = null;
@@ -58,13 +60,13 @@ router.post('/register', async (req, res) => {
     const encryptedKey = encrypt(wallet.privateKey);
     const newReferralCode = generateReferralCode();
 
-    // --- THIS IS THE FIX ---
-    // The INSERT statement no longer includes the deleted 'last_known_usdc_balance' column.
+    // --- THIS IS THE FINAL, CORRECT INSERT STATEMENT ---
     const newUserQuery = `
       INSERT INTO users (
         email, password_hash, username, eth_address, eth_private_key_encrypted, 
-        referral_code, referred_by_user_id, xp, account_tier
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+        referral_code, referred_by_user_id, xp, balance, 
+        account_tier, theme, is_admin
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0.00, 1, 'dark', false)
       RETURNING user_id, email, username, eth_address`;
       
     const newUserParams = [
