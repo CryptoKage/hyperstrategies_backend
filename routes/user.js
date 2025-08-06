@@ -292,3 +292,6 @@ router.get('/xp-history', authenticateToken, async (req, res) => {
     res.status(500).send('Server Error');
   }
 });
+
+module.exports = router;
+
