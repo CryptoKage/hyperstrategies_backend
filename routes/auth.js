@@ -61,9 +61,15 @@ router.post('/register', async (req, res) => {
     const newReferralCode = generateReferralCode();
 
     // --- NEW TAGS LOGIC ---
-    const initialTags = [];
-    if (referralCode && referralCode.toLowerCase() === 'hs-hip-hop') {
-      initialTags.push('hip_hop_syndicate');
+  const initialTags = [];
+const lowerCaseRefCode = referralCode ? referralCode.toLowerCase() : '';
+
+if (lowerCaseRefCode === 'hs-hip-hop') {
+  initialTags.push('hip_hop_syndicate');
+} else if (lowerCaseRefCode === 'hs-shadwmf') { // Inventing a code for ShadwMF
+  initialTags.push('shadwmf_syndicate');
+} else if (lowerCaseRefCode === 'hs-purrtardos') { // Inventing a code for Purrtardos
+  initialTags.push('purrtardos_syndicate');
     }
 
     // --- UPDATED INSERT STATEMENT ---
