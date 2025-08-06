@@ -372,37 +372,46 @@ router.get('/users/:userId/bonus-points', async (req, res) => {
 
 router.get('/treasury-report', async (req, res) => {
   try {
+    // --- THE FIX ---
+    // We now fetch all ledger balances and liability data in one go.
     const [
-      depositFeeRevenueResult,
-      performanceFeeRevenueResult,
+      ledgersResult, // 1. Get all ledger balances from the correct table.
       totalCapitalInVaultsResult,
       totalOutstandingBonusPointsResult
     ] = await Promise.all([
-      // Sum up all revenue from deposit fees
-      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM platform_revenue WHERE source = 'DEPOSIT_FEE'"),
-      // Sum up all revenue from performance fees
-      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM platform_revenue WHERE source = 'PERFORMANCE_FEE'"),
-      // Calculate total user capital currently in vaults (a liability)
+      pool.query("SELECT ledger_name, balance FROM treasury_ledgers"),
       pool.query("SELECT COALESCE(SUM(tradable_capital), 0) as total FROM user_vault_positions WHERE status = 'in_trade'"),
-      // Calculate total outstanding bonus points (a future liability)
       pool.query("SELECT COALESCE(SUM(points_amount), 0) as total FROM bonus_points")
     ]);
 
-    const depositFeeRevenue = parseFloat(depositFeeRevenueResult.rows[0].total);
-    const performanceFeeRevenue = parseFloat(performanceFeeRevenueResult.rows[0].total);
+    // 2. Transform the array of ledger rows into a simple key-value map for easy access.
+    //    Example: { "DEPOSIT_FEES_TOTAL": 150.50, "PERFORMANCE_FEES_TOTAL": 2500.00, ... }
+    const ledgersMap = ledgersResult.rows.reduce((acc, row) => {
+      acc[row.ledger_name] = parseFloat(row.balance);
+      return acc;
+    }, {});
+
+    // 3. Construct the final report using the new ledgersMap.
+    const depositFeeRevenue = ledgersMap['DEPOSIT_FEES_TOTAL'] || 0;
+    const performanceFeeRevenue = ledgersMap['PERFORMANCE_FEES_TOTAL'] || 0;
     const totalCapitalInVaults = parseFloat(totalCapitalInVaultsResult.rows[0].total);
     const totalOutstandingBonusPoints = parseFloat(totalOutstandingBonusPointsResult.rows[0].total);
 
     res.json({
+      // The frontend needs this "revenue" object.
       revenue: {
         depositFees: depositFeeRevenue,
         performanceFees: performanceFeeRevenue,
         total: depositFeeRevenue + performanceFeeRevenue
       },
+      // This part was already working correctly.
       liabilities: {
         userCapitalInVaults: totalCapitalInVaults,
         bonusPoints: totalOutstandingBonusPoints
       },
+      // CRITICAL: The frontend NEEDS this "ledgers" object to populate the allocation cards.
+      ledgers: ledgersMap,
+      // The net position calculation remains the same.
       netPosition: (depositFeeRevenue + performanceFeeRevenue) - totalOutstandingBonusPoints
     });
 
