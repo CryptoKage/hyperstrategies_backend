@@ -33,7 +33,8 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'This username is already taken.' });
     }
 
-    await client.query('BEGIN');
+
+    await client.query('LOCK TABLE users IN EXCLUSIVE MODE');
 
     const userCountResult = await client.query('SELECT COUNT(*) FROM users FOR UPDATE');
     const currentUserCount = parseInt(userCountResult.rows[0].count);
