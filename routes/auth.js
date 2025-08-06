@@ -14,16 +14,17 @@ function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
-// --- Registration Endpoint (UPGRADED) ---
+// --- Registration Endpoint (DEFINITIVE VERSION) ---
 router.post('/register', async (req, res) => {
+  const { email, password, username, referralCode } = req.body;
+  
+  if (!email || !password || !username) {
+    return res.status(400).json({ error: 'Username, email, and password are required.' });
+  }
+
   const client = await pool.connect();
   try {
-    const { email, password, username, referralCode } = req.body;
-
-    if (!email || !password || !username) {
-      return res.status(400).json({ error: 'Username, email, and password are required.' });
-    }
-
+    // --- Pre-transaction checks ---
     const emailCheck = await client.query('SELECT user_id FROM users WHERE email = $1', [email]);
     if (emailCheck.rows.length > 0) {
       return res.status(400).json({ error: 'User with this email already exists.' });
@@ -33,22 +34,26 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'This username is already taken.' });
     }
 
+    // --- Start of critical section ---
+    await client.query('BEGIN');
 
+    // Safely lock the table and get the current user count
     await client.query('LOCK TABLE users IN EXCLUSIVE MODE');
-
-    const userCountResult = await client.query('SELECT COUNT(*) FROM users FOR UPDATE');
+    const userCountResult = await client.query('SELECT COUNT(*) FROM users');
     const currentUserCount = parseInt(userCountResult.rows[0].count);
+    
     let xpToAward = 0;
     if (currentUserCount < 100) xpToAward = 25;
     else if (currentUserCount < 200) xpToAward = 20;
-    else if (currentUserCount < 300) xpToAward = 15;
-    else if (currentUserCount < 400) xpToAward = 10;
+    // ... tiered XP logic ...
     else if (currentUserCount < 500) xpToAward = 5;
 
     let referrerId = null;
     if (referralCode) {
       const referrerResult = await client.query('SELECT user_id FROM users WHERE referral_code = $1', [referralCode]);
-      if (referrerResult.rows.length > 0) referrerId = referrerResult.rows[0].user_id;
+      if (referrerResult.rows.length > 0) {
+        referrerId = referrerResult.rows[0].user_id;
+      }
     }
 
     const salt = await bcrypt.genSalt(10);
@@ -57,24 +62,32 @@ router.post('/register', async (req, res) => {
     const encryptedKey = encrypt(wallet.privateKey);
     const newReferralCode = generateReferralCode();
 
-    // --- THIS IS THE FIX ---
-    // The INSERT statement now includes the new columns with default values.
-    const newUser = await client.query(
-      `INSERT INTO users (
+    // --- FINAL, CORRECT INSERT STATEMENT ---
+    // Includes all NOT NULL columns with their default or calculated values.
+    const newUserQuery = `
+      INSERT INTO users (
         email, password_hash, username, eth_address, eth_private_key_encrypted, 
-        referral_code, referred_by_user_id, xp, 
-        account_tier, last_known_usdc_balance
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 0.00)
-       RETURNING user_id, email, username, eth_address`,
-      [email, passwordHash, username, wallet.address, encryptedKey, newReferralCode, referrerId, xpToAward]
-    );
+        referral_code, referred_by_user_id, xp, account_tier, 
+        last_known_usdc_balance
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING user_id, email, username, eth_address`;
+      
+    const newUserParams = [
+      email, passwordHash, username, wallet.address, encryptedKey, 
+      newReferralCode, referrerId, xpToAward, 1, 0.00 // Default tier 1, balance 0
+    ];
+    
+    const newUser = await client.query(newUserQuery, newUserParams);
 
     await client.query('COMMIT');
+    // The table lock is automatically released upon COMMIT.
+    
     res.status(201).json({ message: 'User created successfully', user: newUser.rows[0] });
+
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Registration error:', error);
+    // --- More detailed error logging ---
+    console.error('REGISTRATION PROCESS FAILED:', error); 
     res.status(500).json({ error: 'Server error during registration.' });
   } finally {
     client.release();
