@@ -248,4 +248,47 @@ router.put('/referral-code', authenticateToken, async (req, res) => {
   }
 });
 
-module.exports = router;
+// Add this new endpoint to server/routes/user.js
+
+router.get('/xp-history', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = 20;
+    const offset = (page - 1) * limit;
+
+    // --- THIS QUERY IS NOW CORRECTED ---
+    // The OR conditions are wrapped in parentheses to ensure the user_id filter applies to all of them.
+    const historyQuery = `
+      SELECT
+        activity_id,
+        activity_type,
+        description,
+        amount_primary,
+        symbol_primary,
+        created_at
+      FROM
+        user_activity_log
+      WHERE
+        user_id = $1 AND
+        ( 
+          activity_type LIKE 'XP_%' OR 
+          (activity_type = 'BONUS_POINT_BUYBACK' AND symbol_primary = 'USDC')
+        )
+      ORDER BY
+        created_at DESC
+      LIMIT $2 OFFSET $3;
+    `;
+    
+    // Note: I also corrected the BONUS_POINT_BUYBACK check to look at symbol_primary.
+    // In that transaction, the USDC is primary, and the XP is secondary.
+    
+    const { rows } = await pool.query(historyQuery, [userId, limit, offset]);
+    
+    res.json(rows);
+
+  } catch (err) {
+    console.error(`Error fetching XP history for user ${req.user.id}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
