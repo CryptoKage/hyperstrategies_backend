@@ -87,18 +87,17 @@ router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // We now run two queries in parallel to get all profile data at once
     const [profileResult, stakedResult] = await Promise.all([
-      // This query is slightly simplified to remove the deprecated 'bio' field
       pool.query(`
-        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier,
-               COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+        SELECT 
+          u.username, u.email, u.xp, u.referral_code, u.account_tier,
+          u.tags, -- <-- FIX: Add the new tags column here
+          COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
         FROM users u
         LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
         WHERE u.user_id = $1
         GROUP BY u.user_id;
       `, [userId]),
-      // This is the NEW query to get the total capital for calculating XP rate
       pool.query(
         "SELECT COALESCE(SUM(tradable_capital), 0) as total FROM user_vault_positions WHERE user_id = $1 AND status IN ('in_trade', 'active')",
         [userId]
@@ -112,10 +111,9 @@ router.get('/profile', authenticateToken, async (req, res) => {
     const profileData = profileResult.rows[0];
     const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
 
-    // Add the new field to the response object before sending
     res.json({
-      ...profileData, // Keep all the original profile data
-      total_staked_capital: totalStakedCapital, // Add our new value
+      ...profileData,
+      total_staked_capital: totalStakedCapital,
     });
     
   } catch (err) {

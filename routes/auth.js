@@ -60,24 +60,20 @@ router.post('/register', async (req, res) => {
     const encryptedKey = encrypt(wallet.privateKey);
     const newReferralCode = generateReferralCode();
 
-    // --- THIS IS THE FINAL, CORRECT INSERT STATEMENT ---
-   const newUserQuery = `
+    // --- NEW TAGS LOGIC ---
+    const initialTags = [];
+    if (referralCode && referralCode.toLowerCase() === 'hs-hip-hop') {
+      initialTags.push('hip_hop_syndicate');
+    }
+
+    // --- UPDATED INSERT STATEMENT ---
+    const newUserQuery = `
       INSERT INTO users (
-        email, 
-        password_hash, 
-        username, 
-        google_id, 
-        balance, 
-        eth_address, 
-        eth_private_key_encrypted, 
-        referred_by_user_id, 
-        xp, 
-        bio, 
-        theme, 
-        referral_code, 
-        is_admin, 
-        account_tier
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        email, password_hash, username, google_id, balance, 
+        eth_address, eth_private_key_encrypted, referred_by_user_id, 
+        xp, bio, theme, referral_code, is_admin, account_tier,
+        tags -- FIX 1: Add the new column
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) -- FIX 2: Add the new placeholder
       RETURNING user_id, email, username, eth_address`;
       
     const newUserParams = [
@@ -94,7 +90,8 @@ router.post('/register', async (req, res) => {
       'dark',                 // $11: theme
       newReferralCode,        // $12: referral_code
       false,                  // $13: is_admin
-      1                       // $14: account_tier
+      1,                      // $14: account_tier
+      initialTags             // $15: FIX 3: Add the initial tags array
     ];
     
     const newUser = await client.query(newUserQuery, newUserParams);
