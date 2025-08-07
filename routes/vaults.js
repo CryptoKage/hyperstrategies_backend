@@ -149,26 +149,50 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
   const { vaultId } = req.body;
   const userId = req.user.id;
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
-    const positionResult = await client.query('SELECT tradable_capital, lock_expires_at FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
+
+    // Get the position and lock it for update to prevent race conditions
+    const positionResult = await client.query(
+      "SELECT position_id, tradable_capital, lock_expires_at FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2 AND status = 'in_trade' FOR UPDATE",
+      [userId, vaultId]
+    );
+
     if (positionResult.rows.length === 0) {
-      return res.status(404).json({ error: 'You do not have a position in this vault.' });
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'You do not have an active position in this vault to withdraw from.' });
     }
+
     const position = positionResult.rows[0];
+
+    // Check the lock date
     if (position.lock_expires_at && new Date(position.lock_expires_at) > new Date()) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ error: `This position is locked for withdrawal until ${new Date(position.lock_expires_at).toLocaleDateString()}.` });
     }
+
     const withdrawalAmount = position.tradable_capital;
+
+    // --- THIS IS THE FIX ---
+    // Instead of deleting the position, we update its status.
+    await client.query(
+      "UPDATE user_vault_positions SET status = 'withdrawal_pending' WHERE position_id = $1",
+      [position.position_id]
+    );
+
+    // Create the activity log entry
     const withdrawalDescription = `Requested withdrawal of ${parseFloat(withdrawalAmount).toFixed(2)} USDC from Vault ${vaultId}.`;
     await client.query(
       `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
        VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING')`,
       [userId, withdrawalDescription, withdrawalAmount]
     );
-    await client.query('DELETE FROM user_vault_positions WHERE user_id = $1 AND vault_id = $2', [userId, vaultId]);
+
     await client.query('COMMIT');
-    res.status(200).json({ message: 'Withdrawal request submitted successfully. It may take up to 48 hours to process.' });
+    
+    res.status(200).json({ message: 'Withdrawal request submitted successfully. The position is now pending processing.' });
+
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Vault withdrawal request error:', err);
