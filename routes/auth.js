@@ -16,10 +16,9 @@ function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
-// --- FIX 1: Stricter rate limit ---
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // Limit each IP to 10 auth attempts per 15 mins
+  windowMs: 15 * 60 * 1000,
+  max: 10,
   message: 'Too many authentication attempts from this IP, please try again after 15 minutes',
   standardHeaders: true,
   legacyHeaders: false,
@@ -47,7 +46,6 @@ router.post(
 
     const { email, password, username, referralCode } = req.body;
     
-    // --- FIX 2: Moved client connection inside the try block ---
     let client;
     try {
       client = await pool.connect();
@@ -62,10 +60,45 @@ router.post(
 
       await client.query('BEGIN');
       
-      // ... (rest of the registration logic is unchanged and correct)
+      const userCountResult = await client.query('SELECT COUNT(*) FROM users');
+      const currentUserCount = parseInt(userCountResult.rows[0].count);
       
+      let xpToAward = 0;
+      if (currentUserCount < 100) xpToAward = 25;
+      else if (currentUserCount < 500) xpToAward = 5;
+
+      let referrerId = null;
+      if (referralCode) {
+        const referrerResult = await client.query('SELECT user_id FROM users WHERE referral_code = $1', [referralCode]);
+        if (referrerResult.rows.length > 0) {
+          referrerId = referrerResult.rows[0].user_id;
+        }
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const passwordHash = await bcrypt.hash(password, salt);
+      const wallet = generateWallet();
+      const encryptedKey = encrypt(wallet.privateKey);
+      const newReferralCode = generateReferralCode();
+
+      const initialTags = [];
+      const lowerCaseRefCode = referralCode ? referralCode.toLowerCase() : '';
+      if (lowerCaseRefCode === 'hs-hip-hop') { initialTags.push('hip_hop_syndicate'); }
+      else if (lowerCaseRefCode === 'hs-shadwmf') { initialTags.push('shadwmf_syndicate'); }
+      else if (lowerCaseRefCode === 'hs-purrtardos') { initialTags.push('purrtardos_syndicate'); }
+
+      const newUserQuery = `
+        INSERT INTO users (email, password_hash, username, google_id, balance, eth_address, eth_private_key_encrypted, referred_by_user_id, xp, bio, theme, referral_code, is_admin, account_tier, tags)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING user_id, email, username, eth_address`;
+        
+      const newUserParams = [email, passwordHash, username, null, 0.00, wallet.address, encryptedKey, referrerId, xpToAward, null, 'dark', newReferralCode, false, 1, initialTags];
+      
+      const newUser = await client.query(newUserQuery, newUserParams);
+
       await client.query('COMMIT');
       res.status(201).json({ message: 'User created successfully', user: newUser.rows[0] });
+
     } catch (error) {
       if (client) await client.query('ROLLBACK');
       console.error('REGISTRATION PROCESS FAILED:', error); 
