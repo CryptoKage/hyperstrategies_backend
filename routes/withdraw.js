@@ -11,7 +11,6 @@ const router = express.Router();
 // --- ✅ THE FIX: Use the correct ethers v5 syntax for creating a provider ---
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
-const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 
 // --- Queue a New Platform Withdrawal Endpoint ---
 router.post('/', authenticateToken, async (req, res) => {
@@ -24,27 +23,41 @@ router.post('/', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'Invalid ETH address' });
     }
 
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      return res.status(400).json({ message: 'Invalid amount. Must be a positive number.' });
+    }
+
+    if (typeof token !== 'string') {
+      return res.status(400).json({ message: 'Invalid token symbol.' });
+    }
+    const tokenSymbol = token.toLowerCase();
+    const tokenInfo = tokenMap[tokenSymbol];
+    if (!tokenInfo) {
+      return res.status(400).json({ message: 'Unsupported token symbol.' });
+    }
+
     const userWalletResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
     if (userWalletResult.rows.length === 0) {
       return res.status(404).json({ message: 'User wallet not found.' });
     }
     const userEthAddress = userWalletResult.rows[0].eth_address;
 
-    const onChainBalance_BN = await usdcContract.balanceOf(userEthAddress);
-    // ✅ THE FIX: Use the correct ethers v5 syntax for parsing units
-    const withdrawalAmount_BN = ethers.utils.parseUnits(amount.toString(), tokenMap.usdc.decimals);
+   const tokenContract = new ethers.Contract(tokenInfo.address, erc20Abi, provider);
+    const onChainBalance_BN = await tokenContract.balanceOf(userEthAddress);
+    const withdrawalAmount_BN = ethers.utils.parseUnits(numericAmount.toString(), tokenInfo.decimals);
 
     if (withdrawalAmount_BN.gt(onChainBalance_BN)) {
-      return res.status(400).json({ message: 'Insufficient on-chain USDC balance.' });
+     return res.status(400).json({ message: `Insufficient on-chain ${tokenInfo.symbol} balance.` });
     }
 
     await pool.query(
       `INSERT INTO withdrawal_queue (user_id, to_address, amount, "token")
        VALUES ($1, $2, $3, $4)`,
-      [userId, toAddress, amount, token.toUpperCase()]
+      [userId, toAddress, numericAmount, tokenInfo.symbol]
     );
 
-    console.log(`📥 Queued platform withdrawal for user ${userId} to ${toAddress} for ${amount} ${token}`);
+    console.log(`📥 Queued platform withdrawal for user ${userId} to ${toAddress} for ${numericAmount} ${tokenInfo.symbol}`);
 
     return res.status(200).json({
       status: 'queued',

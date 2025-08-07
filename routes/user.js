@@ -28,13 +28,20 @@ async function getApePrice() {
   
   try {
     console.log('Fetching fresh APE price from CoinGecko...');
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd');
+    const response = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price?ids=apecoin&vs_currencies=usd',
+      { timeout: 5000 }
+    );
     const price = response.data.apecoin.usd;
     priceCache.apePrice = price;
     priceCache.lastFetched = now;
     return price;
   } catch (error) {
-    console.error('CoinGecko API call failed:', error.message);
+     if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+      console.error('CoinGecko API call timed out:', error.message);
+    } else {
+      console.error('CoinGecko API call failed:', error.message);
+    }
     if (priceCache.apePrice) {
       console.warn('Serving STALE APE price from cache due to API failure.');
       return priceCache.apePrice;
