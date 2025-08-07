@@ -1,8 +1,8 @@
 // server/index.js
-
+const dotenv = require('dotenv');
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
+
 const helmet = require('helmet');
 const session = require('express-session');
 const passport = require('passport');
@@ -13,10 +13,20 @@ dotenv.config();
 
 // Fail fast if the session secret is missing or empty.
 // This ensures cookies are properly signed in all environments.
-if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.trim() === '') {
-  throw new Error('SESSION_SECRET environment variable is required');
+// --- Add the new JWT_SECRET check here ---
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === '') {
+  console.error('FATAL ERROR: JWT_SECRET environment variable is not defined.');
+  process.exit(1); // Exit the process with an error code
 }
-
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.trim() === '') {
+  console.error('FATAL ERROR: SESSION_SECRET environment variable is not defined.');
+  process.exit(1);
+}
+// You could also add one for ENCRYPTION_KEY here for consistency
+if (!process.env.ENCRYPTION_KEY || process.env.ENCRYPTION_KEY.length < 32) {
+  console.error('FATAL ERROR: ENCRYPTION_KEY environment variable is not defined or is too short.');
+  process.exit(1);
+}
 // Import routes and passport setup
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
