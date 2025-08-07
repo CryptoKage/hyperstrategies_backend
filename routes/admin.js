@@ -505,24 +505,40 @@ router.post('/buyback-points', async (req, res) => {
 router.get('/vaults/:vaultId/details', async (req, res) => {
   const { vaultId } = req.params;
   try {
-    const [vaultDetailsResult, participantsResult] = await Promise.all([
-      pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
-      pool.query( `SELECT p.position_id, u.user_id, u.username, p.tradable_capital, p.pnl, p.high_water_mark, p.auto_compound, p.status FROM user_vault_positions p JOIN users u ON p.user_id = u.user_id WHERE p.vault_id = $1 ORDER BY u.username ASC`, [vaultId] )
-    ]);
-
+    // 1. Get the vault's own details (name, etc.)
+    const vaultDetailsResult = await pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
     if (vaultDetailsResult.rows.length === 0) {
       return res.status(404).json({ message: 'Vault not found.' });
     }
-
     const vaultDetails = vaultDetailsResult.rows[0];
-    const participants = participantsResult.rows;
 
-    const totalCapital = participants.reduce((sum, p) => sum + parseFloat(p.tradable_capital), 0);
-    const totalPnl = participants.reduce((sum, p) => sum + parseFloat(p.pnl), 0);
-    
-    // --- NEW --- Calculate the current average PnL percentage
-    const currentPnlPercentage = (totalCapital > 0) ? (totalPnl / totalCapital) * 100 : 0;
-    
+    // 2. Get a list of all participants and their balances from the new ledger table
+    const participantsResult = await pool.query(
+      `SELECT
+         vle.user_id,
+         u.username,
+         COALESCE(SUM(vle.amount), 0) as capital,
+         COALESCE(SUM(CASE WHEN vle.entry_type = 'PNL_UPDATE' THEN vle.amount ELSE 0 END), 0) as pnl
+       FROM vault_ledger_entries vle
+       JOIN users u ON vle.user_id = u.user_id
+       WHERE vle.vault_id = $1
+       GROUP BY vle.user_id, u.username
+       HAVING SUM(vle.amount) > 0 -- Only show users with a current balance in the vault
+       ORDER BY u.username ASC`,
+      [vaultId]
+    );
+    const participants = participantsResult.rows.map(p => ({
+        ...p,
+        capital: parseFloat(p.capital),
+        pnl: parseFloat(p.pnl)
+    }));
+
+    // 3. Calculate the aggregate stats from the participant data
+    const totalCapital = participants.reduce((sum, p) => sum + p.capital, 0);
+    const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
+    const currentPnlPercentage = (totalCapital > 0) ? ((totalCapital - (totalCapital - totalPnl)) / (totalCapital - totalPnl)) * 100 : 0;
+
+
     res.json({
       vault: vaultDetails,
       participants: participants,
@@ -530,11 +546,11 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         participantCount: participants.length,
         totalCapital: totalCapital,
         totalPnl: totalPnl,
-        currentPnlPercentage: currentPnlPercentage // Add to response
+        currentPnlPercentage: currentPnlPercentage
       }
     });
   } catch (err) {
-    console.error(`Error fetching details for vault ${vaultId}:`, err);
+    console.error(`Error fetching ledger-based details for vault ${vaultId}:`, err);
     res.status(500).send('Server Error');
   }
 });
@@ -544,41 +560,71 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
 // @access  Admin
 router.post('/vaults/:vaultId/update-pnl', async (req, res) => {
   const { vaultId } = req.params;
-  const { pnlPercentage } = req.body;
+  const { newTotalValue } = req.body; // Expecting newTotalValue now
   const client = await pool.connect();
 
-  const pnlPercent = parseFloat(pnlPercentage);
-  if (isNaN(pnlPercent)) {
-    return res.status(400).json({ message: 'A valid number for PnL percentage is required.' });
-  }
-
   try {
-    await client.query('BEGIN');
-
-    // Get all active positions to update
-    const { rows: positions } = await client.query(
-      `SELECT position_id, tradable_capital FROM user_vault_positions WHERE vault_id = $1 AND status = 'in_trade'`,
-      [vaultId]
-    );
-
-    if (positions.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'No active positions found in this vault to update.' });
+    const newVaultValue = parseFloat(newTotalValue);
+    if (isNaN(newVaultValue) || newVaultValue < 0) {
+      return res.status(400).json({ message: 'A valid, non-negative number for the new total value is required.' });
     }
 
-    // Loop through each position and update its PnL
-    for (const position of positions) {
-      const capital = parseFloat(position.tradable_capital);
-      const newPnlValue = capital * (pnlPercent / 100.0);
+    await client.query('BEGIN');
 
+    // 1. Get the current total capital in the vault from the ledger
+    const currentCapitalResult = await client.query(
+      "SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1",
+      [vaultId]
+    );
+    const currentTotalCapital = parseFloat(currentCapitalResult.rows[0].total);
+
+    if (currentTotalCapital <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Cannot update PnL for a vault with zero or negative capital.' });
+    }
+
+    // 2. Calculate the total gain or loss
+    const totalGainOrLoss = newVaultValue - currentTotalCapital;
+
+    // 3. Get all users and their respective capital in this vault
+    const participantsResult = await client.query(
+      `SELECT user_id, COALESCE(SUM(amount), 0) as user_capital
+       FROM vault_ledger_entries
+       WHERE vault_id = $1
+       GROUP BY user_id
+       HAVING SUM(amount) > 0`, // Only get users with a positive balance
+      [vaultId]
+    );
+    const participants = participantsResult.rows;
+
+    if (participants.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'No active participants found in this vault.' });
+    }
+    
+    // 4. Loop through each participant, calculate their share, and log it
+    for (const participant of participants) {
+      const userCapital = parseFloat(participant.user_capital);
+      const userShareOfCapital = userCapital / currentTotalCapital;
+      const userPnl = totalGainOrLoss * userShareOfCapital;
+
+      // Insert a PNL entry into the ledger. This can be positive or negative.
       await client.query(
-        'UPDATE user_vault_positions SET pnl = $1 WHERE position_id = $2',
-        [newPnlValue, position.position_id]
+        `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_UPDATE', $3)`,
+        [participant.user_id, vaultId, userPnl]
+      );
+      
+      // Optionally, log this to the main activity log as well for user visibility
+      const description = `Unrealized PnL of ${userPnl.toFixed(2)} USDC updated for Vault ${vaultId}.`;
+      await client.query(
+        `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
+         VALUES ($1, 'VAULT_PNL_UPDATE', $2, $3, 'USDC', 'COMPLETED')`,
+        [participant.user_id, description, userPnl]
       );
     }
     
     await client.query('COMMIT');
-    res.status(200).json({ message: `Successfully updated PnL for ${positions.length} positions in vault ${vaultId} to ${pnlPercent}%.` });
+    res.status(200).json({ message: `Successfully updated PnL for ${participants.length} participants. Total PnL distributed: $${totalGainOrLoss.toFixed(2)}.` });
 
   } catch (err) {
     await client.query('ROLLBACK');
