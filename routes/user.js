@@ -56,30 +56,43 @@ async function getApePrice() {
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const userResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User wallet not found.' });
-    }
-    const userAddress = userResult.rows[0].eth_address;
 
-    // Fetch all data in parallel. getApePrice() will handle its own errors gracefully.
-    const [usdcBalanceBigNumber, apeBalanceBigNumber, bonusPointsResult, apePriceUsd] = await Promise.all([
-      usdcContract.balanceOf(userAddress),
-      apeContract.balanceOf(userAddress),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
-      getApePrice()
+    // We now fetch all PLATFORM data in parallel, just like the dashboard
+    const [
+      userResult,
+      portfolioSumsResult,
+      bonusPointsResult
+    ] = await Promise.all([
+      // Get the user's available balance and deposit address
+      pool.query('SELECT balance, eth_address FROM users WHERE user_id = $1', [userId]),
+      // Get the sums of capital and PnL from their vault positions
+      pool.query(
+        `SELECT 
+           COALESCE(SUM(tradable_capital), 0) as total_capital, 
+           COALESCE(SUM(pnl), 0) as total_pnl 
+         FROM user_vault_positions 
+         WHERE user_id = $1 AND status IN ('in_trade', 'active')`,
+        [userId]
+      ),
+      // Get their total bonus points
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
     ]);
-    
-    const usdcBalance = ethers.utils.formatUnits(usdcBalanceBigNumber, tokenMap.usdc.decimals);
-    const apeBalance = ethers.utils.formatUnits(apeBalanceBigNumber, tokenMap.ape.decimals);
-    const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
 
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const userData = userResult.rows[0];
+    const portfolioData = portfolioSumsResult.rows[0];
+    const bonusPointsData = bonusPointsResult.rows[0];
+
+    // Construct the JSON response with all the data the frontend needs
     res.json({
-      address: userAddress,
-      usdcBalance: parseFloat(usdcBalance),
-      apeBalance: parseFloat(apeBalance),
-      apePrice: apePriceUsd,
-      totalBonusPoints: totalBonusPoints
+      address: userData.eth_address,
+      availableBalance: parseFloat(userData.balance),
+      totalCapitalInVaults: parseFloat(portfolioData.total_capital),
+      totalUnrealizedPnl: parseFloat(portfolioData.total_pnl),
+      totalBonusPoints: parseFloat(bonusPointsData.total_bonus_points)
     });
 
   } catch (err) {
