@@ -3,12 +3,19 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const helmet = require('helmet');
 const session = require('express-session');
 const passport = require('passport');
 const ethers = require('ethers'); // Use the main ethers import
 
 // Load env vars
 dotenv.config();
+
+// Fail fast if the session secret is missing or empty.
+// This ensures cookies are properly signed in all environments.
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.trim() === '') {
+  throw new Error('SESSION_SECRET environment variable is required');
+}
 
 // Import routes and passport setup
 const authRoutes = require('./routes/auth');
@@ -18,19 +25,30 @@ const vaultsRoutes = require('./routes/vaults');
 const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
 require('./passport-setup');
+const { corsOptions } = require('./config/cors');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors());
+app.use(helmet());
+app.use(cors(corsOptions));
 app.use(express.json());
 
+
+// Configure session cookies with environment-aware security settings.
+// In production we enforce HTTPS and use a stricter sameSite policy.
+// During development we relax these settings to ease local testing.
+const isProduction = process.env.NODE_ENV === 'production';
 app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: true,
-  cookie: { secure: false }
+  cookie: {
+    secure: isProduction, // Only send cookies over HTTPS in production
+    httpOnly: true, // Prevent client-side JS from accessing the cookie
+    sameSite: isProduction ? 'strict' : 'lax' // Stricter CSRF protection in production
+  }
 }));
 
 app.use(passport.initialize());
