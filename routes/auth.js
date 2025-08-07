@@ -1,5 +1,3 @@
-// server/routes/auth.js
-
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
@@ -94,10 +92,10 @@ router.post(
         
       const newUserParams = [email, passwordHash, username, null, 0.00, wallet.address, encryptedKey, referrerId, xpToAward, null, 'dark', newReferralCode, false, 1, initialTags];
       
-      const newUser = await client.query(newUserQuery, newUserParams);
+      const newUserResult = await client.query(newUserQuery, newUserParams);
 
       await client.query('COMMIT');
-      res.status(201).json({ message: 'User created successfully', user: newUser.rows[0] });
+      res.status(201).json({ message: 'User created successfully', user: newUserResult.rows[0] });
 
     } catch (error) {
       if (client) await client.query('ROLLBACK');
@@ -148,20 +146,16 @@ router.post(
   }
 );
 
-// --- Google OAuth2 ---
 router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
-
 
 router.get('/google/callback',
   passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login' }),
   async (req, res) => {
     try {
-      // Ensure Google users have a referral code
       if (!req.user.referral_code) {
         const newCode = generateReferralCode();
         await pool.query('UPDATE users SET referral_code = $1 WHERE user_id = $2', [newCode, req.user.user_id]);
       }
-
       const payload = { user: { id: req.user.user_id, username: req.user.username, isAdmin: req.user.is_admin } };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
@@ -173,10 +167,9 @@ router.get('/google/callback',
   }
 );
 
-// --- /me Route ---
 router.get('/me', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT username, eth_address FROM users WHERE user_id = $1', [req.user.id]);
+    const result = await pool.query('SELECT user_id, username, eth_address FROM users WHERE user_id = $1', [req.user.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     res.json(result.rows[0]);
   } catch (err) {
