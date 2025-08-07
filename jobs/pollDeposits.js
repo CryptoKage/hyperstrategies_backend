@@ -26,29 +26,26 @@ async function pollDeposits() {
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
     
-    // --- FIX 1: Handle case where system_state is not initialized ---
     if (!lastCheckedBlockResult.rows[0]) {
         throw new Error("FATAL: 'lastCheckedBlock' key not found in system_state table. Please initialize it.");
     }
     const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
     const latestBlock = await alchemy.core.getBlockNumber();
 
-    const lookbackBlocks = 20; // A safe buffer for API data lag and re-orgs
-    const potentialFromBlock = lastProcessedBlock - lookbackBlocks;
-    
-    // --- FIX 2: Clamp fromBlock to prevent negative values ---
-    const fromBlock = Math.max(0, potentialFromBlock);
-    const toBlock = latestBlock;
+    // --- FIX 1: Add a finality buffer to prevent scanning unconfirmed blocks ---
+    const finalityBuffer = 5; // A safe number of blocks to wait for finality
+    const toBlock = latestBlock - finalityBuffer;
 
+    const lookbackBlocks = 20;
+    const fromBlock = Math.max(0, lastProcessedBlock - lookbackBlocks);
+    
     console.log(`Scanning from block #${fromBlock} to #${toBlock}`);
     if (fromBlock >= toBlock) {
-      // --- FIX 3: Removed redundant client.release() call ---
       return;
     }
 
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     if (users.length === 0) {
-      // --- FIX 3: Removed redundant client.release() call ---
       return;
     }
     
@@ -74,15 +71,26 @@ async function pollDeposits() {
         const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
 
         if (existingDeposit.rows.length === 0) {
-          const rawAmount = event.value; // This is a BigNumber object from Alchemy
-
-          // --- FIX 4: Use ethers.utils.formatUnits for safe BigNumber conversion ---
-          const depositAmount_string = ethers.utils.formatUnits(rawAmount, tokenMap.usdc.decimals);
-          
-          console.log(`✅ New USDC deposit detected for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
-          
-          await client.query('BEGIN');
+          // --- FIX 2: Sanitize the rawAmount to prevent underflow errors ---
           try {
+            const rawAmountFromAlchemy = event.value;
+            
+            // This is the SAFE two-step process.
+            // 1. Use parseUnits to safely convert any numeric string (even decimals) into a BigNumber integer.
+            const amountAsBigNumber = ethers.utils.parseUnits(
+              rawAmountFromAlchemy.toString(), 
+              tokenMap.usdc.decimals
+            );
+            
+            // 2. Now that we have a safe BigNumber, format it back to a decimal string for the database.
+            const depositAmount_string = ethers.utils.formatUnits(
+              amountAsBigNumber, 
+              tokenMap.usdc.decimals
+            );
+
+            console.log(`✅ New USDC deposit detected for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
+            
+            await client.query('BEGIN');
             await client.query(
               `INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`,
               [userId, depositAmount_string, txHash]
@@ -93,21 +101,24 @@ async function pollDeposits() {
             );
             await client.query('COMMIT');
             console.log(`✅ Successfully processed deposit for tx ${txHash}`);
-          } catch (dbError) {
+
+          } catch (processingError) {
             await client.query('ROLLBACK');
-            console.error(`Database error for tx ${txHash}:`, dbError);
+            // If this specific transaction fails to parse, log it and continue with the loop.
+            console.error(`-- SKIPPING TX ${txHash} due to processing error:`, processingError.message);
+            continue;
           }
         }
       }
     }
 
+    // --- FIX 3: Update the last checked block to the end of our scanned range (toBlock) ---
     await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
     console.log(`✅ Finished scan. Next scan will start from block #${toBlock}`);
 
   } catch (error) {
     console.error('❌ Major error in pollDeposits job:', error);
   } finally {
-    // This is the single, correct place to release the client.
     if (client) client.release();
   }
 }
