@@ -5,9 +5,11 @@
  * Update the `allowedOrigins` array whenever the list of trusted
  * front-end domains changes.
  */
-const allowedOrigins = [
+
+ const allowedOrigins = [
   'http://localhost:3000',
-  'https://hyperstrategies.io'
+  'https://www.hyper-strategies.com', // <-- The correct domain from the error
+  'https://hyper-strategies.com'    // <-- Good practice to include the naked domain too
 ];
 
 const corsOptions = {
