@@ -9,20 +9,47 @@ const pool = require('../db');
 const passport = require('passport');
 const { generateWallet, encrypt } = require('../utils/walletUtils');
 const authenticateToken = require('../middleware/authenticateToken');
+const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
-// --- Registration Endpoint (DEFINITIVE V3 - Matches DDL) ---
-router.post('/register', async (req, res) => {
-  const { email, password, username, referralCode } = req.body;
-  
-  if (!email || !password || !username) {
-    return res.status(400).json({ error: 'Username, email, and password are required.' });
-  }
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests, please try again later.',
+});
 
-  const client = await pool.connect();
+// --- Registration Endpoint (DEFINITIVE V3 - Matches DDL) ---
+router.post(
+  '/register',
+  authLimiter,
+  [
+    body('email').isEmail().normalizeEmail(),
+    body('username').trim().escape().notEmpty(),
+    body('password')
+      .isStrongPassword({
+        minLength: 8,
+        minLowercase: 1,
+        minUppercase: 1,
+        minNumbers: 1,
+        minSymbols: 1,
+      })
+      .withMessage(
+        'Password must be at least 8 characters long and include uppercase, lowercase, number, and symbol'
+      ),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email, password, username, referralCode } = req.body;
+
+    const client = await pool.connect();
   try {
     const emailCheck = await client.query('SELECT user_id FROM users WHERE email = $1', [email]);
     if (emailCheck.rows.length > 0) {
@@ -111,47 +138,56 @@ if (lowerCaseRefCode === 'hs-hip-hop') {
   } finally {
     client.release();
   }
-});
+  }
+);
 
 // --- Standard Login ---
-router.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    console.log(`[Login Attempt] for email: ${email}`);
+router.post(
+  '/login',
+  authLimiter,
+  [body('email').isEmail().normalizeEmail(), body('password').notEmpty()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(401).json({ error: 'Invalid credentials.' });
+    }
 
-    if (!email || !password) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-    
-    const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin FROM users WHERE email = $1', [email]);
-    
-    if (result.rows.length === 0) {
-      console.log(`[Login Failed] No user found for email: ${email}`);
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-    
-    const user = result.rows[0];
-    
-    console.log(`[Login Attempt] User found. Comparing password for user ID: ${user.user_id}`);
-    const isMatch = await bcrypt.compare(password, user.password_hash);
-    console.log(`[Login Attempt] Password match result: ${isMatch}`);
-    
-    if (!isMatch) {
-      console.log(`[Login Failed] Password mismatch for user ID: ${user.user_id}`);
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-    
-    const payload = { user: { id: user.user_id, username: user.username, isAdmin: user.is_admin } };
-    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
-    
-    console.log(`[Login Success] JWT generated for user ID: ${user.user_id}`);
-    res.json({ token });
+    try {
+      const { email, password } = req.body;
+      console.log(`[Login Attempt] for email: ${email}`);
 
-  } catch (error) {
-    console.error('[Login Error]', error);
-    res.status(500).json({ error: 'Server error during login.' });
+      const result = await pool.query(
+        'SELECT user_id, username, email, password_hash, is_admin FROM users WHERE email = $1',
+        [email]
+      );
+
+      if (result.rows.length === 0) {
+        console.log(`[Login Failed] No user found for email: ${email}`);
+        return res.status(401).json({ error: 'Invalid credentials.' });
+      }
+
+      const user = result.rows[0];
+
+      console.log(`[Login Attempt] User found. Comparing password for user ID: ${user.user_id}`);
+      const isMatch = await bcrypt.compare(password, user.password_hash);
+      console.log(`[Login Attempt] Password match result: ${isMatch}`);
+
+      if (!isMatch) {
+        console.log(`[Login Failed] Password mismatch for user ID: ${user.user_id}`);
+        return res.status(401).json({ error: 'Invalid credentials.' });
+      }
+
+      const payload = { user: { id: user.user_id, username: user.username, isAdmin: user.is_admin } };
+      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+
+      console.log(`[Login Success] JWT generated for user ID: ${user.user_id}`);
+      res.json({ token });
+    } catch (error) {
+      console.error('[Login Error]', error);
+      res.status(500).json({ error: 'Server error during login.' });
+    }
   }
-});
+);
 
 // --- Google OAuth2 ---
 router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
