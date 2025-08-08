@@ -56,37 +56,19 @@ async function getApePrice() {
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-
-    // We now fetch all PLATFORM data in parallel, just like the dashboard
-    const [
-      userResult,
-      portfolioSumsResult,
-      bonusPointsResult
-    ] = await Promise.all([
-      // Get the user's available balance and deposit address
+    const [userResult, portfolioSumsResult, bonusPointsResult] = await Promise.all([
       pool.query('SELECT balance, eth_address FROM users WHERE user_id = $1', [userId]),
-      // Get the sums of capital and PnL from their vault positions
       pool.query(
         `SELECT 
-           COALESCE(SUM(tradable_capital), 0) as total_capital, 
-           COALESCE(SUM(pnl), 0) as total_pnl 
-         FROM user_vault_positions 
-         WHERE user_id = $1 AND status IN ('in_trade', 'active')`,
-        [userId]
-      ),
-      // Get their total bonus points
+           COALESCE(SUM(amount), 0) as total_capital,
+           COALESCE(SUM(CASE WHEN entry_type IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN amount ELSE 0 END), 0) as total_pnl
+         FROM vault_ledger_entries WHERE user_id = $1`, [userId]),
       pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
     ]);
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found.' });
-    }
-
+    if (userResult.rows.length === 0) { return res.status(404).json({ error: 'User not found.' }); }
     const userData = userResult.rows[0];
     const portfolioData = portfolioSumsResult.rows[0];
     const bonusPointsData = bonusPointsResult.rows[0];
-
-    // Construct the JSON response with all the data the frontend needs
     res.json({
       address: userData.eth_address,
       availableBalance: parseFloat(userData.balance),
@@ -94,9 +76,52 @@ router.get('/wallet', authenticateToken, async (req, res) => {
       totalUnrealizedPnl: parseFloat(portfolioData.total_pnl),
       totalBonusPoints: parseFloat(bonusPointsData.total_bonus_points)
     });
-
   } catch (err) {
-    console.error('Error in /wallet endpoint:', err.message);
+    console.error('Error in /wallet endpoint:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
+// --- UPDATED /profile Endpoint (Ledger-Based) ---
+router.get('/profile', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const [profileResult, stakedResult] = await Promise.all([
+      pool.query(`SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, u.tags, COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+        FROM users u LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
+        WHERE u.user_id = $1 GROUP BY u.user_id;`, [userId]),
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId])
+    ]);
+    if (profileResult.rows.length === 0) { return res.status(404).json({ error: 'User not found.' }); }
+    const profileData = profileResult.rows[0];
+    const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
+    res.json({ ...profileData, total_staked_capital: totalStakedCapital });
+  } catch (err) {
+    console.error('Error fetching profile data:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
+// --- NEW Endpoint for the Activity Hub ---
+router.get('/activity-log', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = 20;
+    const offset = (page - 1) * limit;
+
+    const activityQuery = `
+      SELECT activity_id, activity_type, description, amount_primary, symbol_primary, status, created_at
+      FROM user_activity_log
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      LIMIT $2 OFFSET $3;
+    `;
+    const { rows } = await pool.query(activityQuery, [userId, limit, offset]);
+    
+    res.json(rows);
+  } catch (err) {
+    console.error(`Error fetching activity log for user ${req.user.id}:`, err);
     res.status(500).send('Server Error');
   }
 });
