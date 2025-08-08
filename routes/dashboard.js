@@ -9,29 +9,29 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // --- We run all queries in parallel for maximum efficiency ---
+    // --- We now fetch all ledger-based data in parallel ---
     const [
       userResult, 
       vaultsResult, 
-      positionsResult, 
-      bonusPointsResult,
-      // --- NEW EFFICIENT QUERY ---
-      // This single query gets the two sums we need, replacing the old 'reduce' logic.
-      portfolioSumsResult 
+      userPositionsResult,
+      bonusPointsResult
     ] = await Promise.all([
       pool.query('SELECT username, balance, eth_address, account_tier FROM users WHERE user_id = $1', [userId]),
       pool.query("SELECT * FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
-      pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1', [userId]),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
-      // --- NEW QUERY DEFINITION ---
-      pool.query(
-        `SELECT 
-           COALESCE(SUM(tradable_capital), 0) as total_capital, 
-           COALESCE(SUM(pnl), 0) as total_pnl 
-         FROM user_vault_positions 
-         WHERE user_id = $1 AND status IN ('in_trade', 'active')`,
-        [userId]
-      )
+      // --- NEW LEDGER-BASED QUERY for user positions ---
+      pool.query(`
+        SELECT
+          vle.vault_id,
+          COALESCE(SUM(vle.amount), 0) as tradable_capital,
+          COALESCE(SUM(CASE WHEN vle.entry_type IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as pnl,
+          uvs.auto_compound
+        FROM vault_ledger_entries vle
+        LEFT JOIN user_vault_settings uvs ON vle.user_id = uvs.user_id AND vle.vault_id = uvs.vault_id
+        WHERE vle.user_id = $1
+        GROUP BY vle.vault_id, uvs.auto_compound
+        HAVING SUM(vle.amount) > 0.000001 -- Only return vaults where the user has a positive balance
+      `, [userId]),
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
     ]);
 
     if (userResult.rows.length === 0) {
@@ -40,14 +40,17 @@ router.get('/', authenticateToken, async (req, res) => {
 
     const userData = userResult.rows[0];
     const availableVaults = vaultsResult.rows;
-    const userPositions = positionsResult.rows;
+    const userPositions = userPositionsResult.rows.map(p => ({
+      ...p,
+      tradable_capital: parseFloat(p.tradable_capital),
+      pnl: parseFloat(p.pnl)
+    }));
     const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
 
-    // --- Extracting the new values from our new query ---
-    const totalCapitalInVaults = parseFloat(portfolioSumsResult.rows[0].total_capital);
-    const totalUnrealizedPnl = parseFloat(portfolioSumsResult.rows[0].total_pnl);
+    // Calculate aggregate stats from the user's positions
+    const totalCapitalInVaults = userPositions.reduce((sum, pos) => sum + pos.tradable_capital, 0);
+    const totalUnrealizedPnl = userPositions.reduce((sum, pos) => sum + pos.pnl, 0);
     
-    // --- Constructing the final JSON payload ---
     const dashboardData = {
       username: userData.username,
       depositAddress: userData.eth_address,
@@ -55,8 +58,7 @@ router.get('/', authenticateToken, async (req, res) => {
       totalBonusPoints: totalBonusPoints,
       accountTier: userData.account_tier,
       vaults: availableVaults,
-      userPositions: userPositions,
-      // --- ADDING THE NEW FIELDS FOR THE FRONTEND ---
+      userPositions: userPositions, // This now includes the auto_compound flag
       totalCapitalInVaults: totalCapitalInVaults,
       totalUnrealizedPnl: totalUnrealizedPnl
     };

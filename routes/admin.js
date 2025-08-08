@@ -6,35 +6,34 @@ const pool = require('../db');
 const { ethers } = require('ethers');
 const authenticateToken = require('../middleware/authenticateToken');
 const isAdmin = require('../middleware/isAdmin');
-const { processAllocations } = require('../jobs/processAllocations');
+// Note: We no longer need processAllocations here
 
 router.use(authenticateToken, isAdmin);
 
-// --- Get Full Admin Dashboard Stats Endpoint ---
+// --- Get Full Admin Dashboard Stats Endpoint (Ledger-Based) ---
 router.get('/dashboard-stats', async (req, res) => {
   try {
     const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-    const [ userCount, totalAvailable, totalInVaults, hotWalletBalance_BN, recentDeposits, recentWithdrawals, failedSweeps, pendingVaultWithdrawals ] = await Promise.all([
+    const [ userCount, totalAvailable, totalInVaultsResult, hotWalletBalance_BN, recentDeposits, recentWithdrawals, pendingVaultWithdrawals ] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM users;'),
-      pool.query('SELECT SUM(balance) as total FROM users;'),
-      pool.query('SELECT SUM(tradable_capital) as total FROM user_vault_positions;'),
+      pool.query('SELECT COALESCE(SUM(balance), 0) as total FROM users;'),
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries"),
       provider.getBalance(process.env.HOT_WALLET_ADDRESS),
       pool.query(`SELECT d.amount, u.username, d.detected_at FROM deposits d JOIN users u ON d.user_id = u.user_id ORDER BY d.detected_at DESC LIMIT 5;`),
       pool.query(`SELECT w.amount, u.username, w.created_at FROM withdrawal_queue w JOIN users u ON w.user_id = u.user_id ORDER BY w.created_at DESC LIMIT 5;`),
-      pool.query(`SELECT p.position_id, u.username, p.tradable_capital FROM user_vault_positions p JOIN users u ON p.user_id = u.user_id WHERE p.status = 'sweep_failed';`),
       pool.query(`SELECT log.activity_id, log.amount_primary, log.description, u.username, log.created_at FROM user_activity_log log JOIN users u ON log.user_id = u.user_id WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING' ORDER BY log.created_at ASC;`)
     ]);
 
     res.json({
       userCount: parseInt(userCount.rows[0].count),
       totalAvailable: parseFloat(totalAvailable.rows[0].total || 0),
-      totalInVaults: parseFloat(totalInVaults.rows[0].total || 0),
+      totalInVaults: parseFloat(totalInVaultsResult.rows[0].total || 0),
       hotWalletBalance: ethers.utils.formatEther(hotWalletBalance_BN),
       databaseConnected: true,
       alchemyConnected: true,
       recentDeposits: recentDeposits.rows,
       recentWithdrawals: recentWithdrawals.rows,
-      failedSweeps: failedSweeps.rows,
+      failedSweeps: [], // Deprecated
       pendingVaultWithdrawals: pendingVaultWithdrawals.rows
     });
   } catch (err) {
@@ -43,234 +42,132 @@ router.get('/dashboard-stats', async (req, res) => {
   }
 });
 
-// --- Endpoint to manually trigger the allocation sweep job ---
-router.post('/trigger-sweep', (req, res) => {
-  console.log(`[Admin] Manual sweep triggered by admin user: ${req.user.id}`);
-  processAllocations();
-  res.status(202).json({ message: 'Allocation sweep job has been successfully triggered. Check server logs for progress.' });
-});
+// --- NEW Endpoint for DISPLAY-ONLY PnL Updates ---
+router.post('/vaults/:vaultId/update-display-pnl', async (req, res) => {
+  const { vaultId } = req.params;
+  const { pnlPercentage } = req.body;
+  const pnlPercent = parseFloat(pnlPercentage);
 
-// --- Endpoint to retry all failed vault sweeps ---
-router.post('/retry-sweeps', async (req, res) => {
+  if (isNaN(pnlPercent)) {
+    return res.status(400).json({ message: 'A valid number for PnL percentage is required.' });
+  }
   try {
-    console.log(`[Admin] Retry for all failed sweeps triggered by ${req.user.id}`);
-    const { rowCount } = await pool.query("UPDATE user_vault_positions SET status = 'active' WHERE status = 'sweep_failed'");
-    res.status(200).json({ message: `Successfully re-queued ${rowCount} failed allocation(s).` });
+    const { rowCount } = await pool.query('UPDATE vaults SET display_pnl_percentage = $1 WHERE vault_id = $2', [pnlPercent, vaultId]);
+    if (rowCount === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
+    res.status(200).json({ message: `Successfully updated display PnL for vault ${vaultId} to ${pnlPercent}%.` });
   } catch (err) {
-    console.error('Error retrying sweeps:', err.message);
+    console.error(`Error updating display PnL for vault ${vaultId}:`, err);
     res.status(500).send('Server Error');
   }
 });
 
-// --- Endpoint to ignore/archive a single failed sweep ---
-router.post('/archive-sweep/:position_id', async (req, res) => {
-  try {
-    const { position_id } = req.params;
-    console.log(`[Admin] Archiving failed sweep for position ${position_id} by ${req.user.id}`);
-    const { rowCount } = await pool.query( "UPDATE user_vault_positions SET status = 'archived' WHERE position_id = $1 AND status = 'sweep_failed'", [position_id] );
-    if (rowCount === 0) {
-      return res.status(404).json({ error: 'Failed sweep for the given position not found.' });
-    }
-    res.status(200).json({ message: `Position ${position_id} has been successfully archived.` });
-  } catch (err) {
-    console.error('Error archiving sweep:', err.message);
-    res.status(500).send('Server Error');
-  }
-});
-
-// --- Endpoint for Profit Distribution (with Revenue Logging) ---
-router.post('/distribute-profit', async (req, res) => {
-  const { vault_id, total_profit_amount } = req.body;
-  const adminUserId = req.user.id;
+// --- Endpoint for Finalizing a Period and Distributing Real PnL ---
+router.post('/vaults/:vaultId/finalize-pnl', async (req, res) => {
+  const { vaultId } = req.params;
+  const { newTotalValue } = req.body;
   const client = await pool.connect();
-
-  if (!vault_id || !total_profit_amount || isNaN(parseFloat(total_profit_amount))) {
-    return res.status(400).json({ message: 'Vault ID and a valid total profit amount are required.' });
-  }
-  
-  const totalProfit_BN = ethers.utils.parseUnits(total_profit_amount.toString(), 6);
-  
-  console.log(`[Admin] Profit distribution initiated by ${adminUserId} for vault ${vault_id} with total profit of ${total_profit_amount}.`);
-
   try {
+    const newVaultValue = parseFloat(newTotalValue);
+    if (isNaN(newVaultValue) || newVaultValue < 0) {
+      return res.status(400).json({ message: 'A valid, non-negative number is required.' });
+    }
     await client.query('BEGIN');
-
-    const vaultResult = await client.query('SELECT performance_fee_percentage FROM vaults WHERE vault_id = $1', [vault_id]);
-    if (vaultResult.rows.length === 0) throw new Error(`Vault ${vault_id} not found.`);
-    const basePerfFee = parseFloat(vaultResult.rows[0].performance_fee_percentage);
-
-    const { rows: participants } = await client.query(
-      `SELECT p.position_id, p.user_id, p.tradable_capital, p.high_water_mark, p.auto_compound, u.account_tier 
-       FROM user_vault_positions p
-       JOIN users u ON p.user_id = u.user_id
-       WHERE p.vault_id = $1 AND p.status = 'in_trade'`,
-      [vault_id]
-    );
-
-    if (participants.length === 0) { /* ... (error handling) */ }
-
-    const totalCapitalInVault_BN = participants.reduce(
-      (sum, p) => sum.add(ethers.utils.parseUnits(p.tradable_capital.toString(), 6)), 
-      ethers.BigNumber.from(0)
-    );
-
-    if (totalCapitalInVault_BN.isZero()) { /* ... (error handling) */ }
-    
-    let totalPerformanceFee = 0;
-
+    const currentCapitalResult = await client.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1", [vaultId]);
+    const currentTotalCapital = parseFloat(currentCapitalResult.rows[0].total);
+    if (currentTotalCapital <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Vault has no capital to distribute PnL for.' });
+    }
+    const totalGainOrLoss = newVaultValue - currentTotalCapital;
+    if (Math.abs(totalGainOrLoss) < 0.000001) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'New value is the same as the current value. No PnL to distribute.' });
+    }
+    const participantsResult = await client.query(`SELECT user_id, COALESCE(SUM(amount), 0) as user_capital FROM vault_ledger_entries WHERE vault_id = $1 GROUP BY user_id HAVING SUM(amount) > 0`, [vaultId]);
+    const participants = participantsResult.rows;
     for (const participant of participants) {
-      const participantCapital_BN = ethers.utils.parseUnits(participant.tradable_capital.toString(), 6);
-      
-      // Calculate user's gross profit share using high-precision math
-      const grossProfitShare_BN = totalProfit_BN.mul(participantCapital_BN).div(totalCapitalInVault_BN);
-
-      const currentHWM_BN = ethers.utils.parseUnits(participant.high_water_mark.toString(), 6);
-      const newEquity_BN = participantCapital_BN.add(grossProfitShare_BN);
-
-      let feeAmount_BN = ethers.BigNumber.from(0);
-      let netProfitForUser_BN = grossProfitShare_BN;
-      let newHighWaterMark_BN = currentHWM_BN;
-
-      // --- HIGH-WATER MARK LOGIC ---
-      if (newEquity_BN.gt(currentHWM_BN)) {
-        // Profit was made above the previous high point
-        const billableProfit_BN = newEquity_BN.sub(currentHWM_BN);
-        
-        let finalPerfFee = basePerfFee;
-        if (parseInt(vault_id, 10) === 2 && participant.account_tier >= 4) {
-          finalPerfFee = 0.30;
-        }
-        
-        // Calculate fee only on the billable profit
-        const feeMultiplier = Math.round(finalPerfFee * 100);
-        feeAmount_BN = billableProfit_BN.mul(feeMultiplier).div(100);
-        netProfitForUser_BN = grossProfitShare_BN.sub(feeAmount_BN);
-        
-        // The new high-water mark is the new equity
-        newHighWaterMark_BN = newEquity_BN;
-
-        if (feeAmount_BN.gt(0)) {
-          totalPerformanceFee += parseFloat(ethers.utils.formatUnits(feeAmount_BN, 6));
-        }
-      }
-      
-      if (netProfitForUser_BN.isNegative()) { // Should not happen with HWM, but as a safeguard
-          netProfitForUser_BN = ethers.BigNumber.from(0);
-      }
-      
-      // Update user balances/positions and log activity
-      if (participant.auto_compound) {
-        const newCapital_BN = participantCapital_BN.add(netProfitForUser_BN);
-        await client.query(
-          'UPDATE user_vault_positions SET tradable_capital = $1, high_water_mark = $2 WHERE position_id = $3',
-          [ethers.utils.formatUnits(newCapital_BN, 6), ethers.utils.formatUnits(newHighWaterMark_BN, 6), participant.position_id]
-        );
-        // ... (logging)
-      } else {
-        await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [ethers.utils.formatUnits(netProfitForUser_BN, 6), participant.user_id]);
-        await client.query('UPDATE user_vault_positions SET high_water_mark = $1 WHERE position_id = $2', [ethers.utils.formatUnits(newHighWaterMark_BN, 6), participant.position_id]);
-        // ... (logging)
-      }
+      const userCapital = parseFloat(participant.user_capital);
+      const userShare = userCapital / currentTotalCapital;
+      const userPnl = totalGainOrLoss * userShare;
+      await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3)`, [participant.user_id, vaultId, userPnl]);
+      const description = `Realized PnL of ${userPnl.toFixed(2)} USDC distributed for Vault ${vaultId}.`;
+      await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_PNL_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`, [participant.user_id, description, userPnl]);
     }
-    
-    // --- Log total performance fee revenue ---
-    if (totalPerformanceFee > 0) {
-      // ... (revenue logging logic)
-    }
-    
-       if (totalPerformanceFee > 0) {
-      const splits = {
-        'TREASURY_FOUNDATION': 0.60,
-        'OPERATIONS_DEVELOPMENT': 0.25,
-        'TRADING_TEAM_BONUS': 0.10,
-        'COMMUNITY_GROWTH_INCENTIVES': 0.05
-      };
-
-      const revenueNote = `Performance fee from ${participants.length} users in vault ${vault_id}.`;
-      
-      // Update the main performance fee ledger
-      await client.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = 'PERFORMANCE_FEES_TOTAL'`, [totalPerformanceFee]);
-      await client.query(`INSERT INTO treasury_transactions (to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'PERFORMANCE_FEES_TOTAL'), $1, $2)`, [totalPerformanceFee, revenueNote]);
-      
-      // Split the total fee into the sub-ledgers
-      for (const ledgerName in splits) {
-        const splitAmount = totalPerformanceFee * splits[ledgerName];
-        if (splitAmount > 0) {
-          await client.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = $2`, [splitAmount, ledgerName]);
-          const splitDesc = `Allocated ${splits[ledgerName]*100}% of performance fee to ${ledgerName}.`;
-          await client.query(
-            `INSERT INTO treasury_transactions (from_ledger_id, to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'PERFORMANCE_FEES_TOTAL'), (SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = $1), $2, $3)`,
-            [ledgerName, splitAmount, splitDesc]
-          );
-        }
-      }
-    }
-
-
-
     await client.query('COMMIT');
-    res.status(200).json({ message: `Successfully distributed profits...` });
-
+    res.status(200).json({ message: `Successfully finalized PnL for ${participants.length} participants. Total distributed: $${totalGainOrLoss.toFixed(2)}.` });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error(`[Admin] Profit distribution failed for vault ${vault_id}:`, err);
+    console.error(`Error finalizing PnL for vault ${vaultId}:`, err);
     res.status(500).send('Server Error');
   } finally {
     client.release();
   }
 });
 
-router.get('/users/search', async (req, res) => {
-  const { query } = req.query;
-  if (!query || query.length < 3) {
-    return res.status(400).json({ message: 'Search query must be at least 3 characters long.' });
-  }
-
+router.post('/vaults/:vaultId/harvest', async (req, res) => {
+  const { vaultId } = req.params;
+  const client = await pool.connect();
   try {
-    const searchQuery = `
-      SELECT user_id, username, email, eth_address 
-      FROM users 
-      WHERE 
-        username ILIKE $1 OR 
-        email ILIKE $1 OR 
-        eth_address ILIKE $1
-      LIMIT 10;
-    `;
-    const { rows } = await pool.query(searchQuery, [`%${query}%`]);
-    res.json(rows);
-  } catch (err) {
-    console.error('Admin user search error:', err);
-    res.status(500).send('Server Error');
-  }
-});
+    await client.query('BEGIN');
+    
+    const usersToHarvestResult = await client.query(
+      `SELECT user_id FROM user_vault_settings WHERE vault_id = $1 AND auto_compound = false`,
+      [vaultId]
+    );
+    const userIdsToHarvest = usersToHarvestResult.rows.map(r => r.user_id);
 
-router.get('/users/:userId', async (req, res) => {
-  const { userId } = req.params;
-
-  try {
-    const [userDetails, userPositions, userActivity] = await Promise.all([
-      pool.query('SELECT * FROM users WHERE user_id = $1', [userId]),
-      pool.query('SELECT * FROM user_vault_positions WHERE user_id = $1 ORDER BY entry_date DESC', [userId]),
-      pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
-    ]);
-
-    if (userDetails.rows.length === 0) {
-      return res.status(404).json({ message: 'User not found.' });
+    if (userIdsToHarvest.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(200).json({ message: 'No users with auto-compound disabled found in this vault.' });
     }
 
-    const { password_hash, encrypted_private_key, ...safeUserDetails } = userDetails.rows[0];
+    let totalHarvestedAmount = 0;
     
-    res.json({
-      details: safeUserDetails,
-      positions: userPositions.rows,
-      activity: userActivity.rows
-    });
+    for (const userId of userIdsToHarvest) {
+      // Get all PNL entries that have not been harvested yet.
+      // We do this by summing ALL PNL, then subtracting all HARVESTS.
+      const pnlResult = await client.query(
+        `SELECT COALESCE(SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END), 0) as total_pnl,
+                COALESCE(SUM(CASE WHEN entry_type = 'PNL_HARVEST' THEN amount ELSE 0 END), 0) as total_harvested
+         FROM vault_ledger_entries
+         WHERE user_id = $1 AND vault_id = $2`,
+        [userId, vaultId]
+      );
+      
+      const userPnlToHarvest = parseFloat(pnlResult.rows[0].total_pnl) + parseFloat(pnlResult.rows[0].total_harvested);
+
+      if (userPnlToHarvest > 0.000001) { // Use a small threshold for floating point math
+        await client.query(
+          'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+          [userPnlToHarvest, userId]
+        );
+        await client.query(
+          `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount)
+           VALUES ($1, $2, 'PNL_HARVEST', $3)`,
+          [userId, vaultId, -userPnlToHarvest]
+        );
+        const description = `Harvested ${userPnlToHarvest.toFixed(2)} USDC profit from Vault ${vaultId} to main balance.`;
+        await client.query(
+            `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
+             VALUES ($1, 'VAULT_PNL_HARVEST', $2, $3, 'USDC', 'COMPLETED')`,
+            [userId, description, userPnlToHarvest]
+        );
+        totalHarvestedAmount += userPnlToHarvest;
+      }
+    }
+    
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Successfully harvested a total of $${totalHarvestedAmount.toFixed(2)} for ${userIdsToHarvest.length} users.` });
 
   } catch (err) {
-    console.error(`Error fetching details for user ${userId}:`, err);
+    await client.query('ROLLBACK');
+    console.error(`Error during profit harvesting for vault ${vaultId}:`, err);
     res.status(500).send('Server Error');
+  } finally {
+    client.release();
   }
 });
+
 
 // @route   GET /api/admin/deposits
 // @desc    Get a paginated list of all deposits
@@ -498,141 +395,5 @@ router.post('/buyback-points', async (req, res) => {
   }
 });
 
-// @route   GET /api/admin/vaults/:vaultId/details
-// @desc    Get detailed information for a single vault and all its participants
-// @access  Admin
-// @route   GET /api/admin/vaults/:vaultId/details (UPGRADED)
-router.get('/vaults/:vaultId/details', async (req, res) => {
-  const { vaultId } = req.params;
-  try {
-    // 1. Get the vault's own details (name, etc.)
-    const vaultDetailsResult = await pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
-    if (vaultDetailsResult.rows.length === 0) {
-      return res.status(404).json({ message: 'Vault not found.' });
-    }
-    const vaultDetails = vaultDetailsResult.rows[0];
-
-    // 2. Get a list of all participants and their balances from the new ledger table
-    const participantsResult = await pool.query(
-      `SELECT
-         vle.user_id,
-         u.username,
-         COALESCE(SUM(vle.amount), 0) as capital,
-         COALESCE(SUM(CASE WHEN vle.entry_type = 'PNL_UPDATE' THEN vle.amount ELSE 0 END), 0) as pnl
-       FROM vault_ledger_entries vle
-       JOIN users u ON vle.user_id = u.user_id
-       WHERE vle.vault_id = $1
-       GROUP BY vle.user_id, u.username
-       HAVING SUM(vle.amount) > 0 -- Only show users with a current balance in the vault
-       ORDER BY u.username ASC`,
-      [vaultId]
-    );
-    const participants = participantsResult.rows.map(p => ({
-        ...p,
-        capital: parseFloat(p.capital),
-        pnl: parseFloat(p.pnl)
-    }));
-
-    // 3. Calculate the aggregate stats from the participant data
-    const totalCapital = participants.reduce((sum, p) => sum + p.capital, 0);
-    const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
-    const currentPnlPercentage = (totalCapital > 0) ? ((totalCapital - (totalCapital - totalPnl)) / (totalCapital - totalPnl)) * 100 : 0;
-
-
-    res.json({
-      vault: vaultDetails,
-      participants: participants,
-      stats: {
-        participantCount: participants.length,
-        totalCapital: totalCapital,
-        totalPnl: totalPnl,
-        currentPnlPercentage: currentPnlPercentage
-      }
-    });
-  } catch (err) {
-    console.error(`Error fetching ledger-based details for vault ${vaultId}:`, err);
-    res.status(500).send('Server Error');
-  }
-});
-
-// @route   POST /api/admin/vaults/:vaultId/update-pnl
-// @desc    Update the PnL for all participants in a vault by a percentage
-// @access  Admin
-router.post('/vaults/:vaultId/update-pnl', async (req, res) => {
-  const { vaultId } = req.params;
-  const { newTotalValue } = req.body; // Expecting newTotalValue now
-  const client = await pool.connect();
-
-  try {
-    const newVaultValue = parseFloat(newTotalValue);
-    if (isNaN(newVaultValue) || newVaultValue < 0) {
-      return res.status(400).json({ message: 'A valid, non-negative number for the new total value is required.' });
-    }
-
-    await client.query('BEGIN');
-
-    // 1. Get the current total capital in the vault from the ledger
-    const currentCapitalResult = await client.query(
-      "SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1",
-      [vaultId]
-    );
-    const currentTotalCapital = parseFloat(currentCapitalResult.rows[0].total);
-
-    if (currentTotalCapital <= 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Cannot update PnL for a vault with zero or negative capital.' });
-    }
-
-    // 2. Calculate the total gain or loss
-    const totalGainOrLoss = newVaultValue - currentTotalCapital;
-
-    // 3. Get all users and their respective capital in this vault
-    const participantsResult = await client.query(
-      `SELECT user_id, COALESCE(SUM(amount), 0) as user_capital
-       FROM vault_ledger_entries
-       WHERE vault_id = $1
-       GROUP BY user_id
-       HAVING SUM(amount) > 0`, // Only get users with a positive balance
-      [vaultId]
-    );
-    const participants = participantsResult.rows;
-
-    if (participants.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'No active participants found in this vault.' });
-    }
-    
-    // 4. Loop through each participant, calculate their share, and log it
-    for (const participant of participants) {
-      const userCapital = parseFloat(participant.user_capital);
-      const userShareOfCapital = userCapital / currentTotalCapital;
-      const userPnl = totalGainOrLoss * userShareOfCapital;
-
-      // Insert a PNL entry into the ledger. This can be positive or negative.
-      await client.query(
-        `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_UPDATE', $3)`,
-        [participant.user_id, vaultId, userPnl]
-      );
-      
-      // Optionally, log this to the main activity log as well for user visibility
-      const description = `Unrealized PnL of ${userPnl.toFixed(2)} USDC updated for Vault ${vaultId}.`;
-      await client.query(
-        `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status)
-         VALUES ($1, 'VAULT_PNL_UPDATE', $2, $3, 'USDC', 'COMPLETED')`,
-        [participant.user_id, description, userPnl]
-      );
-    }
-    
-    await client.query('COMMIT');
-    res.status(200).json({ message: `Successfully updated PnL for ${participants.length} participants. Total PnL distributed: $${totalGainOrLoss.toFixed(2)}.` });
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(`Error updating PnL for vault ${vaultId}:`, err);
-    res.status(500).send('Server Error');
-  } finally {
-    client.release();
-  }
-});
 
 module.exports = router;

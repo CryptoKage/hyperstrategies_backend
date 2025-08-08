@@ -325,5 +325,38 @@ router.get('/xp-history', authenticateToken, async (req, res) => {
   }
 });
 
+router.put('/vault-settings/:vaultId/compound', authenticateToken, async (req, res) => {
+  const { vaultId } = req.params;
+  const { autoCompound } = req.body;
+  const userId = req.user.id;
+
+  if (typeof autoCompound !== 'boolean') {
+    return res.status(400).json({ message: 'Invalid autoCompound value. Must be true or false.' });
+  }
+
+  try {
+    // This is an "UPSERT" query.
+    // It will try to INSERT a new setting. If a row for this user/vault already exists
+    // (violating the primary key constraint), the ON CONFLICT clause tells it to
+    // UPDATE the existing row instead. This is extremely robust.
+    const upsertQuery = `
+      INSERT INTO user_vault_settings (user_id, vault_id, auto_compound)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, vault_id)
+      DO UPDATE SET auto_compound = $3;
+    `;
+    
+    await pool.query(upsertQuery, [userId, vaultId, autoCompound]);
+    
+    res.status(200).json({ 
+      message: `Auto-compounding for vault ${vaultId} has been turned ${autoCompound ? 'ON' : 'OFF'}.`
+    });
+
+  } catch (err) {
+    console.error('Error updating auto-compound setting:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
 
