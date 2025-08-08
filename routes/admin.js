@@ -198,16 +198,36 @@ router.get('/users/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     const [userDetails, userVaultLedgers, userActivity] = await Promise.all([
-      pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags FROM users WHERE user_id = $1', [userId]),
-      pool.query(`SELECT vault_id, SUM(amount) as total_capital FROM vault_ledger_entries WHERE user_id = $1 GROUP BY vault_id HAVING SUM(amount) > 0`, [userId]),
+      // This query is now safer, selecting only the columns we need
+      pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags, balance FROM users WHERE user_id = $1', [userId]),
+      
+      // This query gets the user's positions from the new ledger table
+      pool.query(`
+        SELECT 
+          vle.vault_id,
+          v.name as vault_name,
+          COALESCE(SUM(vle.amount), 0) as total_capital
+        FROM vault_ledger_entries vle
+        JOIN vaults v ON vle.vault_id = v.vault_id
+        WHERE vle.user_id = $1
+        GROUP BY vle.vault_id, v.name
+        HAVING SUM(vle.amount) > 0
+      `, [userId]),
+
       pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
     ]);
+
     if (userDetails.rows.length === 0) {
       return res.status(404).json({ message: 'User not found.' });
     }
+
     res.json({
       details: userDetails.rows[0],
-      positions: userVaultLedgers.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
+      // We now map over the ledger results to ensure numbers are formatted correctly
+      positions: userVaultLedgers.rows.map(p => ({
+        ...p, 
+        total_capital: parseFloat(p.total_capital)
+      })),
       activity: userActivity.rows
     });
   } catch (err) {
