@@ -20,7 +20,6 @@ router.get('/dashboard-stats', async (req, res) => {
       pool.query(`SELECT w.amount, u.username, w.created_at FROM withdrawal_queue w JOIN users u ON w.user_id = u.user_id ORDER BY w.created_at DESC LIMIT 5;`),
       pool.query(`SELECT log.activity_id, log.amount_primary, log.description, u.username, log.created_at FROM user_activity_log log JOIN users u ON log.user_id = u.user_id WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING' ORDER BY log.created_at ASC;`)
     ]);
-
     res.json({
       userCount: parseInt(userCount.rows[0].count),
       totalAvailable: parseFloat(totalAvailable.rows[0].total || 0),
@@ -186,15 +185,7 @@ router.get('/users/search', async (req, res) => {
     return res.status(400).json({ message: 'Search query must be at least 3 characters long.' });
   }
   try {
-    const searchQuery = `
-      SELECT user_id, username, email, eth_address 
-      FROM users 
-      WHERE 
-        username ILIKE $1 OR 
-        email ILIKE $1 OR 
-        eth_address ILIKE $1
-      LIMIT 10;
-    `;
+    const searchQuery = `SELECT user_id, username, email, eth_address FROM users WHERE username ILIKE $1 OR email ILIKE $1 OR eth_address ILIKE $1 LIMIT 10;`;
     const { rows } = await pool.query(searchQuery, [`%${query}%`]);
     res.json(rows);
   } catch (err) {
@@ -208,13 +199,7 @@ router.get('/users/:userId', async (req, res) => {
   try {
     const [userDetails, userVaultLedgers, userActivity] = await Promise.all([
       pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags FROM users WHERE user_id = $1', [userId]),
-      pool.query(`
-        SELECT vault_id, SUM(amount) as total_capital
-        FROM vault_ledger_entries
-        WHERE user_id = $1
-        GROUP BY vault_id
-        HAVING SUM(amount) > 0
-      `, [userId]),
+      pool.query(`SELECT vault_id, SUM(amount) as total_capital FROM vault_ledger_entries WHERE user_id = $1 GROUP BY vault_id HAVING SUM(amount) > 0`, [userId]),
       pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
     ]);
     if (userDetails.rows.length === 0) {
@@ -331,27 +316,19 @@ router.get('/users/:userId/bonus-points', async (req, res) => {
 
 router.get('/treasury-report', async (req, res) => {
   try {
-    const [
-      ledgersResult,
-      // --- FIX: This query now uses the new ledger table ---
-      totalCapitalInVaultsResult,
-      totalOutstandingBonusPointsResult
-    ] = await Promise.all([
+    const [ledgersResult, totalCapitalInVaultsResult, totalOutstandingBonusPointsResult] = await Promise.all([
       pool.query("SELECT ledger_name, balance FROM treasury_ledgers"),
       pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries"),
       pool.query("SELECT COALESCE(SUM(points_amount), 0) as total FROM bonus_points")
     ]);
-
     const ledgersMap = ledgersResult.rows.reduce((acc, row) => {
       acc[row.ledger_name] = parseFloat(row.balance);
       return acc;
     }, {});
-
     const depositFeeRevenue = ledgersMap['DEPOSIT_FEES_TOTAL'] || 0;
     const performanceFeeRevenue = ledgersMap['PERFORMANCE_FEES_TOTAL'] || 0;
     const totalCapitalInVaults = parseFloat(totalCapitalInVaultsResult.rows[0].total);
     const totalOutstandingBonusPoints = parseFloat(totalOutstandingBonusPointsResult.rows[0].total);
-
     res.json({
       revenue: {
         depositFees: depositFeeRevenue,
@@ -365,7 +342,6 @@ router.get('/treasury-report', async (req, res) => {
       ledgers: ledgersMap,
       netPosition: (depositFeeRevenue + performanceFeeRevenue) - totalOutstandingBonusPoints
     });
-
   } catch (err) {
     console.error('Error fetching treasury report:', err);
     res.status(500).send('Server Error');
