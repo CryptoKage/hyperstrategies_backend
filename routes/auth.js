@@ -82,7 +82,7 @@ router.post(
       const initialTags = [];
       const lowerCaseRefCode = referralCode ? referralCode.toLowerCase() : '';
       if (lowerCaseRefCode === 'hs-hip-hop') { initialTags.push('hip_hop_syndicate'); }
-      else if (lowerCaseRefCode === 'hs-shadwmf') { initialTags.push('shadwmf_syndicate'); }
+      else if (lowerCaseRefCode === 'hs-shdwmf') { initialTags.push('shdwmf_syndicate'); }
       else if (lowerCaseRefCode === 'hs-purrtardos') { initialTags.push('purrtardos_syndicate'); }
 
       const newUserQuery = `
