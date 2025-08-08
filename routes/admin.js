@@ -321,31 +321,7 @@ router.get('/treasury-report', async (req, res) => {
   }
 });
 
-    // 3. Construct the final report using the new ledgersMap.
-    const depositFeeRevenue = ledgersMap['DEPOSIT_FEES_TOTAL'] || 0;
-    const performanceFeeRevenue = ledgersMap['PERFORMANCE_FEES_TOTAL'] || 0;
-    const totalCapitalInVaults = parseFloat(totalCapitalInVaultsResult.rows[0].total);
-    const totalOutstandingBonusPoints = parseFloat(totalOutstandingBonusPointsResult.rows[0].total);
-
-    res.json({
-      // The frontend needs this "revenue" object.
-      revenue: {
-        depositFees: depositFeeRevenue,
-        performanceFees: performanceFeeRevenue,
-        total: depositFeeRevenue + performanceFeeRevenue
-      },
-      // This part was already working correctly.
-      liabilities: {
-        userCapitalInVaults: totalCapitalInVaults,
-        bonusPoints: totalOutstandingBonusPoints
-      },
-      // CRITICAL: The frontend NEEDS this "ledgers" object to populate the allocation cards.
-      ledgers: ledgersMap,
-      // The net position calculation remains the same.
-      netPosition: (depositFeeRevenue + performanceFeeRevenue) - totalOutstandingBonusPoints
-    });
-
-
+  
 router.post('/buyback-points', async (req, res) => {
   const { buybackAmountUSD } = req.body;
   const adminUserId = req.user.id;
