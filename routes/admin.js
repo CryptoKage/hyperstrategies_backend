@@ -180,6 +180,57 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
     }
 });
 
+router.get('/users/search', async (req, res) => {
+  const { query } = req.query;
+  if (!query || query.length < 3) {
+    return res.status(400).json({ message: 'Search query must be at least 3 characters long.' });
+  }
+  try {
+    const searchQuery = `
+      SELECT user_id, username, email, eth_address 
+      FROM users 
+      WHERE 
+        username ILIKE $1 OR 
+        email ILIKE $1 OR 
+        eth_address ILIKE $1
+      LIMIT 10;
+    `;
+    const { rows } = await pool.query(searchQuery, [`%${query}%`]);
+    res.json(rows);
+  } catch (err) {
+    console.error('Admin user search error:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
+router.get('/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const [userDetails, userVaultLedgers, userActivity] = await Promise.all([
+      pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags FROM users WHERE user_id = $1', [userId]),
+      pool.query(`
+        SELECT vault_id, SUM(amount) as total_capital
+        FROM vault_ledger_entries
+        WHERE user_id = $1
+        GROUP BY vault_id
+        HAVING SUM(amount) > 0
+      `, [userId]),
+      pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
+    ]);
+    if (userDetails.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+    res.json({
+      details: userDetails.rows[0],
+      positions: userVaultLedgers.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
+      activity: userActivity.rows
+    });
+  } catch (err) {
+    console.error(`Error fetching details for user ${userId}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
+
 // @route   GET /api/admin/deposits
 // @desc    Get a paginated list of all deposits
 // @access  Admin
