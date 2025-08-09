@@ -38,101 +38,65 @@ router.get('/dashboard-stats', async (req, res) => {
   }
 });
 
-// --- Endpoint for DISPLAY-ONLY PnL Updates ---
-router.post('/vaults/:vaultId/update-display-pnl', async (req, res) => {
+router.post('/vaults/:vaultId/apply-manual-pnl', async (req, res) => {
   const { vaultId } = req.params;
-  const { pnlPercentage } = req.body;
-  const pnlPercent = parseFloat(pnlPercentage);
-
-  if (isNaN(pnlPercent)) {
-    return res.status(400).json({ message: 'A valid number for PnL percentage is required.' });
-  }
-  try {
-    const { rowCount } = await pool.query('UPDATE vaults SET display_pnl_percentage = $1 WHERE vault_id = $2', [pnlPercent, vaultId]);
-    if (rowCount === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
-    res.status(200).json({ message: `Successfully updated display PnL for vault ${vaultId} to ${pnlPercent}%.` });
-  } catch (err) {
-    console.error(`Error updating display PnL for vault ${vaultId}:`, err);
-    res.status(500).send('Server Error');
-  }
-});
-
-// --- Endpoint for Finalizing a Period and Distributing Real PnL ---
-router.post('/vaults/:vaultId/finalize-pnl', async (req, res) => {
-  const { vaultId } = req.params;
-  const { newTotalValue } = req.body;
+  const { pnlPercentage, beforeTimestamp } = req.body;
   const client = await pool.connect();
+
   try {
-    const newVaultValue = parseFloat(newTotalValue);
-    if (isNaN(newVaultValue) || newVaultValue < 0) {
-      return res.status(400).json({ message: 'A valid, non-negative number is required.' });
+    const pnlPercent = parseFloat(pnlPercentage);
+    if (isNaN(pnlPercent)) {
+      return res.status(400).json({ message: 'A valid PnL percentage is required.' });
     }
+    if (!beforeTimestamp || !new Date(beforeTimestamp).getTime()) {
+      return res.status(400).json({ message: 'A valid "before timestamp" is required.' });
+    }
+
     await client.query('BEGIN');
-    const currentCapitalResult = await client.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1", [vaultId]);
-    const currentTotalCapital = parseFloat(currentCapitalResult.rows[0].total);
-    if (currentTotalCapital <= 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Vault has no capital to distribute PnL for.' });
-    }
-    const totalGainOrLoss = newVaultValue - currentTotalCapital;
-    if (Math.abs(totalGainOrLoss) < 0.000001) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ message: 'New value is the same as the current value. No PnL to distribute.' });
-    }
-    const participantsResult = await client.query(`SELECT user_id, COALESCE(SUM(amount), 0) as user_capital FROM vault_ledger_entries WHERE vault_id = $1 GROUP BY user_id HAVING SUM(amount) > 0`, [vaultId]);
+
+    // 1. Get all users who had capital in the vault BEFORE the cutoff timestamp
+    const participantsResult = await client.query(
+      `SELECT
+         user_id,
+         -- Calculate their principal balance only from entries before the cutoff
+         COALESCE(SUM(CASE WHEN entry_type NOT IN ('PNL_DISTRIBUTION', 'PNL_HARVEST') THEN amount ELSE 0 END), 0) as principal_before_cutoff
+       FROM vault_ledger_entries
+       WHERE vault_id = $1 AND created_at < $2
+       GROUP BY user_id
+       HAVING COALESCE(SUM(CASE WHEN entry_type NOT IN ('PNL_DISTRIBUTION', 'PNL_HARVEST') THEN amount ELSE 0 END), 0) > 0`,
+      [vaultId, beforeTimestamp]
+    );
     const participants = participantsResult.rows;
-    for (const participant of participants) {
-      const userCapital = parseFloat(participant.user_capital);
-      const userShare = userCapital / currentTotalCapital;
-      const userPnl = totalGainOrLoss * userShare;
-      await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3)`, [participant.user_id, vaultId, userPnl]);
-      const description = `Realized PnL of ${userPnl.toFixed(2)} USDC distributed for Vault ${vaultId}.`;
-      await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_PNL_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`, [participant.user_id, description, userPnl]);
-    }
-    await client.query('COMMIT');
-    res.status(200).json({ message: `Successfully finalized PnL for ${participants.length} participants. Total distributed: $${totalGainOrLoss.toFixed(2)}.` });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(`Error finalizing PnL for vault ${vaultId}:`, err);
-    res.status(500).send('Server Error');
-  } finally {
-    client.release();
-  }
-});
 
-// --- Endpoint for Harvesting Profits for Non-Compounding Users ---
-router.post('/vaults/:vaultId/harvest', async (req, res) => {
-  const { vaultId } = req.params;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const usersToHarvestResult = await client.query(`SELECT user_id FROM user_vault_settings WHERE vault_id = $1 AND auto_compound = false`, [vaultId]);
-    const userIdsToHarvest = usersToHarvestResult.rows.map(r => r.user_id);
-    if (userIdsToHarvest.length === 0) {
+    if (participants.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(200).json({ message: 'No users with auto-compound disabled found in this vault.' });
+      return res.status(200).json({ message: 'No eligible participants found before the specified time.' });
     }
-    let totalHarvestedAmount = 0;
-    for (const userId of userIdsToHarvest) {
-      const pnlResult = await client.query(
-        `SELECT COALESCE(SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END), 0) as total_pnl,
-                COALESCE(SUM(CASE WHEN entry_type = 'PNL_HARVEST' THEN amount ELSE 0 END), 0) as total_harvested
-         FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2`, [userId, vaultId]
-      );
-      const userPnlToHarvest = parseFloat(pnlResult.rows[0].total_pnl) + parseFloat(pnlResult.rows[0].total_harvested);
-      if (userPnlToHarvest > 0.000001) {
-        await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [userPnlToHarvest, userId]);
-        await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_HARVEST', $3)`, [userId, vaultId, -userPnlToHarvest]);
-        const description = `Harvested ${userPnlToHarvest.toFixed(2)} USDC profit from Vault ${vaultId} to main balance.`;
-        await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_PNL_HARVEST', $2, $3, 'USDC', 'COMPLETED')`, [userId, description, userPnlToHarvest]);
-        totalHarvestedAmount += userPnlToHarvest;
+
+    // 2. Loop through eligible participants and apply the PnL
+    for (const participant of participants) {
+      const principal = parseFloat(participant.principal_before_cutoff);
+      const pnlAmount = principal * (pnlPercent / 100.0);
+
+      if (pnlAmount !== 0) {
+        await client.query(
+          `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3)`,
+          [participant.user_id, vaultId, pnlAmount]
+        );
+        const description = `Distributed ${pnlPercent}% PnL ($${pnlAmount.toFixed(2)}) for Vault ${vaultId}.`;
+        await client.query(
+          `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_PNL_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
+          [participant.user_id, description, pnlAmount]
+        );
       }
     }
+
     await client.query('COMMIT');
-    res.status(200).json({ message: `Successfully harvested a total of $${totalHarvestedAmount.toFixed(2)} for ${userIdsToHarvest.length} users.` });
+    res.status(200).json({ message: `Successfully applied ${pnlPercent}% PnL to ${participants.length} eligible participants.` });
+
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error(`Error during profit harvesting for vault ${vaultId}:`, err);
+    console.error(`Error applying manual PnL for vault ${vaultId}:`, err);
     res.status(500).send('Server Error');
   } finally {
     client.release();
@@ -146,10 +110,18 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         const vaultDetailsResult = await pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
         if (vaultDetailsResult.rows.length === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
         const vaultDetails = vaultDetailsResult.rows[0];
+
+        // --- THIS IS THE REFINED QUERY ---
         const participantsResult = await pool.query(
-            `SELECT vle.user_id, u.username,
-             COALESCE(SUM(vle.amount), 0) as capital,
-             COALESCE(SUM(CASE WHEN vle.entry_type IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as pnl
+            `SELECT
+               vle.user_id,
+               u.username,
+               -- Total Capital is the simple SUM of all entries
+               COALESCE(SUM(vle.amount), 0) as total_capital,
+               -- Principal is the SUM of everything EXCEPT PnL entries
+               COALESCE(SUM(CASE WHEN vle.entry_type NOT IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as principal,
+               -- PnL is the SUM of ONLY PnL entries
+               COALESCE(SUM(CASE WHEN vle.entry_type IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as pnl
              FROM vault_ledger_entries vle
              JOIN users u ON vle.user_id = u.user_id
              WHERE vle.vault_id = $1
@@ -158,11 +130,19 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
              ORDER BY u.username ASC`,
             [vaultId]
         );
-        const participants = participantsResult.rows.map(p => ({ ...p, capital: parseFloat(p.capital), pnl: parseFloat(p.pnl) }));
-        const totalCapital = participants.reduce((sum, p) => sum + p.capital, 0);
+
+        const participants = participantsResult.rows.map(p => ({
+            ...p,
+            total_capital: parseFloat(p.total_capital),
+            principal: parseFloat(p.principal),
+            pnl: parseFloat(p.pnl)
+        }));
+
+        const totalCapital = participants.reduce((sum, p) => sum + p.total_capital, 0);
         const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
-        const principalCapital = totalCapital - totalPnl;
-        const currentPnlPercentage = (principalCapital > 0) ? (totalPnl / principalCapital) * 100 : 0;
+        const totalPrincipal = totalCapital - totalPnl;
+        const currentPnlPercentage = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
+        
         res.json({
             vault: vaultDetails,
             participants: participants,
