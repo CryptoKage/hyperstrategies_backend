@@ -18,7 +18,7 @@ router.get('/dashboard-stats', async (req, res) => {
       provider.getBalance(process.env.HOT_WALLET_ADDRESS),
       pool.query(`SELECT d.amount, u.username, d.detected_at FROM deposits d JOIN users u ON d.user_id = u.user_id ORDER BY d.detected_at DESC LIMIT 5;`),
       pool.query(`SELECT w.amount, u.username, w.created_at FROM withdrawal_queue w JOIN users u ON w.user_id = u.user_id ORDER BY w.created_at DESC LIMIT 5;`),
-      pool.query(`SELECT log.activity_id, log.amount_primary, log.description, u.username, log.created_at FROM user_activity_log log JOIN users u ON log.user_id = u.user_id WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING' ORDER BY log.created_at ASC;`)
+      pool.query(`SELECT log.activity_id, log.user_id, log.amount_primary, log.description, u.username, log.created_at FROM user_activity_log log JOIN users u ON log.user_id = u.user_id WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING' ORDER BY log.created_at ASC;`)
     ]);
     res.json({
       userCount: parseInt(userCount.rows[0].count),
@@ -29,7 +29,6 @@ router.get('/dashboard-stats', async (req, res) => {
       alchemyConnected: true,
       recentDeposits: recentDeposits.rows,
       recentWithdrawals: recentWithdrawals.rows,
-      failedSweeps: [],
       pendingVaultWithdrawals: pendingVaultWithdrawals.rows
     });
   } catch (err) {
@@ -38,62 +37,38 @@ router.get('/dashboard-stats', async (req, res) => {
   }
 });
 
+// --- Manual PnL Application Endpoint ---
 router.post('/vaults/:vaultId/apply-manual-pnl', async (req, res) => {
   const { vaultId } = req.params;
   const { pnlPercentage, beforeTimestamp } = req.body;
   const client = await pool.connect();
-
   try {
     const pnlPercent = parseFloat(pnlPercentage);
-    if (isNaN(pnlPercent)) {
-      return res.status(400).json({ message: 'A valid PnL percentage is required.' });
-    }
-    if (!beforeTimestamp || !new Date(beforeTimestamp).getTime()) {
-      return res.status(400).json({ message: 'A valid "before timestamp" is required.' });
-    }
-
+    if (isNaN(pnlPercent)) { return res.status(400).json({ message: 'A valid PnL percentage is required.' }); }
+    if (!beforeTimestamp || !new Date(beforeTimestamp).getTime()) { return res.status(400).json({ message: 'A valid "before timestamp" is required.' }); }
     await client.query('BEGIN');
-
-    // 1. Get all users who had capital in the vault BEFORE the cutoff timestamp
     const participantsResult = await client.query(
-      `SELECT
-         user_id,
-         -- Calculate their principal balance only from entries before the cutoff
-         COALESCE(SUM(CASE WHEN entry_type NOT IN ('PNL_DISTRIBUTION', 'PNL_HARVEST') THEN amount ELSE 0 END), 0) as principal_before_cutoff
-       FROM vault_ledger_entries
-       WHERE vault_id = $1 AND created_at < $2
-       GROUP BY user_id
-       HAVING COALESCE(SUM(CASE WHEN entry_type NOT IN ('PNL_DISTRIBUTION', 'PNL_HARVEST') THEN amount ELSE 0 END), 0) > 0`,
+      `SELECT user_id, COALESCE(SUM(CASE WHEN entry_type NOT IN ('PNL_DISTRIBUTION') THEN amount ELSE 0 END), 0) as principal
+       FROM vault_ledger_entries WHERE vault_id = $1 AND created_at < $2 GROUP BY user_id HAVING COALESCE(SUM(CASE WHEN entry_type NOT IN ('PNL_DISTRIBUTION') THEN amount ELSE 0 END), 0) > 0`,
       [vaultId, beforeTimestamp]
     );
     const participants = participantsResult.rows;
-
     if (participants.length === 0) {
       await client.query('ROLLBACK');
       return res.status(200).json({ message: 'No eligible participants found before the specified time.' });
     }
-
-    // 2. Loop through eligible participants and apply the PnL
     for (const participant of participants) {
-      const principal = parseFloat(participant.principal_before_cutoff);
+      const principal = parseFloat(participant.principal);
       const pnlAmount = principal * (pnlPercent / 100.0);
-
-      if (pnlAmount !== 0) {
-        await client.query(
-          `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3)`,
-          [participant.user_id, vaultId, pnlAmount]
-        );
+      if (Math.abs(pnlAmount) > 0.000001) {
+        await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3)`,[participant.user_id, vaultId, pnlAmount]);
         const description = `Distributed ${pnlPercent}% PnL ($${pnlAmount.toFixed(2)}) for Vault ${vaultId}.`;
-        await client.query(
-          `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_PNL_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,
-          [participant.user_id, description, pnlAmount]
-        );
+        await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_PNL_DISTRIBUTION', $2, $3, 'USDC', 'COMPLETED')`,[participant.user_id, description, pnlAmount]);
       }
     }
-
+    await client.query('UPDATE vaults SET display_pnl_percentage = display_pnl_percentage + $1 WHERE vault_id = $2', [pnlPercent, vaultId]);
     await client.query('COMMIT');
     res.status(200).json({ message: `Successfully applied ${pnlPercent}% PnL to ${participants.length} eligible participants.` });
-
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(`Error applying manual PnL for vault ${vaultId}:`, err);
@@ -103,7 +78,7 @@ router.post('/vaults/:vaultId/apply-manual-pnl', async (req, res) => {
   }
 });
 
-// --- GET /vaults/:vaultId/details (Ledger-Based) ---
+// --- Vault Details Endpoint (Ledger-Based) ---
 router.get('/vaults/:vaultId/details', async (req, res) => {
     const { vaultId } = req.params;
     try {
@@ -111,17 +86,12 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         if (vaultDetailsResult.rows.length === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
         const vaultDetails = vaultDetailsResult.rows[0];
         const participantsResult = await pool.query(
-            `SELECT
-               vle.user_id, u.username,
-               COALESCE(SUM(vle.amount), 0) as total_capital,
-               COALESCE(SUM(CASE WHEN vle.entry_type IN ('PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as pnl
-             FROM vault_ledger_entries vle
-             JOIN users u ON vle.user_id = u.user_id
-             WHERE vle.vault_id = $1
-             GROUP BY vle.user_id, u.username
-             HAVING SUM(vle.amount) > 0.000001
-             ORDER BY u.username ASC`,
-            [vaultId]
+            `SELECT vle.user_id, u.username,
+             COALESCE(SUM(vle.amount), 0) as total_capital,
+             COALESCE(SUM(CASE WHEN vle.entry_type = 'PNL_DISTRIBUTION' THEN vle.amount ELSE 0 END), 0) as pnl
+             FROM vault_ledger_entries vle JOIN users u ON vle.user_id = u.user_id
+             WHERE vle.vault_id = $1 GROUP BY vle.user_id, u.username HAVING SUM(vle.amount) > 0.000001
+             ORDER BY u.username ASC`, [vaultId]
         );
         const participants = participantsResult.rows.map(p => ({ ...p, total_capital: parseFloat(p.total_capital), pnl: parseFloat(p.pnl) }));
         const totalCapital = participants.reduce((sum, p) => sum + p.total_capital, 0);
@@ -130,13 +100,8 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         const currentPnlPercentage = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
         res.json({
             vault: vaultDetails,
-            participants: participants,
-            stats: {
-                participantCount: participants.length,
-                totalCapital: totalCapital,
-                totalPnl: totalPnl,
-                currentPnlPercentage: currentPnlPercentage
-            }
+            participants,
+            stats: { participantCount: participants.length, totalCapital, totalPnl, currentPnlPercentage }
         });
     } catch (err) {
         console.error(`Error fetching ledger-based details for vault ${vaultId}:`, err);
@@ -162,24 +127,17 @@ router.get('/users/search', async (req, res) => {
 router.get('/users/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
-    const [userDetails, userVaultLedgers, userActivity] = await Promise.all([
+    const [userDetails, userVaults, userActivity] = await Promise.all([
       pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags, balance FROM users WHERE user_id = $1', [userId]),
-      pool.query(`
-        SELECT 
-          vle.vault_id, v.name as vault_name,
-          COALESCE(SUM(vle.amount), 0) as total_capital
-        FROM vault_ledger_entries vle
-        JOIN vaults v ON vle.vault_id = v.vault_id
-        WHERE vle.user_id = $1
-        GROUP BY vle.vault_id, v.name
-        HAVING SUM(vle.amount) > 0.000001
-      `, [userId]),
+      pool.query(`SELECT v.name as vault_name, vle.vault_id, SUM(vle.amount) as total_capital
+        FROM vault_ledger_entries vle JOIN vaults v ON vle.vault_id = v.vault_id
+        WHERE vle.user_id = $1 GROUP BY vle.vault_id, v.name HAVING SUM(vle.amount) > 0.000001`, [userId]),
       pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
     ]);
     if (userDetails.rows.length === 0) { return res.status(404).json({ message: 'User not found.' }); }
     res.json({
       details: userDetails.rows[0],
-      positions: userVaultLedgers.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
+      positions: userVaults.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
       activity: userActivity.rows
     });
   } catch (err) {
@@ -293,24 +251,14 @@ router.get('/treasury-report', async (req, res) => {
       pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries"),
       pool.query("SELECT COALESCE(SUM(points_amount), 0) as total FROM bonus_points")
     ]);
-    const ledgersMap = ledgersResult.rows.reduce((acc, row) => {
-      acc[row.ledger_name] = parseFloat(row.balance);
-      return acc;
-    }, {});
+    const ledgersMap = ledgersResult.rows.reduce((acc, row) => { acc[row.ledger_name] = parseFloat(row.balance); return acc; }, {});
     const depositFeeRevenue = ledgersMap['DEPOSIT_FEES_TOTAL'] || 0;
     const performanceFeeRevenue = ledgersMap['PERFORMANCE_FEES_TOTAL'] || 0;
     const totalCapitalInVaults = parseFloat(totalCapitalInVaultsResult.rows[0].total);
     const totalOutstandingBonusPoints = parseFloat(totalOutstandingBonusPointsResult.rows[0].total);
     res.json({
-      revenue: {
-        depositFees: depositFeeRevenue,
-        performanceFees: performanceFeeRevenue,
-        total: depositFeeRevenue + performanceFeeRevenue
-      },
-      liabilities: {
-        userCapitalInVaults: totalCapitalInVaults,
-        bonusPoints: totalOutstandingBonusPoints
-      },
+      revenue: { depositFees: depositFeeRevenue, performanceFees: performanceFeeRevenue, total: depositFeeRevenue + performanceFeeRevenue },
+      liabilities: { userCapitalInVaults: totalCapitalInVaults, bonusPoints: totalOutstandingBonusPoints },
       ledgers: ledgersMap,
       netPosition: (depositFeeRevenue + performanceFeeRevenue) - totalOutstandingBonusPoints
     });
@@ -319,7 +267,6 @@ router.get('/treasury-report', async (req, res) => {
     res.status(500).send('Server Error');
   }
 });
-
   
 router.post('/buyback-points', async (req, res) => {
   const { buybackAmountUSD } = req.body;
