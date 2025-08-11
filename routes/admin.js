@@ -188,20 +188,12 @@ router.get('/users/:userId', async (req, res) => {
   try {
     const [userDetails, userVaults, userActivity, bonusPoints] = await Promise.all([
       pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags, balance FROM users WHERE user_id = $1', [userId]),
-      pool.query(`SELECT v.name as vault_name, vle.vault_id, SUM(vle.amount) as total_capital
-        FROM vault_ledger_entries vle JOIN vaults v ON vle.vault_id = v.vault_id
-        WHERE vle.user_id = $1 GROUP BY vle.vault_id, v.name HAVING SUM(vle.amount) > 0.000001`, [userId]),
+      pool.query(`SELECT v.name as vault_name, vle.vault_id, SUM(vle.amount) as total_capital FROM vault_ledger_entries vle JOIN vaults v ON vle.vault_id = v.vault_id WHERE vle.user_id = $1 GROUP BY vle.vault_id, v.name HAVING SUM(vle.amount) > 0.000001`, [userId]),
       pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId]),
       pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total FROM bonus_points WHERE user_id = $1', [userId])
     ]);
     if (userDetails.rows.length === 0) { return res.status(404).json({ message: 'User not found.' }); }
-    
-    // Combine the user details with their bonus points total
-    const fullUserDetails = {
-      ...userDetails.rows[0],
-      total_bonus_points: parseFloat(bonusPoints.rows[0].total)
-    };
-
+    const fullUserDetails = { ...userDetails.rows[0], total_bonus_points: parseFloat(bonusPoints.rows[0].total) };
     res.json({
       details: fullUserDetails,
       positions: userVaults.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
@@ -209,6 +201,41 @@ router.get('/users/:userId', async (req, res) => {
     });
   } catch (err) {
     console.error(`Error fetching details for user ${userId}:`, err);
+    res.status(500).send('Server Error');
+  }
+});
+
+router.get('/vault-positions', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15;
+    const offset = (page - 1) * limit;
+
+    const positionsQuery = `
+      SELECT
+        vle.user_id,
+        u.username,
+        vle.vault_id,
+        v.name as vault_name,
+        SUM(vle.amount) as total_capital
+      FROM vault_ledger_entries vle
+      JOIN users u ON vle.user_id = u.user_id
+      JOIN vaults v ON vle.vault_id = v.vault_id
+      GROUP BY vle.user_id, u.username, vle.vault_id, v.name
+      HAVING SUM(vle.amount) > 0.000001
+      ORDER BY u.username
+      LIMIT $1 OFFSET $2;
+    `;
+    const totalResult = await pool.query('SELECT COUNT(DISTINCT(user_id, vault_id)) FROM vault_ledger_entries WHERE amount > 0;'); // A simplified count
+    const { rows: positions } = await pool.query(positionsQuery, [limit, offset]);
+    res.json({
+      positions,
+      totalCount: parseInt(totalResult.rows[0].count, 10),
+      totalPages: Math.ceil(parseInt(totalResult.rows[0].count, 10) / limit),
+      currentPage: page
+    });
+  } catch (err) {
+    console.error('Error fetching vault positions for admin:', err);
     res.status(500).send('Server Error');
   }
 });
