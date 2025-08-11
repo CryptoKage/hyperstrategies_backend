@@ -54,7 +54,9 @@ const isProduction = process.env.NODE_ENV === 'production';
 app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
-  saveUninitialized: true,
+  // Only create sessions when something is stored to avoid setting
+  // unnecessary cookies for unauthenticated requests.
+  saveUninitialized: false,
   cookie: {
     secure: isProduction, // Only send cookies over HTTPS in production
     httpOnly: true, // Prevent client-side JS from accessing the cookie
