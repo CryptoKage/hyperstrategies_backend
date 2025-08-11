@@ -110,39 +110,24 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         const vaultDetailsResult = await pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
         if (vaultDetailsResult.rows.length === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
         const vaultDetails = vaultDetailsResult.rows[0];
-
-        // --- THIS IS THE REFINED QUERY ---
         const participantsResult = await pool.query(
             `SELECT
-               vle.user_id,
-               u.username,
-               -- Total Capital is the simple SUM of all entries
+               vle.user_id, u.username,
                COALESCE(SUM(vle.amount), 0) as total_capital,
-               -- Principal is the SUM of everything EXCEPT PnL entries
-               COALESCE(SUM(CASE WHEN vle.entry_type NOT IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as principal,
-               -- PnL is the SUM of ONLY PnL entries
-               COALESCE(SUM(CASE WHEN vle.entry_type IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as pnl
+               COALESCE(SUM(CASE WHEN vle.entry_type IN ('PNL_DISTRIBUTION') THEN vle.amount ELSE 0 END), 0) as pnl
              FROM vault_ledger_entries vle
              JOIN users u ON vle.user_id = u.user_id
              WHERE vle.vault_id = $1
              GROUP BY vle.user_id, u.username
-             HAVING SUM(vle.amount) > 0
+             HAVING SUM(vle.amount) > 0.000001
              ORDER BY u.username ASC`,
             [vaultId]
         );
-
-        const participants = participantsResult.rows.map(p => ({
-            ...p,
-            total_capital: parseFloat(p.total_capital),
-            principal: parseFloat(p.principal),
-            pnl: parseFloat(p.pnl)
-        }));
-
+        const participants = participantsResult.rows.map(p => ({ ...p, total_capital: parseFloat(p.total_capital), pnl: parseFloat(p.pnl) }));
         const totalCapital = participants.reduce((sum, p) => sum + p.total_capital, 0);
         const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
         const totalPrincipal = totalCapital - totalPnl;
         const currentPnlPercentage = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
-        
         res.json({
             vault: vaultDetails,
             participants: participants,
@@ -178,36 +163,23 @@ router.get('/users/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     const [userDetails, userVaultLedgers, userActivity] = await Promise.all([
-      // This query is now safer, selecting only the columns we need
       pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags, balance FROM users WHERE user_id = $1', [userId]),
-      
-      // This query gets the user's positions from the new ledger table
       pool.query(`
         SELECT 
-          vle.vault_id,
-          v.name as vault_name,
+          vle.vault_id, v.name as vault_name,
           COALESCE(SUM(vle.amount), 0) as total_capital
         FROM vault_ledger_entries vle
         JOIN vaults v ON vle.vault_id = v.vault_id
         WHERE vle.user_id = $1
         GROUP BY vle.vault_id, v.name
-        HAVING SUM(vle.amount) > 0
+        HAVING SUM(vle.amount) > 0.000001
       `, [userId]),
-
       pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId])
     ]);
-
-    if (userDetails.rows.length === 0) {
-      return res.status(404).json({ message: 'User not found.' });
-    }
-
+    if (userDetails.rows.length === 0) { return res.status(404).json({ message: 'User not found.' }); }
     res.json({
       details: userDetails.rows[0],
-      // We now map over the ledger results to ensure numbers are formatted correctly
-      positions: userVaultLedgers.rows.map(p => ({
-        ...p, 
-        total_capital: parseFloat(p.total_capital)
-      })),
+      positions: userVaultLedgers.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
       activity: userActivity.rows
     });
   } catch (err) {

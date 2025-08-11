@@ -17,7 +17,7 @@ router.get('/', authenticateToken, async (req, res) => {
       bonusPointsResult
     ] = await Promise.all([
       pool.query('SELECT username, balance, eth_address, account_tier FROM users WHERE user_id = $1', [userId]),
-      pool.query("SELECT * FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
+      pool.query("SELECT vault_id, name, description, status, image_url, fee_percentage, is_fee_tier_based, risk_level, display_pnl_percentage FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
       // --- NEW LEDGER-BASED QUERY for user positions ---
       pool.query(`
         SELECT
