@@ -5,10 +5,25 @@ const path = require('path'); // <-- Import the 'path' module
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// --- NEW: Check if we are in a production environment ---
+// --- Ensure all required environment variables are present ---
+const requiredEnvVars = [
+  'DB_HOST',
+  'DB_PORT',
+  'DB_USER',
+  'DB_PASSWORD',
+  'DB_DATABASE',
+];
+
+for (const key of requiredEnvVars) {
+  if (!process.env[key]) {
+    throw new Error(`FATAL ERROR: ${key} environment variable is not defined.`);
+  }
+}
+
+// --- Check if we are in a production environment ---
 const isProduction = process.env.NODE_ENV === 'production';
 
-// --- NEW: Define the base configuration ---
+// --- Define the base configuration ---
 const dbConfig = {
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -16,6 +31,10 @@ const dbConfig = {
   password: process.env.DB_PASSWORD,
   database: process.env.DB_DATABASE,
 };
+
+// Log the configuration (excluding the password) at startup
+const { password, ...sanitizedConfig } = dbConfig;
+console.log('Database configuration loaded:', sanitizedConfig);
 
 // --- NEW: Conditionally add SSL configuration only for production ---
 if (isProduction) {
