@@ -14,6 +14,20 @@ function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
+// Ensure a newly generated referral code is not already taken.
+// If a collision occurs, a new code is generated and checked again.
+// This minimizes the chance of hitting the unique constraint during user creation.
+async function generateUniqueReferralCode(db) {
+  let code;
+  let exists = true;
+  while (exists) {
+    code = generateReferralCode();
+    const result = await db.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+    exists = result.rows.length > 0;
+  }
+  return code;
+}
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -77,7 +91,6 @@ router.post(
       const passwordHash = await bcrypt.hash(password, salt);
       const wallet = generateWallet();
       const encryptedKey = encrypt(wallet.privateKey);
-      const newReferralCode = generateReferralCode();
 
       const initialTags = [];
       const lowerCaseRefCode = referralCode ? referralCode.toLowerCase() : '';
@@ -89,10 +102,43 @@ router.post(
         INSERT INTO users (email, password_hash, username, google_id, balance, eth_address, eth_private_key_encrypted, referred_by_user_id, xp, bio, theme, referral_code, is_admin, account_tier, tags)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING user_id, email, username, eth_address`;
-        
-      const newUserParams = [email, passwordHash, username, null, 0.00, wallet.address, encryptedKey, referrerId, xpToAward, null, 'dark', newReferralCode, false, 1, initialTags];
-      
-      const newUserResult = await client.query(newUserQuery, newUserParams);
+
+      // Attempt to insert with a unique referral code. In the unlikely event
+      // of a race condition causing a duplicate, retry with a fresh code.
+      let newUserResult;
+      let attempts = 0;
+      while (!newUserResult && attempts < 5) {
+        const newReferralCode = await generateUniqueReferralCode(client);
+        const newUserParams = [
+          email,
+          passwordHash,
+          username,
+          null,
+          0.0,
+          wallet.address,
+          encryptedKey,
+          referrerId,
+          xpToAward,
+          null,
+          'dark',
+          newReferralCode,
+          false,
+          1,
+          initialTags,
+        ];
+        try {
+          newUserResult = await client.query(newUserQuery, newUserParams);
+        } catch (err) {
+          if (err.code === '23505' && err.detail && err.detail.includes('referral_code')) {
+            attempts += 1;
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (!newUserResult) {
+        throw new Error('Failed to generate a unique referral code');
+      }
 
       await client.query('COMMIT');
       res.status(201).json({ message: 'User created successfully', user: newUserResult.rows[0] });
@@ -153,8 +199,26 @@ router.get('/google/callback',
   async (req, res) => {
     try {
       if (!req.user.referral_code) {
-        const newCode = generateReferralCode();
-        await pool.query('UPDATE users SET referral_code = $1 WHERE user_id = $2', [newCode, req.user.user_id]);
+        // Assign a unique referral code to new OAuth users. If an update
+        // collides with an existing code, retry with a fresh one.
+        let updated = false;
+        let attempts = 0;
+        while (!updated && attempts < 5) {
+          const newCode = await generateUniqueReferralCode(pool);
+          try {
+            await pool.query('UPDATE users SET referral_code = $1 WHERE user_id = $2', [newCode, req.user.user_id]);
+            updated = true;
+          } catch (err) {
+            if (err.code === '23505' && err.detail && err.detail.includes('referral_code')) {
+              attempts += 1;
+            } else {
+              throw err;
+            }
+          }
+        }
+        if (!updated) {
+          throw new Error('Failed to assign a unique referral code');
+        }
       }
       const payload = { user: { id: req.user.user_id, username: req.user.username, isAdmin: req.user.is_admin } };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
