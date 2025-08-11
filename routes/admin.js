@@ -5,7 +5,9 @@ const { ethers } = require('ethers');
 const authenticateToken = require('../middleware/authenticateToken');
 const isAdmin = require('../middleware/isAdmin');
 
-router.use(authenticateToken, isAdmin);
+// Authenticate first, then verify admin status via asynchronous DB lookup.
+router.use(authenticateToken);
+router.use(isAdmin);
 
 // --- Get Full Admin Dashboard Stats Endpoint (Ledger-Based) ---
 router.get('/dashboard-stats', async (req, res) => {
