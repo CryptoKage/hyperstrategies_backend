@@ -34,6 +34,7 @@ const withdrawRoutes = require('./routes/withdraw');
 const vaultsRoutes = require('./routes/vaults');
 const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
+const marketplaceRoutes = require('./routes/marketplace');
 require('./passport-setup');
 const { corsOptions } = require('./config/cors');
 
@@ -72,6 +73,7 @@ app.use('/api/withdraw', withdrawRoutes);
 app.use('/api/vaults', vaultsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/user', userRoutes);
+app.use('/api/marketplace', marketplaceRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
