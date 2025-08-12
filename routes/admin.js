@@ -4,6 +4,7 @@ const pool = require('../db');
 const { ethers } = require('ethers');
 const authenticateToken = require('../middleware/authenticateToken');
 const isAdmin = require('../middleware/isAdmin');
+const { sweepDepositsToTradingDesk } = require('../jobs/sweepDeposits');
 
 // Authenticate first, then verify admin status via asynchronous DB lookup.
 router.use(authenticateToken);
@@ -290,6 +291,12 @@ router.get('/treasury-report', async (req, res) => {
   }
 });
   
+router.post('/trigger-sweep', (req, res) => {
+  console.log(`[ADMIN] Manual capital sweep triggered by admin user: ${req.user.id}`);
+  sweepDepositsToTradingDesk(); // It must call the NEW job
+  res.status(202).json({ message: 'Capital sweep job has been successfully triggered. Check server logs for progress.' });
+});
+
 router.post('/buyback-points', async (req, res) => {
   const { buybackAmountUSD } = req.body;
   const adminUserId = req.user.id;
