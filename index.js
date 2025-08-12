@@ -94,9 +94,9 @@ app.listen(PORT, async () => {
   // --- NEW: Define lock variables ---
   let isPollingDeposits = false;
   let isProcessingWithdrawals = false;
-  let isProcessingAllocations = false;
   let isProcessingTimeRewards = false;
   let isProcessingVaultWithdrawals = false;
+  let isSweepingDeposits = false;
 
   // Job 1: Poll for new platform deposits
   const { pollDeposits } = require('./jobs/pollDeposits');
@@ -133,22 +133,22 @@ app.listen(PORT, async () => {
   }, 45000); // 45 seconds
 
   // Job 3: Process vault allocations (the sweep job)
-  const { processAllocations } = require('./jobs/processAllocations');
-  const FOUR_HOURS_IN_MS = 4 * 60 * 60 * 1000;
+ const { sweepDepositsToTradingDesk } = require('./jobs/sweepDeposits');
+  const TEN_MINUTES_IN_MS = 10 * 60 * 1000;
   setInterval(async () => {
-    if (isProcessingAllocations) {
-      console.log('SKIPPING: processAllocations is already running.');
+    if (isSweepingDeposits) {
+      console.log('SKIPPING: sweepDepositsToTradingDesk is already running.');
       return;
     }
-    isProcessingAllocations = true;
+    isSweepingDeposits = true;
     try {
-      await processAllocations();
+      await sweepDepositsToTradingDesk();
     } catch (e) {
-      console.error('Error in processAllocations job interval:', e);
+      console.error('Error in sweepDepositsToTradingDesk job interval:', e);
     } finally {
-      isProcessingAllocations = false;
+      isSweepingDeposits = false;
     }
-  }, FOUR_HOURS_IN_MS); // 4 hours
+  }, TEN_MINUTES_IN_MS); // Runs every 10 minutes
 
   // Job 4: Award time-weighted staking XP and update tiers
   const { processTimeWeightedRewards } = require('./jobs/awardStakingXP');
