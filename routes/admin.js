@@ -87,23 +87,52 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         const vaultDetailsResult = await pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
         if (vaultDetailsResult.rows.length === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
         const vaultDetails = vaultDetailsResult.rows[0];
+
+        // --- THIS IS THE DEFINITIVE, CORRECTED QUERY ---
         const participantsResult = await pool.query(
-            `SELECT vle.user_id, u.username,
-             COALESCE(SUM(vle.amount), 0) as total_capital,
-             COALESCE(SUM(CASE WHEN vle.entry_type = 'PNL_DISTRIBUTION' THEN vle.amount ELSE 0 END), 0) as pnl
-             FROM vault_ledger_entries vle JOIN users u ON vle.user_id = u.user_id
-             WHERE vle.vault_id = $1 GROUP BY vle.user_id, u.username HAVING SUM(vle.amount) > 0.000001
-             ORDER BY u.username ASC`, [vaultId]
+            `WITH UserTotals AS (
+              SELECT
+                user_id,
+                SUM(amount) as total_capital,
+                SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END) as pnl
+              FROM vault_ledger_entries
+              WHERE vault_id = $1
+              GROUP BY user_id
+            )
+            SELECT
+              ut.user_id,
+              u.username,
+              ut.total_capital,
+              ut.pnl,
+              (ut.total_capital - ut.pnl) as principal -- Principal is calculated correctly here
+            FROM UserTotals ut
+            JOIN users u ON ut.user_id = u.user_id
+            WHERE ut.total_capital > 0.000001 -- Only show users with a current balance
+            ORDER BY u.username ASC`,
+            [vaultId]
         );
-        const participants = participantsResult.rows.map(p => ({ ...p, total_capital: parseFloat(p.total_capital), pnl: parseFloat(p.pnl) }));
+
+        const participants = participantsResult.rows.map(p => ({
+            ...p,
+            total_capital: parseFloat(p.total_capital),
+            principal: parseFloat(p.principal),
+            pnl: parseFloat(p.pnl)
+        }));
+
         const totalCapital = participants.reduce((sum, p) => sum + p.total_capital, 0);
         const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
         const totalPrincipal = totalCapital - totalPnl;
         const currentPnlPercentage = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
+        
         res.json({
             vault: vaultDetails,
-            participants,
-            stats: { participantCount: participants.length, totalCapital, totalPnl, currentPnlPercentage }
+            participants: participants,
+            stats: {
+                participantCount: participants.length,
+                totalCapital: totalCapital,
+                totalPnl: totalPnl,
+                currentPnlPercentage: currentPnlPercentage
+            }
         });
     } catch (err) {
         console.error(`Error fetching ledger-based details for vault ${vaultId}:`, err);
