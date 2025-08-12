@@ -257,8 +257,14 @@ router.get('/vault-positions', async (req, res) => {
       ORDER BY u.username
       LIMIT $1 OFFSET $2;
     `;
-    const totalResult = await pool.query('SELECT COUNT(DISTINCT(user_id, vault_id)) FROM vault_ledger_entries WHERE amount > 0;'); // A simplified count
+    // Get a correct count of total positions
+    const totalResult = await pool.query(`
+      SELECT COUNT(*) FROM (
+        SELECT 1 FROM vault_ledger_entries GROUP BY user_id, vault_id HAVING SUM(amount) > 0.000001
+      ) as positions
+    `);
     const { rows: positions } = await pool.query(positionsQuery, [limit, offset]);
+    
     res.json({
       positions,
       totalCount: parseInt(totalResult.rows[0].count, 10),
