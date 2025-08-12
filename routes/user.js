@@ -61,7 +61,7 @@ router.get('/wallet', authenticateToken, async (req, res) => {
       pool.query(
         `SELECT 
            COALESCE(SUM(amount), 0) as total_capital,
-           COALESCE(SUM(CASE WHEN entry_type IN ('PNL_UPDATE', 'PNL_DISTRIBUTION') THEN amount ELSE 0 END), 0) as total_pnl
+           COALESCE(SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END), 0) as total_pnl
          FROM vault_ledger_entries WHERE user_id = $1`, [userId]),
       pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
     ]);
@@ -131,71 +131,18 @@ router.get('/activity-log', authenticateToken, async (req, res) => {
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-
     const [profileResult, stakedResult] = await Promise.all([
-      pool.query(`
-        SELECT 
-          u.username, u.email, u.xp, u.referral_code, u.account_tier,
-          u.tags, -- <-- FIX: Add the new tags column here
-          COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
-        FROM users u
-        LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
-        WHERE u.user_id = $1
-        GROUP BY u.user_id;
-      `, [userId]),
-      pool.query(
-        "SELECT COALESCE(SUM(tradable_capital), 0) as total FROM user_vault_positions WHERE user_id = $1 AND status IN ('in_trade', 'active')",
-        [userId]
-      )
+      pool.query(`SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, u.tags, COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+        FROM users u LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
+        WHERE u.user_id = $1 GROUP BY u.user_id;`, [userId]),
+      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId])
     ]);
-
-    if (profileResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found.' });
-    }
-
+    if (profileResult.rows.length === 0) { return res.status(404).json({ error: 'User not found.' }); }
     const profileData = profileResult.rows[0];
     const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
-
-    res.json({
-      ...profileData,
-      total_staked_capital: totalStakedCapital,
-    });
-    
+    res.json({ ...profileData, total_staked_capital: totalStakedCapital });
   } catch (err) {
-    console.error('Error fetching profile data:', err.message);
-    res.status(500).send('Server Error');
-  }
-});
-
-// --- Update User Profile Endpoint ---
-router.put('/profile', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    // --- NEW --- Only accept username, bio is deprecated
-    const { username } = req.body;
-
-    if (!username || username.length < 3) {
-      return res.status(400).json({ error: 'Username must be at least 3 characters.' });
-    }
-
-    const existingUser = await pool.query(
-      'SELECT user_id FROM users WHERE username = $1 AND user_id != $2',
-      [username, userId]
-    );
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({ error: 'Username is already taken.' });
-    }
-
-    // --- NEW --- Query no longer updates bio
-    await pool.query(
-      'UPDATE users SET username = $1 WHERE user_id = $2',
-      [username, userId]
-    );
-    
-    res.status(200).json({ message: 'Profile updated successfully!' });
-
-  } catch (err) {
-    console.error('Error updating profile:', err.message);
+    console.error('Error fetching profile data:', err);
     res.status(500).send('Server Error');
   }
 });
@@ -354,29 +301,18 @@ router.put('/vault-settings/:vaultId/compound', authenticateToken, async (req, r
   const { vaultId } = req.params;
   const { autoCompound } = req.body;
   const userId = req.user.id;
-
   if (typeof autoCompound !== 'boolean') {
-    return res.status(400).json({ message: 'Invalid autoCompound value. Must be true or false.' });
+    return res.status(400).json({ message: 'Invalid autoCompound value.' });
   }
-
   try {
-    // This is an "UPSERT" query.
-    // It will try to INSERT a new setting. If a row for this user/vault already exists
-    // (violating the primary key constraint), the ON CONFLICT clause tells it to
-    // UPDATE the existing row instead. This is extremely robust.
     const upsertQuery = `
-      INSERT INTO user_vault_settings (user_id, vault_id, auto_compound)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id, vault_id)
-      DO UPDATE SET auto_compound = $3;
+      INSERT INTO user_vault_settings (user_id, vault_id, auto_compound) VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, vault_id) DO UPDATE SET auto_compound = $3;
     `;
-    
     await pool.query(upsertQuery, [userId, vaultId, autoCompound]);
-    
     res.status(200).json({ 
       message: `Auto-compounding for vault ${vaultId} has been turned ${autoCompound ? 'ON' : 'OFF'}.`
     });
-
   } catch (err) {
     console.error('Error updating auto-compound setting:', err);
     res.status(500).send('Server Error');
