@@ -293,7 +293,7 @@ router.get('/treasury-report', async (req, res) => {
   
 router.post('/trigger-sweep', (req, res) => {
   console.log(`[ADMIN] Manual capital sweep triggered by admin user: ${req.user.id}`);
-  sweepDepositsToTradingDesk(); 
+  processLedgerSweeps(); 
   res.status(202).json({ message: 'Capital sweep job has been successfully triggered. Check server logs for progress.' });
 });
 

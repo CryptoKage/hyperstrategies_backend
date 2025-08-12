@@ -2,39 +2,34 @@
 const dotenv = require('dotenv');
 const express = require('express');
 const cors = require('cors');
-
 const helmet = require('helmet');
 const session = require('express-session');
 const passport = require('passport');
-const ethers = require('ethers'); // Use the main ethers import
+const ethers = require('ethers');
 
-// Load env vars
 dotenv.config();
 
-// Fail fast if the session secret is missing or empty.
-// This ensures cookies are properly signed in all environments.
-// --- Add the new JWT_SECRET check here ---
+// --- Startup Configuration Checks ---
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === '') {
   console.error('FATAL ERROR: JWT_SECRET environment variable is not defined.');
-  process.exit(1); // Exit the process with an error code
+  process.exit(1);
 }
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.trim() === '') {
   console.error('FATAL ERROR: SESSION_SECRET environment variable is not defined.');
   process.exit(1);
 }
-// You could also add one for ENCRYPTION_KEY here for consistency
 if (!process.env.ENCRYPTION_KEY || process.env.ENCRYPTION_KEY.length < 32) {
   console.error('FATAL ERROR: ENCRYPTION_KEY environment variable is not defined or is too short.');
   process.exit(1);
 }
-// Import routes and passport setup
+
+// --- Route Imports ---
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const withdrawRoutes = require('./routes/withdraw');
 const vaultsRoutes = require('./routes/vaults');
 const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
-const marketplaceRoutes = require('./routes/marketplace');
 require('./passport-setup');
 const { corsOptions } = require('./config/cors');
 
@@ -42,44 +37,36 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 
-// Middleware
+// --- Middleware ---
 app.use(cors(corsOptions));
 app.use(helmet());
 app.use(express.json());
 
-
-// Configure session cookies with environment-aware security settings.
-// In production we enforce HTTPS and use a stricter sameSite policy.
-// During development we relax these settings to ease local testing.
 const isProduction = process.env.NODE_ENV === 'production';
 app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
-  // Only create sessions when something is stored to avoid setting
-  // unnecessary cookies for unauthenticated requests.
   saveUninitialized: false,
   cookie: {
-    secure: isProduction, // Only send cookies over HTTPS in production
-    httpOnly: true, // Prevent client-side JS from accessing the cookie
-    sameSite: isProduction ? 'strict' : 'lax' // Stricter CSRF protection in production
+    secure: isProduction,
+    httpOnly: true,
+    sameSite: isProduction ? 'strict' : 'lax'
   }
 }));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Routes
+// --- API Routes ---
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/withdraw', withdrawRoutes);
 app.use('/api/vaults', vaultsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/user', userRoutes);
-app.use('/api/marketplace', marketplaceRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
-
   try {
     const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const block = await provider.getBlockNumber();
@@ -91,107 +78,57 @@ app.listen(PORT, async () => {
   // --- Initialize All Background Jobs ---
   console.log('🕒 Initializing background jobs with anti-overlap protection...');
 
-  // --- NEW: Define lock variables ---
   let isPollingDeposits = false;
   let isProcessingWithdrawals = false;
   let isProcessingTimeRewards = false;
   let isProcessingVaultWithdrawals = false;
-  let isSweepingDeposits = false;
+  let isSweepingLedger = false; // New lock for our new job
 
-  // Job 1: Poll for new platform deposits
+  // Job 1: Poll for new platform deposits (every 30 seconds)
   const { pollDeposits } = require('./jobs/pollDeposits');
   setInterval(async () => {
-    if (isPollingDeposits) {
-      console.log('SKIPPING: pollDeposits is already running.');
-      return;
-    }
+    if (isPollingDeposits) { return; }
     isPollingDeposits = true;
-    try {
-      await pollDeposits();
-    } catch (e) {
-      console.error('Error in pollDeposits job interval:', e);
-    } finally {
-      isPollingDeposits = false;
-    }
-  }, 30000); // 30 seconds
+    try { await pollDeposits(); } catch (e) { console.error('Error in pollDeposits job:', e); } 
+    finally { isPollingDeposits = false; }
+  }, 30000);
 
-  // Job 2: Process platform withdrawal queue
+  // Job 2: Process platform withdrawal queue (every 45 seconds)
   const { processWithdrawals } = require('./jobs/queueProcessor');
   setInterval(async () => {
-    if (isProcessingWithdrawals) {
-      console.log('SKIPPING: processWithdrawals is already running.');
-      return;
-    }
+    if (isProcessingWithdrawals) { return; }
     isProcessingWithdrawals = true;
-    try {
-      await processWithdrawals();
-    } catch (e) {
-      console.error('Error in processWithdrawals job interval:', e);
-    } finally {
-      isProcessingWithdrawals = false;
-    }
-  }, 45000); // 45 seconds
+    try { await processWithdrawals(); } catch (e) { console.error('Error in processWithdrawals job:', e); }
+    finally { isProcessingWithdrawals = false; }
+  }, 45000);
 
-  // Job 3: Process vault allocations (the sweep job)
- const { sweepDepositsToTradingDesk } = require('./jobs/sweepDeposits');
+  // Job 3: Sweep newly deposited funds to the trading desk (every 10 minutes)
+  const { processLedgerSweeps } = require('./jobs/processLedgerSweeps');
   const TEN_MINUTES_IN_MS = 10 * 60 * 1000;
   setInterval(async () => {
-    if (isSweepingDeposits) {
-      console.log('SKIPPING: sweepDepositsToTradingDesk is already running.');
-      return;
-    }
-    isSweepingDeposits = true;
-    try {
-      await sweepDepositsToTradingDesk();
-    } catch (e) {
-      console.error('Error in sweepDepositsToTradingDesk job interval:', e);
-    } finally {
-      isSweepingDeposits = false;
-    }
-  }, TEN_MINUTES_IN_MS); // Runs every 10 minutes
+    if (isSweepingLedger) { return; }
+    isSweepingLedger = true;
+    try { await processLedgerSweeps(); } catch (e) { console.error('Error in processLedgerSweeps job:', e); }
+    finally { isSweepingLedger = false; }
+  }, TEN_MINUTES_IN_MS);
 
-  // Job 4: Award time-weighted staking XP and update tiers
+  // Job 4: Award time-weighted staking XP (every 24 hours)
   const { processTimeWeightedRewards } = require('./jobs/awardStakingXP');
   const TWENTY_FOUR_HOURS_IN_MS = 24 * 60 * 60 * 1000;
   setInterval(async () => {
-    if (isProcessingTimeRewards) {
-      console.log('SKIPPING: processTimeWeightedRewards is already running.');
-      return;
-    }
+    if (isProcessingTimeRewards) { return; }
     isProcessingTimeRewards = true;
-    try {
-      await processTimeWeightedRewards();
-    } catch (e) {
-      console.error('Error in processTimeWeightedRewards job interval:', e);
-    } finally {
-      isProcessingTimeRewards = false;
-    }
-  }, TWENTY_FOUR_HOURS_IN_MS); // Runs once every 24 hours
+    try { await processTimeWeightedRewards(); } catch (e) { console.error('Error in processTimeWeightedRewards job:', e); }
+    finally { isProcessingTimeRewards = false; }
+  }, TWENTY_FOUR_HOURS_IN_MS);
 
-  // Run once on startup for testing purposes
-  // Note: We wrap this in the same protection to avoid conflict with the first interval run
-  (async () => {
-    if (isProcessingTimeRewards) return;
-    isProcessingTimeRewards = true;
-    await processTimeWeightedRewards();
-    isProcessingTimeRewards = false;
-  })();
-
-  // Job 5: Process pending INTERNAL vault withdrawals
+  // Job 5: Process pending INTERNAL vault withdrawals (every minute)
   const { processPendingVaultWithdrawals } = require('./jobs/processVaultWithdrawals');
   const SIXTY_SECONDS_IN_MS = 60 * 1000;
   setInterval(async () => {
-    if (isProcessingVaultWithdrawals) {
-      console.log('SKIPPING: processPendingVaultWithdrawals is already running.');
-      return;
-    }
+    if (isProcessingVaultWithdrawals) { return; }
     isProcessingVaultWithdrawals = true;
-    try {
-      await processPendingVaultWithdrawals();
-    } catch (e) {
-      console.error('Error in processPendingVaultWithdrawals job interval:', e);
-    } finally {
-      isProcessingVaultWithdrawals = false;
-    }
-  }, SIXTY_SECONDS_IN_MS); // Runs once every minute
+    try { await processPendingVaultWithdrawals(); } catch (e) { console.error('Error in processVaultWithdrawals job:', e); }
+    finally { isProcessingVaultWithdrawals = false; }
+  }, SIXTY_SECONDS_IN_MS);
 });
