@@ -22,7 +22,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
     if (totalAmount_BN.lt(minAllocation_BN)) { return res.status(400).json({ error: 'Minimum allocation is $100.' }); }
 
     await client.query('BEGIN');
-    const userResult = await client.query('SELECT balance, referred_by_user_id, account_tier FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
+    const userResult = await client.query('SELECT balance::text as balance, referred_by_user_id, account_tier FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
     const vaultResult = await client.query('SELECT fee_percentage, is_fee_tier_based FROM vaults WHERE vault_id = $1', [vaultId]);
     if (userResult.rows.length === 0) throw new Error("User not found.");
     if (vaultResult.rows.length === 0) throw new Error(`Vault ${vaultId} not found.`);
