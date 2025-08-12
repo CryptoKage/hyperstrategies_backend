@@ -5,6 +5,7 @@ const { ethers } = require('ethers');
 const authenticateToken = require('../middleware/authenticateToken');
 const isAdmin = require('../middleware/isAdmin');
 const { sweepDepositsToTradingDesk } = require('../jobs/sweepDeposits');
+const { processLedgerSweeps } = require('../jobs/processLedgerSweeps');
 
 // Authenticate first, then verify admin status via asynchronous DB lookup.
 router.use(authenticateToken);
