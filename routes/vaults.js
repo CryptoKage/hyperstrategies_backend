@@ -49,7 +49,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
     const depositFeeAmount = ethers.utils.formatUnits(bonusPointsAmount_BN, 6);
 
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalance_BN, 6), userId]);
-    await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'DEPOSIT', $3)`,[userId, vaultId, tradableAmount]);
+    await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,[userId, vaultId, tradableAmount]);
     await client.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, depositFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
     
     // --- YOUR TREASURY & XP LOGIC (NOW INCLUDED AND CORRECT) ---
@@ -115,7 +115,7 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Withdrawal amount exceeds your capital in this vault.' });
     }
-    await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) VALUES ($1, $2, 'WITHDRAWAL_REQUEST', $3)`, [userId, vaultId, -withdrawalAmount]);
+    await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'WITHDRAWAL_REQUEST', $3, 'PENDING_APPROVAL')`, [userId, vaultId, -withdrawalAmount]);
     const description = `Requested withdrawal of ${withdrawalAmount.toFixed(2)} USDC from Vault ${vaultId}.`;
     await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING')`, [userId, description, withdrawalAmount]);
     await client.query('COMMIT');
