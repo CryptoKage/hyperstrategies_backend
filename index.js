@@ -6,6 +6,8 @@ const helmet = require('helmet');
 const session = require('express-session');
 const passport = require('passport');
 const ethers = require('ethers');
+const pinsRouter = require('./routes/pins');
+const adminPinsRouter = require('./routes/adminPins');
 
 dotenv.config();
 
@@ -64,6 +66,8 @@ app.use('/api/withdraw', withdrawRoutes);
 app.use('/api/vaults', vaultsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/user', userRoutes);
+app.use('/api/pins', pinsRouter);
+app.use('/api/admin/pins', adminPinsRouter);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
