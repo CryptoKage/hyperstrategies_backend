@@ -293,8 +293,44 @@ router.get('/treasury-report', async (req, res) => {
   
 router.post('/trigger-sweep', (req, res) => {
   console.log(`[ADMIN] Manual capital sweep triggered by admin user: ${req.user.id}`);
-  sweepDepositsToTradingDesk(); // It must call the NEW job
+  sweepDepositsToTradingDesk(); 
   res.status(202).json({ message: 'Capital sweep job has been successfully triggered. Check server logs for progress.' });
+});
+
+// --- NEW Endpoint for an Admin to Approve a Vault Withdrawal ---
+router.post('/approve-withdrawal/:activityId', async (req, res) => {
+  const { activityId } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const requestResult = await client.query(
+      `SELECT user_id, amount_primary, description FROM user_activity_log WHERE activity_id = $1 AND activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND status = 'PENDING'`,
+      [activityId]
+    );
+    if (requestResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Pending withdrawal request not found or already processed.' });
+    }
+    const request = requestResult.rows[0];
+    const { user_id, description } = request;
+    const vaultIdMatch = description.match(/from Vault (\d+)/);
+    const vaultId = vaultIdMatch ? parseInt(vaultIdMatch[1], 10) : null;
+    if (!vaultId) throw new Error('Could not parse vault ID from withdrawal description.');
+    
+    await client.query(
+      `UPDATE vault_ledger_entries SET status = 'PENDING_PROCESS' WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'WITHDRAWAL_REQUEST' AND status = 'PENDING_APPROVAL'`,
+      [user_id, vaultId]
+    );
+    await client.query("UPDATE user_activity_log SET status = 'PROCESSING' WHERE activity_id = $1", [activityId]);
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Withdrawal ${activityId} approved. It will be processed by the next background job run.` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`Error approving withdrawal ${activityId}:`, err);
+    res.status(500).send('Server Error');
+  } finally {
+    client.release();
+  }
 });
 
 router.post('/buyback-points', async (req, res) => {
