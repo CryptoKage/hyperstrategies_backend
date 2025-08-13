@@ -11,7 +11,7 @@ const router = express.Router();
 // --- Allocate Funds to Vault Endpoint (FINAL with safe parsing) ---
 router.post('/invest', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.user_id;
     const dbClient = await pool.connect();
 
     try {
