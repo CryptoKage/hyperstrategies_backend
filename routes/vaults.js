@@ -16,7 +16,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
     try {
         const investmentAmountStr = amount.toString();
-        const vaultDataResult = await dbClient.query('SELECT * FROM vaults WHERE id = $1', [vaultId]);
+        const vaultDataResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
         if (vaultDataResult.rows.length === 0) throw new Error(`Vault ${vaultId} not found.`);
         const theVault = vaultDataResult.rows[0];
         const tokenDecimals = theVault.token_decimals;
