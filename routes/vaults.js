@@ -153,8 +153,9 @@ router.post('/calculate-investment-fee', authenticateToken, async (req, res) => 
     const dbClient = await pool.connect();
     try {
         // --- Fetch Vault and User Data ---
-        const vaultResult = await dbClient.query('SELECT * FROM vaults WHERE id = $1', [vaultId]);
-        const userResult = await dbClient.query('SELECT account_tier FROM users WHERE id = $1', [userId]);
+        const vaultResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
+        // --- THE FIX: Query the users table using 'user_id' ---
+        const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
 
         if (vaultResult.rows.length === 0 || userResult.rows.length === 0) {
             throw new Error('User or Vault not found for fee calculation.');
