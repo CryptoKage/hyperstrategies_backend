@@ -34,7 +34,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
         if (userResult.rows.length === 0) throw new Error("User not found.");
         const theUser = userResult.rows[0];
 
-        const userBalanceBigNum = ethers.BigNumber.from(theUser.balance);
+          const userBalanceBigNum = ethers.utils.parseUnits(theUser.balance.toString(), tokenDecimals);
         if (userBalanceBigNum.lt(investmentAmountBigNum)) {
             await dbClient.query('ROLLBACK');
             return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
