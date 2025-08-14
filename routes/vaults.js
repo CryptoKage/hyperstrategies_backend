@@ -10,10 +10,8 @@ const router = express.Router();
 
 router.post('/invest', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
-    // --- THE FIX: Read 'id' from the JWT payload ---
     const userId = req.user.id; 
     const dbClient = await pool.connect();
-
     try {
         const investmentAmountStr = amount.toString();
         const vaultDataResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
@@ -21,25 +19,28 @@ router.post('/invest', authenticateToken, async (req, res) => {
         const theVault = vaultDataResult.rows[0];
         const tokenDecimals = theVault.token_decimals || 6;
 
+        // Use string-based validation
+        const decimalPattern = new RegExp(`^\\d+(\\.\\d{1,${tokenDecimals}})?$`);
+        if (!decimalPattern.test(investmentAmountStr)) { return res.status(400).json({ messageKey: 'errors.invalidAmountFormat' }); }
+
         const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmountStr, tokenDecimals);
-        const minAllocationBigNum = ethers.utils.parseUnits(theVault.min_allocation_usd || '100', tokenDecimals);
+        const minAllocationBigNum = ethers.utils.parseUnits((theVault.min_allocation_usd || '100').toString(), tokenDecimals);
         if (investmentAmountBigNum.lt(minAllocationBigNum)) {
             return res.status(400).json({ messageKey: 'errors.minimumAllocation' });
         }
 
         await dbClient.query('BEGIN');
-
-        // --- THE FIX: Query the users table using the correct column 'user_id' ---
-        const userResult = await dbClient.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
+        const userResult = await dbClient.query('SELECT user_id, balance, account_tier, referred_by_user_id FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
         if (userResult.rows.length === 0) throw new Error("User not found.");
         const theUser = userResult.rows[0];
 
-          const userBalanceBigNum = ethers.utils.parseUnits(theUser.balance.toString(), tokenDecimals);
+        const userBalanceBigNum = ethers.utils.parseUnits(theUser.balance.toString(), tokenDecimals);
         if (userBalanceBigNum.lt(investmentAmountBigNum)) {
             await dbClient.query('ROLLBACK');
             return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
         }
 
+        // --- Fee Calculation Logic (from your /calculate-investment-fee endpoint) ---
         let feeBasisPointsAfterTiers = ethers.BigNumber.from(theVault.deposit_fee_bps ?? 0);
         if (theVault.is_fee_tier_based) {
             const tierDiscountBps = (theUser.account_tier - 1) * 200;
@@ -47,12 +48,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
             if (feeBasisPointsAfterTiers.lt(100)) feeBasisPointsAfterTiers = ethers.BigNumber.from(100);
         }
 
-        const userPinsResult = await dbClient.query(`
-            SELECT pd.pin_effects_config FROM user_pins up
-            JOIN pin_definitions pd ON up.pin_name = pd.pin_name
-            WHERE up.user_id = $1 AND pd.pin_effects_config IS NOT NULL;
-        `, [userId]);
-
+        const userPinsResult = await dbClient.query(`SELECT pd.pin_effects_config FROM user_pins up JOIN pin_definitions pd ON up.pin_name = pd.pin_name WHERE up.user_id = $1 AND pd.pin_effects_config IS NOT NULL;`, [userId]);
         let pinDiscountRate = ethers.BigNumber.from(0);
         if (userPinsResult.rows.length > 0) {
             for (const perk of userPinsResult.rows) {
@@ -68,17 +64,18 @@ router.post('/invest', authenticateToken, async (req, res) => {
         const finalFeeBasisPoints = feeBasisPointsAfterTiers.mul(discountMultiplier).div(100);
         const finalizedFeeComponent = investmentAmountBigNum.mul(finalFeeBasisPoints).div(10000);
         const capitalForTrade = investmentAmountBigNum.sub(finalizedFeeComponent);
-        const awardedBonusPoints = finalizedFeeComponent.div(ethers.utils.parseUnits('1', tokenDecimals - 2));
-
+        
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
-        // --- THE FIX: Update the users table using the correct column 'user_id' ---
-        await dbClient.query('UPDATE users SET balance = $1, bonus_points = bonus_points + $2 WHERE user_id = $3', [newBalanceBigNum.toString(), awardedBonusPoints.toString(), userId]);
+        const bonusPointsAwarded = ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals);
+
+        // --- Database Writes (using the new ledger system) ---
+        await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
+        await dbClient.query(`INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)`, [userId, bonusPointsAwarded, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         
         await dbClient.query(
-            `INSERT INTO vault_ledger_entries (user_id, vault_id, transaction_type, amount, fee_paid, status) VALUES ($1, $2, 'DEPOSIT', $3, $4, 'PENDING_SWEEP')`,
-            [userId, vaultId, capitalForTrade.toString(), finalizedFeeComponent.toString()]
+            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,
+            [userId, vaultId, ethers.utils.formatUnits(capitalForTrade, tokenDecimals)]
         );
-        
         // Your treasury and XP logic was also broken by my incorrect column names.
         // It has been corrected to use 'user_id' where appropriate.
         const feeToDistributeStr = ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals);
