@@ -8,6 +8,7 @@ const passport = require('passport');
 const ethers = require('ethers');
 const pinsRouter = require('./routes/pins');
 const adminPinsRouter = require('./routes/adminPins');
+const wsProvider = require('./utils/alchemyWebsocketProvider');
 
 dotenv.config();
 
@@ -88,14 +89,18 @@ app.listen(PORT, async () => {
   let isProcessingVaultWithdrawals = false;
   let isSweepingLedger = false; // New lock for our new job
 
-  // Job 1: Poll for new platform deposits (every 30 seconds)
-  const { pollDeposits } = require('./jobs/pollDeposits');
-  setInterval(async () => {
-    if (isPollingDeposits) { return; }
+  // Job 1: Poll for new platform deposits on each finalized block
+  const { pollDeposits, initializeProvider } = require('./jobs/pollDeposits');
+  initializeProvider();
+  const finalityBuffer = 5;
+  wsProvider.on('block', async (blockNumber) => {
+    const finalizedBlock = blockNumber - finalityBuffer;
+    if (finalizedBlock <= 0 || isPollingDeposits) { return; }
     isPollingDeposits = true;
-    try { await pollDeposits(); } catch (e) { console.error('Error in pollDeposits job:', e); } 
+    try { await pollDeposits({ toBlock: finalizedBlock }); }
+    catch (e) { console.error('Error in pollDeposits job:', e); }
     finally { isPollingDeposits = false; }
-  }, 30000);
+  });
 
   // Job 2: Process platform withdrawal queue (every 45 seconds)
   const { processWithdrawals } = require('./jobs/queueProcessor');
