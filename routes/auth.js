@@ -224,7 +224,18 @@ router.get('/google/callback',
           throw new Error('Failed to assign a unique referral code');
         }
       }
-      const payload = { user: { id: req.user.user_id, username: req.user.username, isAdmin: req.user.is_admin } };
+         const freshUserResult = await pool.query('SELECT * FROM users WHERE user_id = $1', [req.user.user_id]);
+      const freshUser = freshUserResult.rows[0];
+
+      // Now we build the payload with the fresh data, including the account_tier.
+      const payload = { 
+        user: { 
+          id: freshUser.user_id, 
+          username: freshUser.username, 
+          isAdmin: freshUser.is_admin,
+          account_tier: freshUser.account_tier // This is the crucial piece
+        } 
+      };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
       res.redirect(`${frontend}/oauth-success?token=${token}`);
