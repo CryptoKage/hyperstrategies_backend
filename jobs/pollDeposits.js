@@ -20,27 +20,30 @@ async function initializeProvider() {
   }
 }
 
-async function pollDeposits() {
+async function pollDeposits({ toBlock: toBlockOverride } = {}) {
   console.log('🔄 Checking for new deposits by transaction hash...');
   const client = await pool.connect();
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
-    
+
     if (!lastCheckedBlockResult.rows[0]) {
         throw new Error("FATAL: 'lastCheckedBlock' key not found in system_state table. Please initialize it.");
     }
     const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
-    const latestBlock = await alchemy.core.getBlockNumber();
 
-    // --- FIX 1: Add a finality buffer to prevent scanning unconfirmed blocks ---
-    const finalityBuffer = 5; // A safe number of blocks to wait for finality
-    const toBlock = latestBlock - finalityBuffer;
+    let toBlock;
+    if (typeof toBlockOverride === 'number') {
+      toBlock = toBlockOverride;
+    } else {
+      const latestBlock = await alchemy.core.getBlockNumber();
+      const finalityBuffer = 5; // wait for finality when polling without override
+      toBlock = latestBlock - finalityBuffer;
+    }
 
-    const lookbackBlocks = 20;
-    const fromBlock = Math.max(0, lastProcessedBlock - lookbackBlocks);
-    
+    const fromBlock = lastProcessedBlock + 1; // minimal lookback
+
     console.log(`Scanning from block #${fromBlock} to #${toBlock}`);
-    if (fromBlock >= toBlock) {
+    if (fromBlock > toBlock) {
       return;
     }
 
