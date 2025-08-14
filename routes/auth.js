@@ -166,8 +166,7 @@ router.post(
 
     try {
       const { email, password } = req.body;
-      const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin FROM users WHERE email = $1', [email]);
-
+        const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin, account_tier FROM users WHERE email = $1', [email]);
       if (result.rows.length === 0) {
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
@@ -179,7 +178,14 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
 
-      const payload = { user: { id: user.user_id, username: user.username, isAdmin: user.is_admin } };
+          const payload = { 
+        user: { 
+          id: user.user_id, 
+          username: user.username, 
+          isAdmin: user.is_admin,
+          account_tier: user.account_tier // This is the new, crucial piece of data
+        } 
+      };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
       res.json({ token });
