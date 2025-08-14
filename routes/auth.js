@@ -61,7 +61,6 @@ router.post(
     let client;
     try {
       client = await pool.connect();
-      // --- Start Database Transaction ---
       await client.query('BEGIN');
 
       const emailCheck = await client.query('SELECT user_id FROM users WHERE email = $1', [email]);
@@ -94,8 +93,9 @@ router.post(
       const passwordHash = await bcrypt.hash(password, salt);
       const wallet = generateWallet();
       const encryptedKey = encrypt(wallet.privateKey);
-
-      // --- THE FIX: The new user query no longer includes the 'tags' column ---
+      
+      // --- THE FIX: The INSERT query no longer mentions 'tags' or 'pins' ---
+      // This now perfectly matches your 'users' table DDL.
       const newUserQuery = `
         INSERT INTO users (email, password_hash, username, google_id, balance, eth_address, eth_private_key_encrypted, referred_by_user_id, xp, bio, theme, referral_code, is_admin, account_tier)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
@@ -127,11 +127,9 @@ router.post(
       const newlyCreatedUser = newUserResult.rows[0];
       const newUserId = newlyCreatedUser.user_id;
 
-      // --- THE FIX: Assign initial pins to the new user in the correct 'user_pins' table ---
-      const initialPinsToAssign = ['EARLY_SUPPORTER']; // Every new user gets this pin by default.
-      
-      // We can re-introduce the syndicate logic here, reading from the DB.
-      // For now, this is a safe default.
+      // --- THE FIX: Assign initial pins in the correct 'user_pins' table ---
+      const initialPinsToAssign = ['EARLY_SUPPORTER']; // Default pin for all new users.
+      // We can add logic here later to check the referrerId and add a syndicate pin.
       
       for (const pinName of initialPinsToAssign) {
         await client.query(
@@ -140,7 +138,6 @@ router.post(
         );
       }
 
-      // --- Commit the entire transaction ---
       await client.query('COMMIT');
       res.status(201).json({ message: 'User created successfully', user: newlyCreatedUser });
 
