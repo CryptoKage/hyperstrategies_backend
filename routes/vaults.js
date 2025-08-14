@@ -19,10 +19,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
         const theVault = vaultDataResult.rows[0];
         const tokenDecimals = theVault.token_decimals || 6;
 
-        // Use string-based validation
-        const decimalPattern = new RegExp(`^\\d+(\\.\\d{1,${tokenDecimals}})?$`);
-        if (!decimalPattern.test(investmentAmountStr)) { return res.status(400).json({ messageKey: 'errors.invalidAmountFormat' }); }
-
         const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmountStr, tokenDecimals);
         const minAllocationBigNum = ethers.utils.parseUnits((theVault.min_allocation_usd || '100').toString(), tokenDecimals);
         if (investmentAmountBigNum.lt(minAllocationBigNum)) {
@@ -30,7 +26,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
         }
 
         await dbClient.query('BEGIN');
-        const userResult = await dbClient.query('SELECT user_id, balance, account_tier, referred_by_user_id FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
+        const userResult = await dbClient.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
         if (userResult.rows.length === 0) throw new Error("User not found.");
         const theUser = userResult.rows[0];
 
@@ -40,7 +36,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
             return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
         }
 
-        // --- Fee Calculation Logic (from your /calculate-investment-fee endpoint) ---
+        // --- THIS IS THE CORRECT, FULL FEE CALCULATION LOGIC ---
         let feeBasisPointsAfterTiers = ethers.BigNumber.from(theVault.deposit_fee_bps ?? 0);
         if (theVault.is_fee_tier_based) {
             const tierDiscountBps = (theUser.account_tier - 1) * 200;
@@ -64,13 +60,13 @@ router.post('/invest', authenticateToken, async (req, res) => {
         const finalFeeBasisPoints = feeBasisPointsAfterTiers.mul(discountMultiplier).div(100);
         const finalizedFeeComponent = investmentAmountBigNum.mul(finalFeeBasisPoints).div(10000);
         const capitalForTrade = investmentAmountBigNum.sub(finalizedFeeComponent);
-        
+        // --- END OF FEE CALCULATION LOGIC ---
+
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         const bonusPointsAwarded = ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals);
 
-        // --- Database Writes (using the new ledger system) ---
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
-        await dbClient.query(`INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)`, [userId, bonusPointsAwarded, `DEPOSIT_FEE_VAULT_${vaultId}`]);
+        await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, bonusPointsAwarded, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         
         await dbClient.query(
             `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,
