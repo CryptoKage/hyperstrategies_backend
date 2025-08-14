@@ -24,18 +24,14 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
     const theVault = vaultResult.rows[0];
     const theUser = userResult.rows[0];
 
-    // Convert decimal fee (e.g., 0.20) to a percentage (e.g., 20)
     const baseFeePct = parseFloat(theVault.fee_percentage) * 100;
-
-    // Calculate Tier Discount Percentage
     let tierDiscountPct = 0;
     if (theVault.is_fee_tier_based && theUser.account_tier > 1) {
-        tierDiscountPct = (theUser.account_tier - 1) * 2.0; // 2% per tier
+        tierDiscountPct = (theUser.account_tier - 1) * 2.0;
     }
 
-    // Calculate TOTAL Pin Discount Percentage by summing all applicable pins
     const userPinsResult = await dbClient.query(`
-        SELECT pd.pin_name, pd.pin_effects_config FROM user_pins up
+        SELECT pd.pin_effects_config FROM user_pins up
         JOIN pin_definitions pd ON up.pin_name = pd.pin_name
         WHERE up.user_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;
     `, [userId]);
@@ -50,12 +46,10 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
         }
     }
 
-    // Calculate Final Fee Percentage
     let finalFeePct = baseFeePct - tierDiscountPct - totalPinDiscountPct;
-    if (finalFeePct < 0.5) finalFeePct = 0.5; // Ensure fee doesn't go below a minimum
+    if (finalFeePct < 0.5) finalFeePct = 0.5;
     const finalTradablePct = 100 - finalFeePct;
 
-    // Calculate all dollar amounts using BigNumber for precision
     const baseFeeAmount = investmentAmountBigNum.mul(Math.round(baseFeePct * 100)).div(10000);
     const tierDiscountAmount = investmentAmountBigNum.mul(Math.round(tierDiscountPct * 100)).div(10000);
     const pinDiscountAmount = investmentAmountBigNum.mul(Math.round(totalPinDiscountPct * 100)).div(10000);
@@ -79,8 +73,10 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
 
 router.post('/calculate-investment-fee', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
+    // --- THE FIX 1: Use the correct JWT property 'id' ---
     const userId = req.user.id;
     const numericAmount = parseFloat(amount);
+
     if (!vaultId || isNaN(numericAmount) || numericAmount <= 0) {
         return res.status(200).json(null);
     }
@@ -99,6 +95,7 @@ router.post('/calculate-investment-fee', authenticateToken, async (req, res) => 
 
 router.post('/invest', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
+    // --- THE FIX 2: Use the correct JWT property 'id' ---
     const userId = req.user.id;
     const dbClient = await pool.connect();
     try {
@@ -119,12 +116,10 @@ router.post('/invest', authenticateToken, async (req, res) => {
             return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
         }
 
-        // Run the new authoritative calculation to get the final, correct numbers
         const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, numericAmount);
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         
-        // --- PRESERVED ORIGINAL LOGIC ---
-        // Write to all the same tables as your original code, using the new accurate numbers.
+        // This is your original logic, now using the correct numbers from our calculation
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
         await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, feeBreakdown.finalFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         await dbClient.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`, [userId, vaultId, feeBreakdown.finalTradableAmount]);
@@ -146,7 +141,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
         if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
             await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, theUser.referred_by_user_id]);
         }
-        // --- END OF PRESERVED LOGIC ---
 
         await dbClient.query('COMMIT');
         res.status(200).json({ message: 'Allocation successful!' });
