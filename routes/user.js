@@ -126,26 +126,7 @@ router.get('/activity-log', authenticateToken, async (req, res) => {
   }
 });
 
-// --- Get User Profile Endpoint ---
-// This version is the correct, up-to-date one.
-router.get('/profile', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const [profileResult, stakedResult] = await Promise.all([
-      pool.query(`SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, u.tags, COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
-        FROM users u LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
-        WHERE u.user_id = $1 GROUP BY u.user_id;`, [userId]),
-      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId])
-    ]);
-    if (profileResult.rows.length === 0) { return res.status(404).json({ error: 'User not found.' }); }
-    const profileData = profileResult.rows[0];
-    const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
-    res.json({ ...profileData, total_staked_capital: totalStakedCapital });
-  } catch (err) {
-    console.error('Error fetching profile data:', err);
-    res.status(500).send('Server Error');
-  }
-});
+
 
 
 // --- Get Leaderboard Endpoint ---
