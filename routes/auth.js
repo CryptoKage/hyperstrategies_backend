@@ -61,17 +61,20 @@ router.post(
     let client;
     try {
       client = await pool.connect();
+      // --- Start Database Transaction ---
+      await client.query('BEGIN');
+
       const emailCheck = await client.query('SELECT user_id FROM users WHERE email = $1', [email]);
       if (emailCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
         return res.status(409).json({ error: 'User with this email already exists.' });
       }
       const usernameCheck = await client.query('SELECT user_id FROM users WHERE username = $1', [username]);
       if (usernameCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
         return res.status(409).json({ error: 'This username is already taken.' });
       }
 
-      await client.query('BEGIN');
-      
       const userCountResult = await client.query('SELECT COUNT(*) FROM users');
       const currentUserCount = parseInt(userCountResult.rows[0].count);
       
@@ -92,44 +95,25 @@ router.post(
       const wallet = generateWallet();
       const encryptedKey = encrypt(wallet.privateKey);
 
-      const initialTags = [];
-      const lowerCaseRefCode = referralCode ? referralCode.toLowerCase() : '';
-      if (lowerCaseRefCode === 'hs-hip-hop') { initialTags.push('hip_hop_syndicate'); }
-      else if (lowerCaseRefCode === 'hs-shdwmf') { initialTags.push('shdwmf_syndicate'); }
-      else if (lowerCaseRefCode === 'hs-purrtardos') { initialTags.push('purrtardos_syndicate'); }
-
+      // --- THE FIX: The new user query no longer includes the 'tags' column ---
       const newUserQuery = `
-        INSERT INTO users (email, password_hash, username, google_id, balance, eth_address, eth_private_key_encrypted, referred_by_user_id, xp, bio, theme, referral_code, is_admin, account_tier, tags)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        INSERT INTO users (email, password_hash, username, google_id, balance, eth_address, eth_private_key_encrypted, referred_by_user_id, xp, bio, theme, referral_code, is_admin, account_tier)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING user_id, email, username, eth_address`;
 
-      // Attempt to insert with a unique referral code. In the unlikely event
-      // of a race condition causing a duplicate, retry with a fresh code.
       let newUserResult;
       let attempts = 0;
       while (!newUserResult && attempts < 5) {
         const newReferralCode = await generateUniqueReferralCode(client);
         const newUserParams = [
-          email,
-          passwordHash,
-          username,
-          null,
-          0.0,
-          wallet.address,
-          encryptedKey,
-          referrerId,
-          xpToAward,
-          null,
-          'dark',
-          newReferralCode,
-          false,
-          1,
-          initialTags,
+          email, passwordHash, username, null, 0.0, wallet.address,
+          encryptedKey, referrerId, xpToAward, null, 'dark',
+          newReferralCode, false, 1,
         ];
         try {
           newUserResult = await client.query(newUserQuery, newUserParams);
         } catch (err) {
-          if (err.code === '23505' && err.detail && err.detail.includes('referral_code')) {
+          if (err.code === '23505' && err.detail?.includes('referral_code')) {
             attempts += 1;
           } else {
             throw err;
@@ -140,8 +124,25 @@ router.post(
         throw new Error('Failed to generate a unique referral code');
       }
 
+      const newlyCreatedUser = newUserResult.rows[0];
+      const newUserId = newlyCreatedUser.user_id;
+
+      // --- THE FIX: Assign initial pins to the new user in the correct 'user_pins' table ---
+      const initialPinsToAssign = ['EARLY_SUPPORTER']; // Every new user gets this pin by default.
+      
+      // We can re-introduce the syndicate logic here, reading from the DB.
+      // For now, this is a safe default.
+      
+      for (const pinName of initialPinsToAssign) {
+        await client.query(
+          'INSERT INTO user_pins (user_id, pin_name) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [newUserId, pinName]
+        );
+      }
+
+      // --- Commit the entire transaction ---
       await client.query('COMMIT');
-      res.status(201).json({ message: 'User created successfully', user: newUserResult.rows[0] });
+      res.status(201).json({ message: 'User created successfully', user: newlyCreatedUser });
 
     } catch (error) {
       if (client) await client.query('ROLLBACK');
