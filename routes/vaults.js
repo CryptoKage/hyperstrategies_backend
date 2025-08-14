@@ -16,8 +16,12 @@ router.post('/invest', authenticateToken, async (req, res) => {
         const investmentAmountStr = amount.toString();
         const vaultDataResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
         if (vaultDataResult.rows.length === 0) throw new Error(`Vault ${vaultId} not found.`);
+        
         const theVault = vaultDataResult.rows[0];
-        const tokenDecimals = theVault.token_decimals || 6;
+        const tokenDecimals = tokenMap.usdc.decimals;
+        
+        const decimalPattern = new RegExp(`^\\d+(\\.\\d{1,${tokenDecimals}})?$`);
+        if (!decimalPattern.test(investmentAmountStr)) { return res.status(400).json({ messageKey: 'errors.invalidAmountFormat' }); }
 
         const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmountStr, tokenDecimals);
         const minAllocationBigNum = ethers.utils.parseUnits((theVault.min_allocation_usd || '100').toString(), tokenDecimals);
@@ -36,42 +40,34 @@ router.post('/invest', authenticateToken, async (req, res) => {
             return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
         }
 
-        // --- THIS IS THE CORRECT, FULL FEE CALCULATION LOGIC ---
-        let feeBasisPointsAfterTiers = ethers.BigNumber.from(theVault.deposit_fee_bps ?? 0);
+        // --- Re-calculating the fee here to ensure server-side authority ---
+        const baseFeePercentage = parseFloat(theVault.fee_percentage);
+        let finalFeePercentage = baseFeePercentage;
         if (theVault.is_fee_tier_based) {
-            const tierDiscountBps = (theUser.account_tier - 1) * 200;
-            feeBasisPointsAfterTiers = feeBasisPointsAfterTiers.sub(tierDiscountBps);
-            if (feeBasisPointsAfterTiers.lt(100)) feeBasisPointsAfterTiers = ethers.BigNumber.from(100);
+            const tierDiscount = (theUser.account_tier - 1) * 0.02;
+            finalFeePercentage = Math.max(0.10, baseFeePercentage - tierDiscount);
         }
 
-        const userPinsResult = await dbClient.query(`SELECT pd.pin_effects_config FROM user_pins up JOIN pin_definitions pd ON up.pin_name = pd.pin_name WHERE up.user_id = $1 AND pd.pin_effects_config IS NOT NULL;`, [userId]);
-        let pinDiscountRate = ethers.BigNumber.from(0);
+        const userPinsResult = await dbClient.query(`SELECT pd.pin_effects_config FROM user_pins up JOIN pin_definitions pd ON up.pin_name = pd.pin_name WHERE up.user_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;`, [userId]);
+        let pinDiscountPercentage = 0;
         if (userPinsResult.rows.length > 0) {
             for (const perk of userPinsResult.rows) {
                 const effects = perk.pin_effects_config;
-                if (effects && effects.fee_discount_pct) {
-                    const currentPinDiscount = ethers.BigNumber.from(effects.fee_discount_pct);
-                    if (currentPinDiscount.gt(pinDiscountRate)) pinDiscountRate = currentPinDiscount;
+                if(effects && effects.deposit_fee_discount_pct) {
+                    const currentPinDiscount = parseFloat(effects.deposit_fee_discount_pct);
+                    if (currentPinDiscount > pinDiscountPercentage) pinDiscountPercentage = currentPinDiscount;
                 }
             }
         }
         
-        const discountMultiplier = ethers.BigNumber.from(100).sub(pinDiscountRate);
-        const finalFeeBasisPoints = feeBasisPointsAfterTiers.mul(discountMultiplier).div(100);
-        const finalizedFeeComponent = investmentAmountBigNum.mul(finalFeeBasisPoints).div(10000);
+        const finalFeeAfterPins = finalFeePercentage * (1 - (pinDiscountPercentage / 100.0));
+        const finalizedFeeComponent = investmentAmountBigNum.mul(Math.round(finalFeeAfterPins * 10000)).div(10000);
         const capitalForTrade = investmentAmountBigNum.sub(finalizedFeeComponent);
-        // --- END OF FEE CALCULATION LOGIC ---
-
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
-        const bonusPointsAwarded = ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals);
-
-        await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
-        await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, bonusPointsAwarded, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         
-        await dbClient.query(
-            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,
-            [userId, vaultId, ethers.utils.formatUnits(capitalForTrade, tokenDecimals)]
-        );
+        await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
+        await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals), `DEPOSIT_FEE_VAULT_${vaultId}`]);
+        await dbClient.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`, [userId, vaultId, ethers.utils.formatUnits(capitalForTrade, tokenDecimals)]);
         // Your treasury and XP logic was also broken by my incorrect column names.
         // It has been corrected to use 'user_id' where appropriate.
         const feeToDistributeStr = ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals);
@@ -94,89 +90,78 @@ router.post('/invest', authenticateToken, async (req, res) => {
             await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, theUser.referred_by_user_id]);
         }
 
-        await dbClient.query('COMMIT');
+     await dbClient.query('COMMIT');
         res.status(200).json({ message: 'Allocation successful!' });
-
     } catch (err) {
-        await dbClient.query('ROLLBACK');
+        if(dbClient) await dbClient.query('ROLLBACK');
         console.error('Allocation transaction error:', err);
         res.status(500).json({ message: 'An error occurred during the allocation process.' });
     } finally {
-        dbClient.release();
+        if(dbClient) dbClient.release();
     }
 });
 
 router.post('/calculate-investment-fee', authenticateToken, async (req, res) => {
-const { vaultId, amount } = req.body;
-const userId = req.user.id;
-const numericAmount = parseFloat(amount);
-if (!vaultId || isNaN(numericAmount) || numericAmount <= 0) {
-    return res.status(200).json({ baseFee: '0', finalFee: '0' });
-}
-const dbClient = await pool.connect();
-try {
-    const vaultResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
-    const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
-
-    if (vaultResult.rows.length === 0 || userResult.rows.length === 0) {
-        throw new Error('User or Vault not found for fee calculation.');
+    const { vaultId, amount } = req.body;
+    const userId = req.user.id; 
+    const numericAmount = parseFloat(amount);
+    if (!vaultId || isNaN(numericAmount) || numericAmount <= 0) {
+        return res.status(200).json({ baseFee: '0', finalFee: '0', netInvestment: '0' });
     }
-    const theVault = vaultResult.rows[0];
-    const theUser = userResult.rows[0];
-    // --- THIS IS THE CORE LOGIC CHANGE ---
-    // Use USDC decimals from our tokenMap, and get fee_percentage
-    const tokenDecimals = tokenMap.usdc.decimals;
-    const baseFeePercentage = parseFloat(theVault.fee_percentage); // e.g., 0.20
-    const investmentAmountBigNum = ethers.utils.parseUnits(numericAmount.toFixed(tokenDecimals), tokenDecimals);
+    const dbClient = await pool.connect();
+    try {
+        const vaultResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
+        const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
+        if (vaultResult.rows.length === 0 || userResult.rows.length === 0) { throw new Error('User or Vault not found.'); }
+        
+        const theVault = vaultResult.rows[0];
+        const theUser = userResult.rows[0];
+        const tokenDecimals = tokenMap.usdc.decimals; // Standardize on USDC
+        
+        const investmentAmountBigNum = ethers.utils.parseUnits(numericAmount.toFixed(tokenDecimals), tokenDecimals);
+        const baseFeePercentage = parseFloat(theVault.fee_percentage); // e.g., 0.20
 
-    const baseFeeComponent = investmentAmountBigNum.mul(Math.round(baseFeePercentage * 100)).div(100);
+        const baseFeeComponent = investmentAmountBigNum.mul(Math.round(baseFeePercentage * 10000)).div(10000);
 
-    let finalFeePercentage = baseFeePercentage;
-    if (theVault.is_fee_tier_based) {
-        const tierDiscount = (theUser.account_tier - 1) * 0.02; // e.g., 0.02 for Tier 2
-        finalFeePercentage = Math.max(0.10, baseFeePercentage - tierDiscount);
-    }
+        let finalFeePercentage = baseFeePercentage;
+        if (theVault.is_fee_tier_based) {
+            const tierDiscount = (theUser.account_tier - 1) * 0.02;
+            finalFeePercentage = Math.max(0.10, baseFeePercentage - tierDiscount);
+        }
 
-    const userPinsResult = await dbClient.query(`
-        SELECT pd.pin_name, pd.pin_effects_config FROM user_pins up
-        JOIN pin_definitions pd ON up.pin_name = pd.pin_name
-        WHERE up.user_id = $1 AND pd.pin_effects_config->>'fee_discount_pct' IS NOT NULL;
-    `, [userId]);
-
-    let pinDiscountPercentage = 0;
-    let bestPinName = null;
-    if (userPinsResult.rows.length > 0) {
-        for (const perk of userPinsResult.rows) {
-            const effects = perk.pin_effects_config;
-            if(effects && effects.fee_discount_pct) {
-                const currentPinDiscount = parseInt(effects.fee_discount_pct, 10);
-                if (currentPinDiscount > pinDiscountPercentage) {
-                    pinDiscountPercentage = currentPinDiscount;
-                    bestPinName = perk.pin_name;
+        const userPinsResult = await dbClient.query(`SELECT pd.pin_name, pd.pin_effects_config FROM user_pins up JOIN pin_definitions pd ON up.pin_name = pd.pin_name WHERE up.user_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;`, [userId]);
+        let pinDiscountPercentage = 0;
+        let bestPinName = null;
+        if (userPinsResult.rows.length > 0) {
+            for (const perk of userPinsResult.rows) {
+                const effects = perk.pin_effects_config;
+                if(effects && effects.deposit_fee_discount_pct) {
+                    const currentPinDiscount = parseFloat(effects.deposit_fee_discount_pct);
+                    if (currentPinDiscount > pinDiscountPercentage) {
+                        pinDiscountPercentage = currentPinDiscount;
+                        bestPinName = perk.pin_name;
+                    }
                 }
             }
         }
+        
+        const finalFeeAfterPins = finalFeePercentage * (1 - (pinDiscountPercentage / 100.0));
+        const finalizedFeeComponent = investmentAmountBigNum.mul(Math.round(finalFeeAfterPins * 10000)).div(10000);
+
+        res.status(200).json({
+            baseFee: ethers.utils.formatUnits(baseFeeComponent, tokenDecimals),
+            finalFee: ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals),
+            hasPinDiscount: pinDiscountPercentage > 0,
+            pinDiscountPercentage: pinDiscountPercentage.toString(),
+            pinName: bestPinName,
+            netInvestment: ethers.utils.formatUnits(investmentAmountBigNum.sub(finalizedFeeComponent), tokenDecimals)
+        });
+    } catch (error) {
+        console.error('Error in fee calculation endpoint:', error);
+        res.status(200).json({ baseFee: '0', finalFee: '0', netInvestment: '0' });
+    } finally {
+        if (dbClient) dbClient.release();
     }
-    
-    const finalFeeAfterPins = finalFeePercentage * (1 - (pinDiscountPercentage / 100.0));
-    const finalizedFeeComponent = investmentAmountBigNum.mul(Math.round(finalFeeAfterPins * 100)).div(100);
-
-    const feeBreakdownPayload = {
-        baseFee: ethers.utils.formatUnits(baseFeeComponent, tokenDecimals),
-        finalFee: ethers.utils.formatUnits(finalizedFeeComponent, tokenDecimals),
-        hasPinDiscount: pinDiscountPercentage > 0,
-        pinDiscountPercentage: pinDiscountPercentage.toString(),
-        pinName: bestPinName,
-        netInvestment: ethers.utils.formatUnits(investmentAmountBigNum.sub(finalizedFeeComponent), tokenDecimals)
-    };
-    res.status(200).json(feeBreakdownPayload);
-
-} catch (error) {
-    console.error('Error in fee calculation endpoint:', error);
-    res.status(200).json({ baseFee: '0', finalFee: '0' });
-} finally {
-    if (dbClient) dbClient.release();
-}
 });
 
 // Your withdrawal code, corrected to use the right JWT property.
