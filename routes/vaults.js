@@ -1,5 +1,4 @@
 // server/routes/vaults.js
-// FINAL MERGED VERSION: Combines the original business logic with the new authoritative fee calculation engine.
 
 const express = require('express');
 const { ethers } = require('ethers');
@@ -9,80 +8,52 @@ const tokenMap = require('../utils/tokens/tokenMap');
 
 const router = express.Router();
 
-// A centralized function to perform the authoritative fee calculation.
-// This is the new, accurate calculation engine.
 async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAmount) {
     const tokenDecimals = tokenMap.usdc.decimals;
     const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmount.toString(), tokenDecimals);
-
     const vaultResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
     const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
-
-    if (vaultResult.rows.length === 0 || userResult.rows.length === 0) {
-        throw new Error('User or Vault not found for fee calculation.');
-    }
+    if (vaultResult.rows.length === 0 || userResult.rows.length === 0) { throw new Error('User or Vault not found'); }
     const theVault = vaultResult.rows[0];
     const theUser = userResult.rows[0];
-
     const baseFeePct = parseFloat(theVault.fee_percentage) * 100;
     let tierDiscountPct = 0;
     if (theVault.is_fee_tier_based && theUser.account_tier > 1) {
         tierDiscountPct = (theUser.account_tier - 1) * 2.0;
     }
-
     const userPinsResult = await dbClient.query(`
         SELECT pd.pin_effects_config FROM user_pins up
         JOIN pin_definitions pd ON up.pin_name = pd.pin_name
         WHERE up.user_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;
     `, [userId]);
-
     let totalPinDiscountPct = 0;
     if (userPinsResult.rows.length > 0) {
         for (const perk of userPinsResult.rows) {
             const discount = parseFloat(perk.pin_effects_config.deposit_fee_discount_pct);
-            if (!isNaN(discount)) {
-                totalPinDiscountPct += discount;
-            }
+            if (!isNaN(discount)) { totalPinDiscountPct += discount; }
         }
     }
-
     let finalFeePct = baseFeePct - tierDiscountPct - totalPinDiscountPct;
     if (finalFeePct < 0.5) finalFeePct = 0.5;
     const finalTradablePct = 100 - finalFeePct;
-
     const baseFeeAmount = investmentAmountBigNum.mul(Math.round(baseFeePct * 100)).div(10000);
-    const tierDiscountAmount = investmentAmountBigNum.mul(Math.round(tierDiscountPct * 100)).div(10000);
-    const pinDiscountAmount = investmentAmountBigNum.mul(Math.round(totalPinDiscountPct * 100)).div(10000);
     const finalFeeAmount = investmentAmountBigNum.mul(Math.round(finalFeePct * 100)).div(10000);
     const finalTradableAmount = investmentAmountBigNum.sub(finalFeeAmount);
-
     return {
         baseFeePct,
-        baseFeeAmount: ethers.utils.formatUnits(baseFeeAmount, tokenDecimals),
-        tierDiscountPct,
-        tierDiscountAmount: ethers.utils.formatUnits(tierDiscountAmount, tokenDecimals),
-        totalPinDiscountPct,
-        pinDiscountAmount: ethers.utils.formatUnits(pinDiscountAmount, tokenDecimals),
-        finalFeePct,
         finalFeeAmount: ethers.utils.formatUnits(finalFeeAmount, tokenDecimals),
-        finalTradablePct,
         finalTradableAmount: ethers.utils.formatUnits(finalTradableAmount, tokenDecimals)
     };
 }
 
-
+// The fee calculation endpoint is fine, but we will simplify its response to match what the /invest route needs
 router.post('/calculate-investment-fee', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
-    // --- THE FIX 1: Use the correct JWT property 'id' ---
     const userId = req.user.id;
-    const numericAmount = parseFloat(amount);
-
-    if (!vaultId || isNaN(numericAmount) || numericAmount <= 0) {
-        return res.status(200).json(null);
-    }
     const dbClient = await pool.connect();
     try {
-        const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, numericAmount);
+        const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, parseFloat(amount));
+        // We can pass the whole thing, the frontend will just use what it needs
         res.status(200).json(feeBreakdown);
     } catch (error) {
         console.error('Error in fee calculation endpoint:', error);
@@ -92,37 +63,36 @@ router.post('/calculate-investment-fee', authenticateToken, async (req, res) => 
     }
 });
 
-
 router.post('/invest', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
-    // --- THE FIX 2: Use the correct JWT property 'id' ---
     const userId = req.user.id;
     const dbClient = await pool.connect();
     try {
         await dbClient.query('BEGIN');
-        
         const numericAmount = parseFloat(amount);
         const tokenDecimals = tokenMap.usdc.decimals;
-
         const userResult = await dbClient.query('SELECT * FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
-        if (userResult.rows.length === 0) throw new Error("User not found.");
         const theUser = userResult.rows[0];
-
         const userBalanceBigNum = ethers.utils.parseUnits(theUser.balance.toString(), tokenDecimals);
         const investmentAmountBigNum = ethers.utils.parseUnits(numericAmount.toString(), tokenDecimals);
-
         if (userBalanceBigNum.lt(investmentAmountBigNum)) {
             await dbClient.query('ROLLBACK');
             return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
         }
-
         const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, numericAmount);
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         
-        // This is your original logic, now using the correct numbers from our calculation
+        // This is your original business logic, fully preserved
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
         await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, feeBreakdown.finalFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
-        await dbClient.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`, [userId, vaultId, feeBreakdown.finalTradableAmount]);
+        
+        // --- THE FINAL FIX: Use the correct column name 'entry_type' and add 'fee_paid' ---
+        // Your DDL shows the ledger table has a 'fee_paid' column, which we were missing.
+        await dbClient.query(
+            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_paid, status) 
+             VALUES ($1, $2, 'DEPOSIT', $3, $4, 'PENDING_SWEEP')`,
+            [userId, vaultId, feeBreakdown.finalTradableAmount, feeBreakdown.finalFeeAmount]
+        );
         
         const feeToDistributeStr = feeBreakdown.finalFeeAmount;
         await dbClient.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'`, [feeToDistributeStr]);
@@ -131,13 +101,12 @@ router.post('/invest', authenticateToken, async (req, res) => {
         
         const allocationDescription = `Allocated ${amount} USDC to Vault ${vaultId}.`;
         await dbClient.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_ALLOCATION', $2, $3, 'USDC', 'COMPLETED')`, [userId, allocationDescription, amount]);
-
+        
         const xpForAmount = investmentAmountBigNum.div(ethers.utils.parseUnits('10', tokenDecimals)).toNumber();
         if (xpForAmount > 0) {
             await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, userId]);
         }
-
-        const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND transaction_type = 'DEPOSIT'", [userId]);
+        const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
         if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
             await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, theUser.referred_by_user_id]);
         }
