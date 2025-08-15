@@ -92,6 +92,8 @@ app.listen(PORT, async () => {
   // Job 1: Poll for new platform deposits on each finalized block
   const { pollDeposits, initializeProvider } = require('./jobs/pollDeposits');
   initializeProvider();
+  
+  const wsProvider = getProvider(); 
   const finalityBuffer = 5;
   wsProvider.on('block', async (blockNumber) => {
     const finalizedBlock = blockNumber - finalityBuffer;
@@ -141,3 +143,4 @@ app.listen(PORT, async () => {
     finally { isProcessingVaultWithdrawals = false; }
   }, SIXTY_SECONDS_IN_MS);
 });
+
