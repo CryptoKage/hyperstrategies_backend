@@ -282,40 +282,43 @@ router.put('/vault-settings/:vaultId/compound', authenticateToken, async (req, r
   }
 });
 
-// --- NEW EASTER EGG ENDPOINT: Mint Troll Pin ---
-// This route is called by the frontend when a user selects the 'Troll' language.
+// --- NEW EASTER EGG ENDPOINT: Mint Troll Pin (Corrected) ---
 router.post('/mint-troll-pin', authenticateToken, async (req, res) => {
   const userId = req.user.id;
-  const pinToMint = 'TROLL'; // The specific pin we are minting
+  const pinToMint = 'TROLL';
 
+  let client;
   try {
-    // We use ON CONFLICT DO NOTHING to ensure that a user can only ever get one
-    // TROLL pin. If they already have it, this query will do nothing but still succeed.
-    const result = await pool.query(
-      `INSERT INTO pins (owner_id, pin_name) 
-       VALUES ($1, $2) 
-       ON CONFLICT (owner_id, pin_name) DO NOTHING`,
+    client = await pool.connect();
+
+    // --- THE FIX: First, check if the user already owns this specific type of pin ---
+    const existingPinCheck = await client.query(
+      `SELECT pin_id FROM pins WHERE owner_id = $1 AND pin_name = $2`,
       [userId, pinToMint]
     );
 
-    // Check if a row was actually inserted.
-    if (result.rowCount > 0) {
-      // This was the first time the user got the pin.
-      console.log(`User ${userId} has successfully minted the ${pinToMint} pin.`);
-      res.status(201).json({ message: `u trollin? 트롤` });
-    } else {
-      // The user already had the pin.
+    if (existingPinCheck.rows.length > 0) {
+      // The user already has the pin.
       console.log(`User ${userId} attempted to mint the ${pinToMint} pin again.`);
-      res.status(200).json({ message: `You already have this pin!` });
+      return res.status(200).json({ message: `You already have this pin!` });
     }
 
+    // If the check passes, mint the new pin.
+    const result = await client.query(
+      `INSERT INTO pins (owner_id, pin_name) VALUES ($1, $2) RETURNING *`,
+      [userId, pinToMint]
+    );
+
+    // This was the first time the user got the pin.
+    console.log(`User ${userId} has successfully minted the ${pinToMint} pin.`);
+    res.status(201).json({ message: `u trollin? 트롤`, newPin: result.rows[0] });
+
   } catch (err) {
-    // This could happen if the 'TROLL' pin isn't in pin_definitions, or a DB error.
     console.error(`Error minting TROLL pin for user ${userId}:`, err);
     res.status(500).json({ message: 'Could not mint the pin at this time.' });
+  } finally {
+    if (client) client.release();
   }
 });
-
-
 
 module.exports = router;
