@@ -178,20 +178,21 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
 
-          const payload = { 
+        const payload = { 
         user: { 
-          id: user.user_id, 
-          username: user.username, 
-          isAdmin: user.is_admin,
-          account_tier: user.account_tier // This is the new, crucial piece of data
+          id: req.user.user_id, 
+          username: req.user.username, 
+          isAdmin: req.user.is_admin,
+          account_tier: req.user.account_tier 
         } 
       };
-      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
-      res.json({ token });
-    } catch (error) {
-      console.error('[Login Error]', error);
-      res.status(500).json({ error: 'Server error during login.' });
+     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+      const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
+      res.redirect(`${frontend}/oauth-success?token=${token}`);
+    } catch (err) {
+      console.error('Google callback error:', err);
+      res.redirect(`${process.env.FRONTEND_URL || 'https://www.hyper-strategies.com'}/login`);
     }
   }
 );
