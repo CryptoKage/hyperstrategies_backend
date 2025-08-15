@@ -192,8 +192,7 @@ router.post(
       };
       
      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
-      const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
-      res.redirect(`${frontend}/oauth-success?token=${token}`);
+       res.json({ token });
     } catch (err) {
       console.error('Google callback error:', err);
       res.redirect(`${process.env.FRONTEND_URL || 'https://www.hyper-strategies.com'}/login`);
