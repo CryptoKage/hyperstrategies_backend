@@ -8,6 +8,7 @@ const passport = require('passport');
 const ethers = require('ethers');
 const pinsRouter = require('./routes/pins');
 const adminPinsRouter = require('./routes/adminPins');
+const { getProvider } = require('./utils/alchemyWebsocketProvider');
 
 dotenv.config();
 
@@ -92,7 +93,7 @@ app.listen(PORT, async () => {
   const { pollDeposits, initializeProvider } = require('./jobs/pollDeposits');
   initializeProvider();
   
-  const wsProvider = getProvider(); 
+ const wsProvider = getProvider(); 
   const finalityBuffer = 5;
   wsProvider.on('block', async (blockNumber) => {
     const finalizedBlock = blockNumber - finalityBuffer;
