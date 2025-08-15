@@ -1,5 +1,5 @@
 // server/routes/vaults.js
-// FINAL COMPLETE VERSION: Merges all original business logic with the new, authoritative fee calculation engine.
+// FINAL VERSION: The fee calculation now correctly queries the new 'pins' table.
 
 const express = require('express');
 const { ethers } = require('ethers');
@@ -9,7 +9,6 @@ const tokenMap = require('../utils/tokens/tokenMap');
 
 const router = express.Router();
 
-// This is our new, centralized, and authoritative function for all fee calculations.
 async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAmount) {
     const tokenDecimals = tokenMap.usdc.decimals;
     const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmount.toString(), tokenDecimals);
@@ -29,10 +28,11 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
         tierDiscountPct = (theUser.account_tier - 1) * 2.0;
     }
 
+    // --- THE FIX: This query now joins the new 'pins' table with pin_definitions ---
     const userPinsResult = await dbClient.query(`
-        SELECT pd.pin_effects_config FROM user_pins up
-        JOIN pin_definitions pd ON up.pin_name = pd.pin_name
-        WHERE up.user_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;
+        SELECT pd.pin_effects_config FROM pins p
+        JOIN pin_definitions pd ON p.pin_name = pd.pin_name
+        WHERE p.owner_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;
     `, [userId]);
 
     let totalPinDiscountPct = 0;
@@ -64,7 +64,6 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
     };
 }
 
-// ROUTE 1: The Preview Endpoint
 router.post('/calculate-investment-fee', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
     const userId = req.user.id;
@@ -84,7 +83,6 @@ router.post('/calculate-investment-fee', authenticateToken, async (req, res) => 
     }
 });
 
-// ROUTE 2: The Main Investment Endpoint
 router.post('/invest', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
     const userId = req.user.id;
@@ -110,11 +108,9 @@ router.post('/invest', authenticateToken, async (req, res) => {
         const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, numericAmount);
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         
-        // --- PRESERVED ORIGINAL BUSINESS LOGIC ---
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
         await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, feeBreakdown.finalFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         
-        // This query now uses the correct 'entry_type' column name
         await dbClient.query(
             `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
              VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,
@@ -138,7 +134,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
         if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
             await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, theUser.referred_by_user_id]);
         }
-        // --- END OF PRESERVED LOGIC ---
 
         await dbClient.query('COMMIT');
         res.status(200).json({ message: 'Allocation successful!' });
@@ -151,7 +146,6 @@ router.post('/invest', authenticateToken, async (req, res) => {
     }
 });
 
-// ROUTE 3: The Withdrawal Endpoint (Preserved from your original code)
 router.post('/withdraw', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
     const userId = req.user.id; 

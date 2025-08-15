@@ -127,16 +127,20 @@ router.post(
       const newlyCreatedUser = newUserResult.rows[0];
       const newUserId = newlyCreatedUser.user_id;
 
-      // --- THE FIX: Assign initial pins in the correct 'user_pins' table ---
-      const initialPinsToAssign = ['EARLY_SUPPORTER']; // Default pin for all new users.
-      // We can add logic here later to check the referrerId and add a syndicate pin.
-      
-      for (const pinName of initialPinsToAssign) {
-        await client.query(
-          'INSERT INTO user_pins (user_id, pin_name) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-          [newUserId, pinName]
-        );
-      }
+      if (referralCode) {
+            const syndicateResult = await client.query(
+                'SELECT pin_name_to_grant FROM syndicates WHERE referral_code = $1',
+                [referralCode.toLowerCase()]
+            );
+            if (syndicateResult.rows.length > 0) {
+                const pinToMint = syndicateResult.rows[0].pin_name_to_grant;
+                // Mint the new pin in the 'pins' table
+                await client.query(
+                    'INSERT INTO pins (owner_id, pin_name) VALUES ($1, $2)',
+                    [newUserId, pinToMint]
+                );
+            }
+        }
 
       await client.query('COMMIT');
       res.status(201).json({ message: 'User created successfully', user: newlyCreatedUser });

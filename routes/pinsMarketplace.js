@@ -3,7 +3,7 @@ const router = express.Router();
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const requireTier = require('../middleware/requireTier');
-const { body, param, validationResult } = require('express-validator');
+const { body, param, validationResult } = require('express-validator'); 
 
 const MAX_PRICE = 1000000;
 

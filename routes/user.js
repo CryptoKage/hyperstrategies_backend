@@ -1,4 +1,5 @@
 // server/routes/user.js
+// FINAL VERSION: The /profile route is updated to use the new 'pins' table.
 
 const express = require('express');
 const router = express.Router();
@@ -19,7 +20,6 @@ const priceCache = {
   cacheDuration: 5 * 60 * 1000,
 };
 
-// --- FINAL, ROBUST Caching Function ---
 async function getApePrice() {
   const now = Date.now();
   if (priceCache.apePrice && (now - priceCache.lastFetched < priceCache.cacheDuration)) {
@@ -46,13 +46,11 @@ async function getApePrice() {
       console.warn('Serving STALE APE price from cache due to API failure.');
       return priceCache.apePrice;
     }
-    // If we have NO cached price and the API fails, return a safe default instead of crashing.
     console.error('CRITICAL: Could not fetch APE price and no cache is available.');
-    return 0; // Return 0 as a safe fallback
+    return 0;
   }
 }
 
-// --- FINAL, ROBUST /wallet Endpoint ---
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -82,20 +80,24 @@ router.get('/wallet', authenticateToken, async (req, res) => {
   }
 });
 
-// --- UPDATED /profile Endpoint (Ledger-Based) ---
+
+// --- THE REFACTORED /profile Endpoint ---
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    // We now run three queries in parallel to get all the data we need.
     const [profileResult, stakedResult, pinsResult] = await Promise.all([
-      // Query 1: Gets the main user details. NOTE: We have removed 'u.tags' from this query.
-      pool.query(`SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
-        FROM users u LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
-        WHERE u.user_id = $1 GROUP BY u.user_id;`, [userId]),
-      // Query 2: Gets the total staked capital (unchanged).
+      // Query 1: Gets main user details (no longer selects 'tags')
+      pool.query(`
+        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+        FROM users u 
+        LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
+        WHERE u.user_id = $1 
+        GROUP BY u.user_id;
+      `, [userId]),
+      // Query 2: Gets total staked capital (unchanged)
       pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]),
-      // Query 3 (NEW): Fetches all pin names for the user from the correct 'user_pins' table.
-      pool.query("SELECT pin_name FROM user_pins WHERE user_id = $1", [userId])
+      // Query 3 (NEW): Fetches all pin names for the user from the new 'pins' table.
+      pool.query("SELECT pin_name FROM pins WHERE owner_id = $1", [userId])
     ]);
 
     if (profileResult.rows.length === 0) {
@@ -104,11 +106,10 @@ router.get('/profile', authenticateToken, async (req, res) => {
 
     const profileData = profileResult.rows[0];
     const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
-    // This creates a simple array of pin names, e.g., ['BUG_FINDER', 'SHDWMF_SYNDICATE']
+    // This creates the simple array of pin names that the frontend expects.
     const userPins = pinsResult.rows.map(row => row.pin_name);
 
-    // We combine all the data into a single response object.
-    // Crucially, it now has a 'pins' property instead of 'tags'.
+    // Combine all data into the final response, adding the new 'pins' property.
     res.json({
       ...profileData,
       total_staked_capital: totalStakedCapital,
@@ -120,14 +121,13 @@ router.get('/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// --- NEW Endpoint for the Activity Hub ---
+
 router.get('/activity-log', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const page = parseInt(req.query.page, 10) || 1;
     const limit = 20;
     const offset = (page - 1) * limit;
-
     const activityQuery = `
       SELECT activity_id, activity_type, description, amount_primary, symbol_primary, status, created_at
       FROM user_activity_log
@@ -136,7 +136,6 @@ router.get('/activity-log', authenticateToken, async (req, res) => {
       LIMIT $2 OFFSET $3;
     `;
     const { rows } = await pool.query(activityQuery, [userId, limit, offset]);
-    
     res.json(rows);
   } catch (err) {
     console.error(`Error fetching activity log for user ${req.user.id}:`, err);
@@ -144,10 +143,6 @@ router.get('/activity-log', authenticateToken, async (req, res) => {
   }
 });
 
-
-
-
-// --- Get Leaderboard Endpoint ---
 router.get('/leaderboard', async (req, res) => {
   try {
     const leaderboardResult = await pool.query(
@@ -160,7 +155,6 @@ router.get('/leaderboard', async (req, res) => {
   }
 });
 
-// --- Get My Rank Endpoint ---
 router.get('/my-rank', authenticateToken, async (req, res) => {
   try {
     const authenticatedUserId = req.user.id;
@@ -191,64 +185,41 @@ router.get('/my-rank', authenticateToken, async (req, res) => {
   }
 });
 
-
 router.put('/referral-code', authenticateToken, async (req, res) => {
   const { desiredCode } = req.body;
   const authenticatedUserId = req.user.id;
-
-  // --- 1. Validation and Sanitization ---
   if (!desiredCode || typeof desiredCode !== 'string') {
     return res.status(400).json({ message: 'A referral code must be provided.' });
   }
-
-  // Sanitize the input: lowercase, alphanumeric only.
   const sanitizedCode = desiredCode.toLowerCase().replace(/[^a-z0-9]/g, '');
-
   if (sanitizedCode.length < 3 || sanitizedCode.length > 15) {
     return res.status(400).json({ message: 'Code must be between 3 and 15 alphanumeric characters.' });
   }
-
-  // Our system's final referral code format.
   const finalReferralCode = `HS-${sanitizedCode}`;
-
-  // --- 2. Database Checks and Update ---
   try {
-    // Check if the user is even allowed to change their code.
-    // We could add logic here later, e.g., "only changeable once" or "requires 100 XP".
-    // For now, we'll allow it.
-
-    // Check if the desired final code already exists.
     const existingCodeResult = await pool.query(
       'SELECT user_id FROM users WHERE referral_code = $1',
       [finalReferralCode]
     );
-
     if (existingCodeResult.rows.length > 0) {
-      // If the code belongs to someone else, it's taken.
       if (existingCodeResult.rows[0].user_id !== authenticatedUserId) {
         return res.status(409).json({ message: 'This referral code is already taken. Please try another.' });
       }
-      // If it belongs to the current user, it's already set. No need to update.
       return res.status(200).json({ 
         message: 'This is already your referral code.',
         referralCode: finalReferralCode 
       });
     }
-
-    // --- 3. If all checks pass, update the database ---
     await pool.query(
       'UPDATE users SET referral_code = $1 WHERE user_id = $2',
       [finalReferralCode, authenticatedUserId]
     );
-
     res.status(200).json({
       message: 'Success! Your new referral link is ready.',
       referralCode: finalReferralCode
     });
-
   } catch (err) {
-    // This will catch the UNIQUE constraint error if two users try to set the same code at the exact same time.
-    if (err.code === '23505') { // PostgreSQL unique_violation error code
+    if (err.code === '23505') {
       return res.status(409).json({ message: 'This referral code was just claimed. Please try another.' });
     }
     console.error("Error updating referral code:", err.message);
@@ -256,16 +227,12 @@ router.put('/referral-code', authenticateToken, async (req, res) => {
   }
 });
 
-// Add this new endpoint to server/routes/user.js
-
 router.get('/xp-history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const page = parseInt(req.query.page, 10) || 1;
     const limit = 20;
     const offset = (page - 1) * limit;
-
-    // The SQL query now filters OUT the daily staking bonus
     const historyQuery = `
       SELECT
         activity_id,
@@ -285,11 +252,8 @@ router.get('/xp-history', authenticateToken, async (req, res) => {
         created_at DESC
       LIMIT $2 OFFSET $3;
     `;
-    
     const { rows } = await pool.query(historyQuery, [userId, limit, offset]);
-    
     res.json(rows);
-
   } catch (err) {
     console.error(`Error fetching XP history for user ${req.user.id}:`, err);
     res.status(500).send('Server Error');
@@ -319,4 +283,3 @@ router.put('/vault-settings/:vaultId/compound', authenticateToken, async (req, r
 });
 
 module.exports = router;
-
