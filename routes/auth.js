@@ -178,12 +178,12 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
 
-        const payload = { 
+      const payload = { 
         user: { 
-          id: req.user.user_id, 
-          username: req.user.username, 
-          isAdmin: req.user.is_admin,
-          account_tier: req.user.account_tier 
+          id: user.user_id, 
+          username: user.username, 
+          isAdmin: user.is_admin,
+          account_tier: user.account_tier 
         } 
       };
       
