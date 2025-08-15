@@ -118,7 +118,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
         await dbClient.query(
             `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
              VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,
-            [userId, vaultId, feeBreakdown.finalTradableAmount, feeBreakdown.finalFeeAmount]
+            [userId, vaultId, feeBreakdown.finalTradableAmount]
         );
         
         const feeToDistributeStr = feeBreakdown.finalFeeAmount;
