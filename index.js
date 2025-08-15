@@ -8,7 +8,6 @@ const passport = require('passport');
 const ethers = require('ethers');
 const pinsRouter = require('./routes/pins');
 const adminPinsRouter = require('./routes/adminPins');
-const wsProvider = require('./utils/alchemyWebsocketProvider');
 
 dotenv.config();
 
