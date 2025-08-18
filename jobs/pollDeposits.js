@@ -6,38 +6,29 @@ const tokenMap = require('../utils/tokens/tokenMap');
 const config = { apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET };
 const alchemy = new Alchemy(config);
 
-async function initializeProvider() {
-  try {
-    const block = await alchemy.core.getBlockNumber();
-    console.log(`🔌 Alchemy SDK connected to Ethereum Mainnet. Current block: ${block}`);
-  } catch (err) {
-    console.error('❌ Alchemy SDK connection failed:', err);
-  }
-}
-
-async function pollDeposits({ toBlock: toBlockOverride } = {}) {
-  console.log('🔄 Checking for new deposits...');
+async function pollDeposits() {
+  console.log('🔄 Checking for new deposits by transaction hash...');
   const client = await pool.connect();
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
     if (!lastCheckedBlockResult.rows[0]) {
         throw new Error("FATAL: 'lastCheckedBlock' key not found in system_state table.");
     }
-    
+
     const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
     let fromBlock = lastProcessedBlock + 1;
-    let toBlock = toBlockOverride;
 
-    // --- THE SIMPLE FIX: Automatically limit the scan range if we are far behind ---
-    const MAX_SCAN_RANGE = 250; // Set a safe, smaller number of blocks to scan at once.
-    const blockGap = toBlock - fromBlock;
-
-    if (blockGap > MAX_SCAN_RANGE) {
-      console.log(`[CATCH-UP MODE] System is ${blockGap} blocks behind. Scanning the next ${MAX_SCAN_RANGE} blocks.`);
-      toBlock = fromBlock + MAX_SCAN_RANGE -1; // -1 because the range is inclusive.
+    const latestBlock = await alchemy.core.getBlockNumber();
+    const finalityBuffer = 5;
+    let toBlock = latestBlock - finalityBuffer;
+    
+    // --- THE SIMPLE CATCH-UP FIX ---
+    // If we are more than a certain number of blocks behind, only scan a safe chunk.
+    const MAX_SCAN_RANGE = 500;
+    if ((toBlock - fromBlock) > MAX_SCAN_RANGE) {
+      console.log(`[CATCH-UP MODE] Scanner is far behind. Processing a chunk of ${MAX_SCAN_RANGE} blocks.`);
+      toBlock = fromBlock + MAX_SCAN_RANGE - 1;
     }
-    // If the gap is small, it will just scan the few new blocks as normal.
-    // --- End of Fix ---
 
     if (fromBlock > toBlock) {
       console.log('Scanner is up to date. No new blocks to process.');
@@ -47,7 +38,12 @@ async function pollDeposits({ toBlock: toBlockOverride } = {}) {
     console.log(`Scanning from block #${fromBlock} to #${toBlock}`);
     
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
-    if (users.length === 0) return;
+    if (users.length === 0) {
+      // Release client and exit early if there are no users with wallets.
+      client.release();
+      return;
+    }
+    
     const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
     const allTransfers = await alchemy.core.getAssetTransfers({
@@ -93,4 +89,4 @@ async function pollDeposits({ toBlock: toBlockOverride } = {}) {
   }
 }
 
-module.exports = { pollDeposits, initializeProvider };
+module.exports = { pollDeposits };
