@@ -8,7 +8,7 @@ const passport = require('passport');
 const ethers = require('ethers');
 const pinsRouter = require('./routes/pins');
 const adminPinsRouter = require('./routes/adminPins');
-const { getProvider } = require('./utils/alchemyWebsocketProvider');
+// We no longer require the WebSocket provider here.
 
 dotenv.config();
 
@@ -87,22 +87,20 @@ app.listen(PORT, async () => {
   let isProcessingWithdrawals = false;
   let isProcessingTimeRewards = false;
   let isProcessingVaultWithdrawals = false;
-  let isSweepingLedger = false; // New lock for our new job
+  let isSweepingLedger = false;
 
-  // Job 1: Poll for new platform deposits on each finalized block
-  const { pollDeposits, initializeProvider } = require('./jobs/pollDeposits');
-  initializeProvider();
-  
- const wsProvider = getProvider(); 
-  const finalityBuffer = 5;
-  wsProvider.on('block', async (blockNumber) => {
-    const finalizedBlock = blockNumber - finalityBuffer;
-    if (finalizedBlock <= 0 || isPollingDeposits) { return; }
+  // --- THE FIX: Switched to a reliable setInterval for deposit polling ---
+  const { pollDeposits } = require('./jobs/pollDeposits');
+  // The call to initializeProvider() has been removed as it's no longer exported or needed.
+  setInterval(async () => {
+    if (isPollingDeposits) { return; }
     isPollingDeposits = true;
-    try { await pollDeposits({ toBlock: finalizedBlock }); }
+    try { 
+      await pollDeposits(); 
+    }
     catch (e) { console.error('Error in pollDeposits job:', e); }
     finally { isPollingDeposits = false; }
-  });
+  }, 15000); // Run every 15 seconds.
 
   // Job 2: Process platform withdrawal queue (every 45 seconds)
   const { processWithdrawals } = require('./jobs/queueProcessor');
@@ -143,4 +141,3 @@ app.listen(PORT, async () => {
     finally { isProcessingVaultWithdrawals = false; }
   }, SIXTY_SECONDS_IN_MS);
 });
-
