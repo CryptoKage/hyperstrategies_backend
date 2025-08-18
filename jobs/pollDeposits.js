@@ -18,19 +18,17 @@ async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOver
     }
     const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
 
-    // If the admin tool provides a fromBlock, use it. Otherwise, use the one from the database.
     let fromBlock = fromBlockOverride || (lastProcessedBlock + 1);
     let toBlock;
 
     if (toBlockOverride) {
-      toBlock = toBlockOverride; // Use admin-provided toBlock
+      toBlock = toBlockOverride;
     } else {
       const latestBlock = await alchemy.core.getBlockNumber();
       const finalityBuffer = 5;
       toBlock = latestBlock - finalityBuffer;
     }
     
-    // The simple catch-up logic
     const MAX_SCAN_RANGE = 500;
     if (!fromBlockOverride && (toBlock - fromBlock) > MAX_SCAN_RANGE) {
       console.log(`[CATCH-UP MODE] Scanner is far behind. Processing a chunk of ${MAX_SCAN_RANGE} blocks.`);
@@ -71,8 +69,21 @@ async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOver
         const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
         if (existingDeposit.rows.length === 0) {
           try {
-            const depositAmount_string = ethers.utils.formatUnits(event.value, tokenMap.usdc.decimals);
+            // --- THE FIX: A more robust, two-step sanitization for the amount ---
+            const rawAmountFromAlchemy = event.value;
+            
+            // 1. First, safely parse the (potentially messy) number into a clean BigNumber.
+            // We use parseFloat and toFixed() to prevent any floating point errors before parsing.
+            const amountAsBigNumber = ethers.utils.parseUnits(
+              parseFloat(rawAmountFromAlchemy).toFixed(tokenMap.usdc.decimals), 
+              tokenMap.usdc.decimals
+            );
+            
+            // 2. Now, format the clean BigNumber back into a string for the database.
+            const depositAmount_string = ethers.utils.formatUnits(amountAsBigNumber, tokenMap.usdc.decimals);
+
             console.log(`✅ New USDC deposit detected for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
+            
             await client.query('BEGIN');
             await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
             await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [depositAmount_string, userId]);
@@ -85,7 +96,6 @@ async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOver
       }
     }
 
-    // Only update the main scanner's state if we are NOT doing a manual admin override.
     if (!fromBlockOverride) {
       await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
       console.log(`✅ Finished automated scan. Next scan will start from block #${toBlock + 1}`);
@@ -95,7 +105,6 @@ async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOver
 
   } catch (error) {
     console.error('❌ Major error in pollDeposits job:', error);
-    // Throw the error so the admin endpoint knows the manual scan failed.
     if (fromBlockOverride) {
       throw error;
     }
@@ -104,5 +113,4 @@ async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOver
   }
 }
 
-// We no longer need initializeProvider, it's handled internally by the Alchemy SDK.
 module.exports = { pollDeposits };
