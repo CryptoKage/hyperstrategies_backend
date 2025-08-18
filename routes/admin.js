@@ -160,16 +160,32 @@ router.get('/users/search', async (req, res) => {
 router.get('/users/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
-    const [userDetails, userVaults, userActivity, bonusPoints] = await Promise.all([
-      pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, tags, balance FROM users WHERE user_id = $1', [userId]),
+    // --- THE FIX: We now run one extra query to get the pins ---
+    const [userDetails, userVaults, userActivity, bonusPoints, userPins] = await Promise.all([
+      // Query 1: Gets main user details (no longer selects 'tags')
+      pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, balance FROM users WHERE user_id = $1', [userId]),
+      // Query 2: Gets vault positions (unchanged)
       pool.query(`SELECT v.name as vault_name, vle.vault_id, SUM(vle.amount) as total_capital FROM vault_ledger_entries vle JOIN vaults v ON vle.vault_id = v.vault_id WHERE vle.user_id = $1 GROUP BY vle.vault_id, v.name HAVING SUM(vle.amount) > 0.000001`, [userId]),
+      // Query 3: Gets activity log (unchanged)
       pool.query('SELECT * FROM user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId]),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total FROM bonus_points WHERE user_id = $1', [userId])
+      // Query 4: Gets bonus points (unchanged)
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total FROM bonus_points WHERE user_id = $1', [userId]),
+      // Query 5 (NEW): Fetches all pin names for the user from the new 'pins' table.
+      pool.query("SELECT pin_name FROM pins WHERE owner_id = $1", [userId])
     ]);
-    if (userDetails.rows.length === 0) { return res.status(404).json({ message: 'User not found.' }); }
-    const fullUserDetails = { ...userDetails.rows[0], total_bonus_points: parseFloat(bonusPoints.rows[0].total),
-       pins: userPins.rows.map(p => p.pin_name) 
-     };
+
+    if (userDetails.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    // Combine the results into the final payload
+    const fullUserDetails = { 
+      ...userDetails.rows[0], 
+      total_bonus_points: parseFloat(bonusPoints.rows[0].total),
+      // --- THE FIX: Add the 'pins' array to the response ---
+      pins: userPins.rows.map(p => p.pin_name) 
+    };
+    
     res.json({
       details: fullUserDetails,
       positions: userVaults.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
