@@ -429,5 +429,89 @@ router.post('/buyback-points', async (req, res) => {
   }
 });
 
+router.post('/force-scan-block', async (req, res) => {
+  const { blockNumber } = req.body;
+  const blockNum = parseInt(blockNumber, 10);
+  if (!blockNum || blockNum <= 0) {
+    return res.status(400).json({ message: "A valid block number is required." });
+  }
+
+  try {
+    console.log(`[ADMIN] Manual scan triggered for block #${blockNum} by admin ${req.user.id}`);
+    // We import pollDeposits here to avoid circular dependency issues
+    const { pollDeposits } = require('../jobs/pollDeposits');
+    // We call the job, forcing it to scan only this one block
+    await pollDeposits({ fromBlock: blockNum, toBlock: blockNum });
+    res.status(200).json({ message: `Successfully scanned block #${blockNum}. Check logs for any new deposits found.` });
+  } catch (err) {
+    console.error(`Admin force-scan-block failed:`, err);
+    res.status(500).json({ message: "Failed to scan block. See server logs for details." });
+  }
+});
+
+
+// --- NEW ADMIN TOOL: Scan a specific user's wallet history ---
+router.post('/scan-user-wallet', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ message: "A user ID is required." });
+  }
+
+  const client = await pool.connect();
+  try {
+    console.log(`[ADMIN] Manual wallet scan triggered for user ${userId} by admin ${req.user.id}`);
+    
+    const userResult = await client.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: "User not found." });
+    }
+    const userWalletAddress = userResult.rows[0].eth_address;
+
+    // Fetch all ERC20 transfers TO this user's address
+    const allTransfers = await alchemy.core.getAssetTransfers({
+      toAddress: userWalletAddress,
+      category: [AssetTransfersCategory.ERC20],
+      contractAddresses: [tokenMap.usdc.address],
+      excludeZeroValue: true,
+      // We limit the scan to a reasonable history to avoid massive queries
+      fromBlock: "0x0", // You could make this more recent if needed
+    });
+
+    let newDepositsFound = 0;
+    let existingDepositsFound = 0;
+
+    // Use the same trusted logic from pollDeposits to process the results
+    for (const event of allTransfers.transfers) {
+      const txHash = event.hash;
+      const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
+      
+      if (existingDeposit.rows.length === 0) {
+        newDepositsFound++;
+        const depositAmount_string = ethers.utils.formatUnits(event.value, tokenMap.usdc.decimals);
+        console.log(`   - Found new deposit for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
+        await client.query('BEGIN');
+        await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
+        await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [depositAmount_string, userId]);
+        await client.query('COMMIT');
+      } else {
+        existingDepositsFound++;
+      }
+    }
+
+    const summaryMessage = `Scan complete. Found ${newDepositsFound} new deposits and ${existingDepositsFound} existing deposits for user ${userId}.`;
+    console.log(`[ADMIN] ${summaryMessage}`);
+    res.status(200).json({ message: summaryMessage, newDeposits: newDepositsFound, existingDeposits: existingDepositsFound });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`Admin scan-user-wallet failed:`, err);
+    res.status(500).json({ message: "Failed to scan wallet. See server logs for details." });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+
+
 
 module.exports = router;

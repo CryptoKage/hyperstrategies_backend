@@ -6,32 +6,39 @@ const tokenMap = require('../utils/tokens/tokenMap');
 const config = { apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET };
 const alchemy = new Alchemy(config);
 
-async function pollDeposits() {
-  console.log('🔄 Checking for new deposits by transaction hash...');
+async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOverride } = {}) {
+  const jobTitle = fromBlockOverride ? '[ADMIN SCAN]' : '🔄';
+  console.log(`${jobTitle} Checking for new deposits by transaction hash...`);
+  
   const client = await pool.connect();
   try {
     const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
     if (!lastCheckedBlockResult.rows[0]) {
         throw new Error("FATAL: 'lastCheckedBlock' key not found in system_state table.");
     }
-
     const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
-    let fromBlock = lastProcessedBlock + 1;
 
-    const latestBlock = await alchemy.core.getBlockNumber();
-    const finalityBuffer = 5;
-    let toBlock = latestBlock - finalityBuffer;
+    // If the admin tool provides a fromBlock, use it. Otherwise, use the one from the database.
+    let fromBlock = fromBlockOverride || (lastProcessedBlock + 1);
+    let toBlock;
+
+    if (toBlockOverride) {
+      toBlock = toBlockOverride; // Use admin-provided toBlock
+    } else {
+      const latestBlock = await alchemy.core.getBlockNumber();
+      const finalityBuffer = 5;
+      toBlock = latestBlock - finalityBuffer;
+    }
     
-    // --- THE SIMPLE CATCH-UP FIX ---
-    // If we are more than a certain number of blocks behind, only scan a safe chunk.
+    // The simple catch-up logic
     const MAX_SCAN_RANGE = 500;
-    if ((toBlock - fromBlock) > MAX_SCAN_RANGE) {
+    if (!fromBlockOverride && (toBlock - fromBlock) > MAX_SCAN_RANGE) {
       console.log(`[CATCH-UP MODE] Scanner is far behind. Processing a chunk of ${MAX_SCAN_RANGE} blocks.`);
       toBlock = fromBlock + MAX_SCAN_RANGE - 1;
     }
 
     if (fromBlock > toBlock) {
-      console.log('Scanner is up to date. No new blocks to process.');
+      if (!toBlockOverride) console.log('Scanner is up to date. No new blocks to process.');
       return;
     }
 
@@ -39,7 +46,6 @@ async function pollDeposits() {
     
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     if (users.length === 0) {
-      // Release client and exit early if there are no users with wallets.
       client.release();
       return;
     }
@@ -79,14 +85,24 @@ async function pollDeposits() {
       }
     }
 
-    await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
-    console.log(`✅ Finished scan. Next scan will start from block #${toBlock + 1}`);
+    // Only update the main scanner's state if we are NOT doing a manual admin override.
+    if (!fromBlockOverride) {
+      await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
+      console.log(`✅ Finished automated scan. Next scan will start from block #${toBlock + 1}`);
+    } else {
+      console.log(`✅ Finished manual scan of block range ${fromBlock}-${toBlock}.`);
+    }
 
   } catch (error) {
     console.error('❌ Major error in pollDeposits job:', error);
+    // Throw the error so the admin endpoint knows the manual scan failed.
+    if (fromBlockOverride) {
+      throw error;
+    }
   } finally {
     if (client) client.release();
   }
 }
 
+// We no longer need initializeProvider, it's handled internally by the Alchemy SDK.
 module.exports = { pollDeposits };
