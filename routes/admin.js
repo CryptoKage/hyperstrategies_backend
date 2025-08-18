@@ -167,7 +167,9 @@ router.get('/users/:userId', async (req, res) => {
       pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total FROM bonus_points WHERE user_id = $1', [userId])
     ]);
     if (userDetails.rows.length === 0) { return res.status(404).json({ message: 'User not found.' }); }
-    const fullUserDetails = { ...userDetails.rows[0], total_bonus_points: parseFloat(bonusPoints.rows[0].total) };
+    const fullUserDetails = { ...userDetails.rows[0], total_bonus_points: parseFloat(bonusPoints.rows[0].total),
+       pins: userPins.rows.map(p => p.pin_name) 
+     };
     res.json({
       details: fullUserDetails,
       positions: userVaults.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
