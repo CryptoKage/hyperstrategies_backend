@@ -9,6 +9,8 @@ const { generateWallet, encrypt } = require('../utils/walletUtils');
 const authenticateToken = require('../middleware/authenticateToken');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
@@ -170,7 +172,8 @@ router.post(
 
     try {
       const { email, password } = req.body;
-        const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin, account_tier FROM users WHERE email = $1', [email]);
+      const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin, account_tier FROM users WHERE email = $1', [email]);
+      
       if (result.rows.length === 0) {
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
@@ -190,12 +193,14 @@ router.post(
           account_tier: user.account_tier 
         } 
       };
+      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
-     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
-       res.json({ token });
+      res.json({ token });
+
     } catch (err) {
-      console.error('Google callback error:', err);
-      res.redirect(`${process.env.FRONTEND_URL || 'https://www.hyper-strategies.com'}/login`);
+      // --- THE FINAL FIX: Use the correct error handling for this route ---
+      console.error('[Login Error]', err);
+      res.status(500).json({ error: 'Server error during login.' });
     }
   }
 );
@@ -260,6 +265,105 @@ router.get('/me', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Server error while fetching user profile' });
   }
 });
+
+router.post(
+  '/forgot-password',
+  authLimiter,
+  [ body('email').isEmail().normalizeEmail() ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    const { email } = req.body;
+    try {
+      const userResult = await pool.query('SELECT user_id FROM users WHERE email = $1', [email]);
+      if (userResult.rows.length === 0) {
+        // SECURITY: We don't tell the user if the email was found or not.
+        // This prevents people from guessing emails.
+        return res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
+      }
+      const user = userResult.rows[0];
+
+      // 1. Generate a secure, random token
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      // 2. Hash the token before storing it in the database for security
+      const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+      // 3. Set an expiration date for 1 hour from now
+      const tokenExpires = new Date(Date.now() + 3600000); // 1 hour
+
+      // 4. Update the user's record in the database
+      await pool.query(
+        'UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE user_id = $3',
+        [hashedToken, tokenExpires, user.user_id]
+      );
+
+      // 5. Send the email with the UN-HASHED token
+      const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+      await resend.emails.send({
+        from: 'password-reset@hyper-strategies.com', // You'll need to verify this domain in Resend
+        to: email,
+        subject: 'Your HyperStrategies Password Reset Link',
+        html: `<p>You requested a password reset. Please click this link to set a new password:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>This link will expire in one hour.</p>`,
+      });
+      
+      res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
+
+    } catch (err) {
+      console.error('Forgot password error:', err);
+      // Don't send a detailed error to the client
+      res.status(500).json({ error: 'An error occurred.' });
+    }
+  }
+);
+
+// ROUTE 2: User submits a new password with their token
+router.post(
+  '/reset-password',
+  authLimiter,
+  [
+    body('token').notEmpty().withMessage('Token is required.'),
+    body('password').isStrongPassword().withMessage('Please provide a stronger password.'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    const { token, password } = req.body;
+    try {
+      // 1. Hash the token from the request to match what's in the database
+      const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+      // 2. Find the user with that token and ensure it has not expired
+      const userResult = await pool.query(
+        'SELECT user_id FROM users WHERE password_reset_token = $1 AND password_reset_expires > NOW()',
+        [hashedToken]
+      );
+
+      if (userResult.rows.length === 0) {
+        return res.status(400).json({ error: 'Password reset token is invalid or has expired.' });
+      }
+      const user = userResult.rows[0];
+
+      // 3. Hash the new password and update the user's record
+      const salt = await bcrypt.genSalt(10);
+      const newPasswordHash = await bcrypt.hash(password, salt);
+
+      await pool.query(
+        'UPDATE users SET password_hash = $1, password_reset_token = NULL, password_reset_expires = NULL WHERE user_id = $2',
+        [newPasswordHash, user.user_id]
+      );
+      
+      res.status(200).json({ message: 'Password has been successfully reset. You can now log in.' });
+
+    } catch (err) {
+      console.error('Reset password error:', err);
+      res.status(500).json({ error: 'An error occurred.' });
+    }
+  }
+);
+
 
 module.exports = router;
 
