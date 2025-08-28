@@ -8,8 +8,8 @@ const erc20Abi = require('../utils/abis/erc20.json');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
-const USER_ID_TO_FIX = '71bd55c5-d7c3-4465-9a0b-31a2c727eb27';
-const AMOUNT_TO_SEND = '34.618'; // The 20% Devops Fee
+const USER_ID_TO_FIX = '0932e6f3-4004-46c2-939b-ea0d32dc7831';
+const AMOUNT_TO_SEND = '444'; // The 20% Devops Fee
 const GAS_PRICE_GWEI = '30';    // Check Etherscan Gas Tracker
 
 const transferFunds = async () => {
