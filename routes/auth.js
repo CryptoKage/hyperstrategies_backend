@@ -16,9 +16,6 @@ function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
 }
 
-// Ensure a newly generated referral code is not already taken.
-// If a collision occurs, a new code is generated and checked again.
-// This minimizes the chance of hitting the unique constraint during user creation.
 async function generateUniqueReferralCode(db) {
   let code;
   let exists = true;
@@ -83,9 +80,13 @@ router.post(
       if (currentUserCount < 100) xpToAward = 25;
       else if (currentUserCount < 500) xpToAward = 5;
 
-      let referrerId = null;
+     let referrerId = null;
       if (referralCode) {
-        const referrerResult = await client.query('SELECT user_id FROM users WHERE referral_code = $1', [referralCode]);
+        // We now use LOWER() on both the database column and the input to ensure a match.
+        const referrerResult = await client.query(
+          'SELECT user_id FROM users WHERE LOWER(referral_code) = LOWER($1)', 
+          [referralCode]
+        );
         if (referrerResult.rows.length > 0) {
           referrerId = referrerResult.rows[0].user_id;
         }
@@ -96,8 +97,6 @@ router.post(
       const wallet = generateWallet();
       const encryptedKey = encrypt(wallet.privateKey);
       
-      // --- THE FIX: The INSERT query no longer mentions 'tags' or 'pins' ---
-      // This now perfectly matches your 'users' table DDL.
       const newUserQuery = `
         INSERT INTO users (email, password_hash, username, google_id, balance, eth_address, eth_private_key_encrypted, referred_by_user_id, xp, bio, theme, referral_code, is_admin, account_tier)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
@@ -136,7 +135,6 @@ router.post(
             );
             if (syndicateResult.rows.length > 0) {
                 const pinToMint = syndicateResult.rows[0].pin_name_to_grant;
-                // Mint the new pin in the 'pins' table
                 await client.query(
                     'INSERT INTO pins (owner_id, pin_name) VALUES ($1, $2)',
                     [newUserId, pinToMint]
@@ -198,62 +196,90 @@ router.post(
       res.json({ token });
 
     } catch (err) {
-      // --- THE FINAL FIX: Use the correct error handling for this route ---
       console.error('[Login Error]', err);
       res.status(500).json({ error: 'Server error during login.' });
     }
   }
 );
 
-router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
+// --- FIX STARTS HERE: REPLACING THE GOOGLE OAUTH ROUTES ---
+
+// NEW /google route to capture referral code and pass it via 'state'
+router.get('/google', (req, res, next) => {
+  const referralCode = req.query.ref;
+  const state = referralCode 
+    ? Buffer.from(JSON.stringify({ referralCode })).toString('base64')
+    : undefined;
+  const authenticator = passport.authenticate('google', { 
+    scope: ['profile', 'email'],
+    state: state
+  });
+  authenticator(req, res, next);
+});
+
+// NEW /google/callback route to read the 'state' and apply the referral
 router.get('/google/callback',
-  passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login' }),
+  passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login', session: false }),
   async (req, res) => {
+    const client = await pool.connect();
     try {
-      if (!req.user.referral_code) {
-        // Assign a unique referral code to new OAuth users. If an update
-        // collides with an existing code, retry with a fresh one.
-        let updated = false;
-        let attempts = 0;
-        while (!updated && attempts < 5) {
-          const newCode = await generateUniqueReferralCode(pool);
-          try {
-            await pool.query('UPDATE users SET referral_code = $1 WHERE user_id = $2', [newCode, req.user.user_id]);
-            updated = true;
-          } catch (err) {
-            if (err.code === '23505' && err.detail && err.detail.includes('referral_code')) {
-              attempts += 1;
-            } else {
-              throw err;
+      await client.query('BEGIN');
+
+      const googleUser = req.user; 
+
+      if (req.query.state) {
+        try {
+          const decodedState = JSON.parse(Buffer.from(req.query.state, 'base64').toString('ascii'));
+          const referralCode = decodedState.referralCode;
+
+          if (referralCode && !googleUser.referred_by_user_id) {
+            console.log(`[OAuth] Applying referral code ${referralCode} to new user ${googleUser.user_id}`);
+            
+            const referrerResult = await client.query('SELECT user_id FROM users WHERE referral_code = $1', [referralCode]);
+            if (referrerResult.rows.length > 0) {
+              const referrerId = referrerResult.rows[0].user_id;
+              await client.query('UPDATE users SET referred_by_user_id = $1 WHERE user_id = $2', [referrerId, googleUser.user_id]);
+            }
+
+            const syndicateResult = await client.query('SELECT pin_name_to_grant FROM syndicates WHERE referral_code = $1', [referralCode.toLowerCase()]);
+            if (syndicateResult.rows.length > 0) {
+              const pinToMint = syndicateResult.rows[0].pin_name_to_grant;
+              await client.query('INSERT INTO pins (owner_id, pin_name) VALUES ($1, $2)', [googleUser.user_id, pinToMint]);
+              console.log(`[OAuth] Minted Syndicate Pin '${pinToMint}' for user ${googleUser.user_id}`);
             }
           }
-        }
-        if (!updated) {
-          throw new Error('Failed to assign a unique referral code');
+        } catch (stateError) {
+          console.error('[OAuth] Failed to decode or process referral state:', stateError);
         }
       }
-         const freshUserResult = await pool.query('SELECT * FROM users WHERE user_id = $1', [req.user.user_id]);
-      const freshUser = freshUserResult.rows[0];
-
-      // Now we build the payload with the fresh data, including the account_tier.
+      
       const payload = { 
         user: { 
-          id: freshUser.user_id, 
-          username: freshUser.username, 
-          isAdmin: freshUser.is_admin,
-          account_tier: freshUser.account_tier // This is the crucial piece
+          id: googleUser.user_id, 
+          username: googleUser.username, 
+          isAdmin: googleUser.is_admin,
+          account_tier: googleUser.account_tier
         } 
       };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
+      
+      await client.query('COMMIT');
       res.redirect(`${frontend}/oauth-success?token=${token}`);
+
     } catch (err) {
-      console.error('Google callback error:', err);
-      res.redirect(`${process.env.FRONTEND_URL || 'https://www.hyper-strategies.com'}/login`);
+      await client.query('ROLLBACK');
+      console.error('Google callback transaction error:', err);
+      res.redirect(`${process.env.FRONTEND_URL || 'https://www.hyper-strategies.com'}/login?error=oauth_failed`);
+    } finally {
+      client.release();
     }
   }
 );
+
+// --- FIX ENDS HERE ---
+
 
 router.get('/me', authenticateToken, async (req, res) => {
   try {
@@ -279,29 +305,22 @@ router.post(
     try {
       const userResult = await pool.query('SELECT user_id FROM users WHERE email = $1', [email]);
       if (userResult.rows.length === 0) {
-        // SECURITY: We don't tell the user if the email was found or not.
-        // This prevents people from guessing emails.
         return res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
       }
       const user = userResult.rows[0];
 
-      // 1. Generate a secure, random token
       const resetToken = crypto.randomBytes(32).toString('hex');
-      // 2. Hash the token before storing it in the database for security
       const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-      // 3. Set an expiration date for 1 hour from now
-      const tokenExpires = new Date(Date.now() + 3600000); // 1 hour
+      const tokenExpires = new Date(Date.now() + 3600000); 
 
-      // 4. Update the user's record in the database
       await pool.query(
         'UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE user_id = $3',
         [hashedToken, tokenExpires, user.user_id]
       );
 
-      // 5. Send the email with the UN-HASHED token
       const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
       await resend.emails.send({
-        from: 'password-reset@hyper-strategies.com', // You'll need to verify this domain in Resend
+        from: 'password-reset@hyper-strategies.com',
         to: email,
         subject: 'Your HyperStrategies Password Reset Link',
         html: `<p>You requested a password reset. Please click this link to set a new password:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>This link will expire in one hour.</p>`,
@@ -311,13 +330,11 @@ router.post(
 
     } catch (err) {
       console.error('Forgot password error:', err);
-      // Don't send a detailed error to the client
       res.status(500).json({ error: 'An error occurred.' });
     }
   }
 );
 
-// ROUTE 2: User submits a new password with their token
 router.post(
   '/reset-password',
   authLimiter,
@@ -332,10 +349,7 @@ router.post(
     }
     const { token, password } = req.body;
     try {
-      // 1. Hash the token from the request to match what's in the database
       const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
-
-      // 2. Find the user with that token and ensure it has not expired
       const userResult = await pool.query(
         'SELECT user_id FROM users WHERE password_reset_token = $1 AND password_reset_expires > NOW()',
         [hashedToken]
@@ -346,7 +360,6 @@ router.post(
       }
       const user = userResult.rows[0];
 
-      // 3. Hash the new password and update the user's record
       const salt = await bcrypt.genSalt(10);
       const newPasswordHash = await bcrypt.hash(password, salt);
 
@@ -366,4 +379,3 @@ router.post(
 
 
 module.exports = router;
-

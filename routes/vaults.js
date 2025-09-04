@@ -25,7 +25,7 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
     const baseFeePct = parseFloat(theVault.fee_percentage) * 100;
     let tierDiscountPct = 0;
     if (theVault.is_fee_tier_based && theUser.account_tier > 1) {
-        tierDiscountPct = (theUser.account_tier - 1) * 2.0;
+        tierDiscountPct = (theUser.account_tier - 1) * 0.5;
     }
 
     // --- THE FIX: This query now joins the new 'pins' table with pin_definitions ---
@@ -59,6 +59,7 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
         totalPinDiscountPct,
         finalFeePct,
         finalTradablePct,
+        finalFeeAmountBN: finalFeeAmount,
         finalFeeAmount: ethers.utils.formatUnits(finalFeeAmount, tokenDecimals),
         finalTradableAmount: ethers.utils.formatUnits(finalTradableAmount, tokenDecimals)
     };
@@ -111,11 +112,11 @@ router.post('/invest', authenticateToken, async (req, res) => {
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
         await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, feeBreakdown.finalFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         
-        await dbClient.query(
-            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
-             VALUES ($1, $2, 'DEPOSIT', $3, 'PENDING_SWEEP')`,
-            [userId, vaultId, feeBreakdown.finalTradableAmount]
-        );
+     await dbClient.query(
+    `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) 
+     VALUES ($1, $2, 'DEPOSIT', $3, $4, 'PENDING_SWEEP')`,
+    [userId, vaultId, feeBreakdown.finalTradableAmount, feeBreakdown.finalFeeAmount] 
+);
         
         const feeToDistributeStr = feeBreakdown.finalFeeAmount;
         await dbClient.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'`, [feeToDistributeStr]);
@@ -244,11 +245,11 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
             [userId, vaultId, -withdrawalAmount]
         );
         const description = `Requested withdrawal of ${withdrawalAmount.toFixed(2)} USDC from Vault ${vaultId}.`;
-        await client.query(
-            `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) 
-             VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING')`, 
-            [userId, description, withdrawalAmount]
-        );
+       await client.query(
+    `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, related_vault_id) 
+     VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING', $4)`, 
+    [userId, description, withdrawalAmount, vaultId] 
+);
         
         await client.query('COMMIT');
         res.status(200).json({ message: 'Withdrawal request submitted successfully.' });

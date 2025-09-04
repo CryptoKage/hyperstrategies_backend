@@ -323,20 +323,29 @@ router.post('/approve-withdrawal/:activityId', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    
+    // 1. Fetch the request, including our new reliable ID
     const requestResult = await client.query(
-      `SELECT user_id, amount_primary, description FROM user_activity_log WHERE activity_id = $1 AND activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND status = 'PENDING'`,
+      `SELECT user_id, amount_primary, description, related_vault_id FROM user_activity_log WHERE activity_id = $1 AND activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND status = 'PENDING'`,
       [activityId]
     );
+
     if (requestResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Pending withdrawal request not found or already processed.' });
     }
+
     const request = requestResult.rows[0];
-    const { user_id, description } = request;
-    const vaultIdMatch = description.match(/from Vault (\d+)/);
-    const vaultId = vaultIdMatch ? parseInt(vaultIdMatch[1], 10) : null;
-    if (!vaultId) throw new Error('Could not parse vault ID from withdrawal description.');
-    
+    const { user_id, related_vault_id } = request;
+    const vaultId = related_vault_id;
+
+    // --- THIS IS THE ADDED SAFETY CHECK ---
+    // We confirm that a vault ID was actually found before proceeding.
+    if (!vaultId) {
+        throw new Error(`Could not find a related_vault_id for activity log ${activityId}.`);
+    }
+    // --- END OF SAFETY CHECK ---
+
     await client.query(
       `UPDATE vault_ledger_entries SET status = 'PENDING_PROCESS' WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'WITHDRAWAL_REQUEST' AND status = 'PENDING_APPROVAL'`,
       [user_id, vaultId]

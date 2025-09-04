@@ -121,6 +121,51 @@ router.get('/profile', authenticateToken, async (req, res) => {
   }
 });
 
+router.put('/profile', authenticateToken, async (req, res) => {
+  // We'll use a creative variable name here to avoid conflicts.
+  const { username: desiredUsername } = req.body;
+  const currentUserId = req.user.id;
+
+  // --- 1. Validation and Sanitization ---
+  // We first check if the username is valid and clean it up.
+  if (!desiredUsername || typeof desiredUsername !== 'string' || desiredUsername.trim().length < 3) {
+    return res.status(400).json({ error: 'Username must be at least 3 characters long.' });
+  }
+  const sanitizedUsername = desiredUsername.trim();
+
+  try {
+    // --- 2. CRITICAL Security Check: Is the name taken by ANOTHER user? ---
+  
+    const existingUserCheck = await pool.query(
+      'SELECT user_id FROM users WHERE username = $1 AND user_id != $2',
+      [sanitizedUsername, currentUserId]
+    );
+
+    // If we find any rows, it means the name is already in use.
+    if (existingUserCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'This username is already taken. Please choose another.' }); // 409 Conflict
+    }
+
+    // --- 3. Database Update ---
+
+    await pool.query(
+      'UPDATE users SET username = $1 WHERE user_id = $2',
+      [sanitizedUsername, currentUserId]
+    );
+
+    // --- 4. Success Response ---
+ 
+    res.status(200).json({ message: 'Username updated successfully!' });
+
+  } catch (err) {
+    if (err.code === '23505') { 
+      return res.status(409).json({ error: 'This username was just claimed. Please try another.' });
+    }
+    
+    console.error(`Error updating username for user ${currentUserId}:`, err);
+    res.status(500).json({ error: 'An error occurred while updating your profile.' });
+  }
+});
 
 router.get('/activity-log', authenticateToken, async (req, res) => {
   try {
@@ -146,7 +191,11 @@ router.get('/activity-log', authenticateToken, async (req, res) => {
 router.get('/leaderboard', async (req, res) => {
   try {
     const leaderboardResult = await pool.query(
-      `SELECT eth_address, xp FROM users WHERE eth_address IS NOT NULL ORDER BY xp DESC, created_at ASC LIMIT 25`
+      `SELECT username, referral_code, xp 
+       FROM users 
+       WHERE referral_code IS NOT NULL 
+       ORDER BY xp DESC, created_at ASC 
+       LIMIT 25`
     );
     res.json(leaderboardResult.rows);
   } catch (err) {

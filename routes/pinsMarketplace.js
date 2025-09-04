@@ -1,82 +1,95 @@
+// pinsmarketplace.js
+
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+const { ethers } = require('ethers'); // Using ethers for safe financial math
 const authenticateToken = require('../middleware/authenticateToken');
 const requireTier = require('../middleware/requireTier');
-const { body, param, validationResult } = require('express-validator'); 
+const { body, param, validationResult } = require('express-validator');
 
 const MAX_PRICE = 1000000;
+const MARKETPLACE_FEE_PERCENTAGE = 0.0025; // 0.25%
 
-// All marketplace routes require authentication and minimum tier 2
+// All marketplace routes require authentication and a minimum account tier.
 router.use(authenticateToken);
-router.use(requireTier(2));
+router.use(requireTier(2)); // Example: Tier 2 required to use the marketplace
 
-// Get all active tab listings
-router.get('/tabs', async (req, res) => {
+// --- GET All Active Pin Listings ---
+// This query is now more powerful, joining multiple tables to provide all necessary data to the frontend.
+router.get('/listings', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT l.listing_id, t.tab_id, t.name, t.description, l.price, l.seller_id
-       FROM tab_listings l
-       JOIN tabs t ON l.tab_id = t.tab_id
+      `SELECT 
+         l.listing_id, 
+         l.price, 
+         l.created_at,
+         p.pin_id,
+         u.username as seller_username,
+         pd.pin_name, 
+         pd.pin_description, 
+         pd.image_url
+       FROM pin_listings l
+       JOIN pins p ON l.pin_id = p.pin_id
+       JOIN pin_definitions pd ON p.pin_name = pd.pin_name
+       JOIN users u ON l.seller_id = u.user_id
        WHERE l.status = 'ACTIVE'
        ORDER BY l.created_at DESC`
     );
     res.json(rows);
   } catch (err) {
-    console.error('Error fetching tab listings:', err);
+    console.error('Error fetching pin listings:', err);
     res.status(500).send('Server Error');
   }
 });
 
-// List a tab for sale
+// --- List a Unique Pin for Sale ---
 router.post(
-  '/tabs/list',
+  '/listings/list',
   [
-    body('tabId').isInt({ gt: 0 }).withMessage('tabId must be a positive integer'),
-    body('price')
-      .isFloat({ gt: 0, lt: MAX_PRICE })
-      .withMessage(`price must be a positive number below ${MAX_PRICE}`),
+    body('pinId').isInt({ gt: 0 }).withMessage('A valid pinId is required.'),
+    body('price').isFloat({ gt: 0, lt: MAX_PRICE }).withMessage(`Price must be a positive number below ${MAX_PRICE}.`),
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const { tabId, price } = req.body;
-    const numericPrice = parseFloat(price);
+    const { pinId, price } = req.body;
     const userId = req.user.id;
-
     const client = await pool.connect();
+
     try {
       await client.query('BEGIN');
-      const tabRes = await client.query('SELECT owner_id FROM tabs WHERE tab_id = $1', [tabId]);
-      if (tabRes.rows.length === 0) {
+
+      // 1. Verify the user owns this specific pin instance
+      const pinOwnership = await client.query('SELECT owner_id FROM pins WHERE pin_id = $1 FOR UPDATE', [pinId]);
+      if (pinOwnership.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Tab not found' });
+        return res.status(404).json({ error: 'Pin not found.' });
       }
-      if (tabRes.rows[0].owner_id !== userId) {
+      if (pinOwnership.rows[0].owner_id !== userId) {
         await client.query('ROLLBACK');
-        return res.status(403).json({ error: 'Not owner of this tab' });
+        return res.status(403).json({ error: 'You do not own this pin.' });
       }
-      const existingRes = await client.query(
-        "SELECT listing_id FROM tab_listings WHERE tab_id = $1 AND status = 'ACTIVE'",
-        [tabId]
-      );
-      if (existingRes.rows.length > 0) {
+
+      // 2. Verify this specific pin instance is not already listed
+      const existingListing = await client.query("SELECT listing_id FROM pin_listings WHERE pin_id = $1 AND status = 'ACTIVE'", [pinId]);
+      if (existingListing.rows.length > 0) {
         await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'Tab already listed' });
+        return res.status(409).json({ error: 'This pin is already listed for sale.' });
       }
+
+      // 3. Create the new listing
       await client.query(
-        'INSERT INTO tab_listings (tab_id, seller_id, price, status) VALUES ($1, $2, $3, ' +
-          "'ACTIVE')",
-        [tabId, userId, numericPrice]
+        "INSERT INTO pin_listings (pin_id, seller_id, price, status) VALUES ($1, $2, $3, 'ACTIVE')",
+        [pinId, userId, price]
       );
+
       await client.query('COMMIT');
-      res.status(201).json({ message: 'Tab listed for sale' });
+      res.status(201).json({ message: 'Your pin has been successfully listed for sale.' });
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error('Error listing tab:', err);
+      console.error('Error listing pin:', err);
       res.status(500).send('Server Error');
     } finally {
       client.release();
@@ -84,67 +97,78 @@ router.post(
   }
 );
 
-// Buy a tab listing
+// --- Buy a Pin Listing ---
 router.post(
-  '/tabs/:listingId/buy',
-  [param('listingId').isInt({ gt: 0 }).withMessage('listingId must be a positive integer')],
+  '/listings/:listingId/buy',
+  [param('listingId').isInt({ gt: 0 }).withMessage('A valid listingId is required.')],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const { listingId } = req.params;
     const buyerId = req.user.id;
     const client = await pool.connect();
+
     try {
       await client.query('BEGIN');
-      const listingRes = await client.query(
-        `SELECT l.listing_id, l.tab_id, l.price, l.seller_id, l.status
-         FROM tab_listings l
-         WHERE l.listing_id = $1 FOR UPDATE`,
-        [listingId]
-      );
-      if (listingRes.rows.length === 0) {
+
+      // 1. Get and lock the listing to prevent race conditions
+      const listingResult = await client.query("SELECT * FROM pin_listings WHERE listing_id = $1 FOR UPDATE", [listingId]);
+      if (listingResult.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Listing not found' });
+        return res.status(404).json({ error: 'Listing not found.' });
       }
-      const listing = listingRes.rows[0];
-      const listingPrice = parseFloat(listing.price);
-      if (isNaN(listingPrice) || listingPrice <= 0 || listingPrice >= MAX_PRICE) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Invalid listing price' });
-      }
+
+      const listing = listingResult.rows[0];
       if (listing.status !== 'ACTIVE') {
         await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Listing not active' });
+        return res.status(400).json({ error: 'This listing is no longer active.' });
       }
       if (listing.seller_id === buyerId) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Cannot buy your own tab' });
+        return res.status(400).json({ error: 'You cannot buy your own pin.' });
       }
-      const balanceRes = await client.query('SELECT balance FROM users WHERE user_id = $1', [buyerId]);
-      if (balanceRes.rows.length === 0) {
+
+      // 2. Check buyer's balance
+      const buyerResult = await client.query('SELECT balance FROM users WHERE user_id = $1 FOR UPDATE', [buyerId]);
+      const buyerBalance = ethers.utils.parseUnits(buyerResult.rows[0].balance.toString(), 6); // Assuming 6 decimals for USDC
+      const listingPrice = ethers.utils.parseUnits(listing.price.toString(), 6);
+
+      if (buyerBalance.lt(listingPrice)) {
         await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Buyer not found' });
+        return res.status(400).json({ error: 'Insufficient USDC balance.' });
       }
-      const buyerBalance = parseFloat(balanceRes.rows[0].balance);
-      if (buyerBalance < listingPrice) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Insufficient balance' });
-      }
-      await client.query('UPDATE users SET balance = balance - $1 WHERE user_id = $2', [listingPrice, buyerId]);
-      await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [listingPrice, listing.seller_id]);
-      await client.query('UPDATE tabs SET owner_id = $1 WHERE tab_id = $2', [buyerId, listing.tab_id]);
+
+      // 3. Calculate fees and proceeds
+      const feeAmount = listingPrice.mul(Math.round(MARKETPLACE_FEE_PERCENTAGE * 10000)).div(10000);
+      const sellerProceeds = listingPrice.sub(feeAmount);
+
+      // 4. Perform the atomic swap of funds and ownership
+      await client.query('UPDATE users SET balance = balance - $1 WHERE user_id = $2', [ethers.utils.formatUnits(listingPrice, 6), buyerId]);
+      await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [ethers.utils.formatUnits(sellerProceeds, 6), listing.seller_id]);
+      await client.query('UPDATE pins SET owner_id = $1 WHERE pin_id = $2', [buyerId, listing.pin_id]);
+
+      // 5. Update the listing to 'SOLD'
       await client.query(
-        "UPDATE tab_listings SET status = 'SOLD', buyer_id = $1, sold_at = NOW() WHERE listing_id = $2",
+        "UPDATE pin_listings SET status = 'SOLD', buyer_id = $1, sold_at = NOW() WHERE listing_id = $2",
         [buyerId, listingId]
       );
+
+      // 6. Record the fee revenue for auditing
+      const marketplaceLedger = await client.query("SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'MARKETPLACE_FEES_TOTAL'");
+      if (marketplaceLedger.rows.length > 0) {
+        const ledgerId = marketplaceLedger.rows[0].ledger_id;
+        const feeAmountStr = ethers.utils.formatUnits(feeAmount, 6);
+        await client.query('UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_id = $2', [feeAmountStr, ledgerId]);
+        const feeDescription = `Marketplace Fee from listing #${listingId} (Pin ID: ${listing.pin_id})`;
+        await client.query('INSERT INTO treasury_transactions (to_ledger_id, amount, description) VALUES ($1, $2, $3)', [ledgerId, feeAmountStr, feeDescription]);
+      }
+
       await client.query('COMMIT');
-      res.json({ message: 'Tab purchased successfully' });
+      res.json({ message: 'Pin purchased successfully!' });
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error('Error buying tab:', err);
+      console.error('Error buying pin:', err);
       res.status(500).send('Server Error');
     } finally {
       client.release();
@@ -152,19 +176,19 @@ router.post(
   }
 );
 
-// Cancel a listing
-router.delete('/tabs/:listingId', async (req, res) => {
+// --- Cancel a Listing ---
+router.delete('/listings/:listingId', async (req, res) => {
   const { listingId } = req.params;
   const userId = req.user.id;
   try {
     const result = await pool.query(
-      "UPDATE tab_listings SET status = 'CANCELLED' WHERE listing_id = $1 AND seller_id = $2 AND status = 'ACTIVE'",
+      "UPDATE pin_listings SET status = 'CANCELLED' WHERE listing_id = $1 AND seller_id = $2 AND status = 'ACTIVE'",
       [listingId, userId]
     );
     if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Listing not found or cannot cancel' });
+      return res.status(404).json({ error: 'Active listing not found or you are not the owner.' });
     }
-    res.json({ message: 'Listing cancelled' });
+    res.json({ message: 'Your listing has been cancelled.' });
   } catch (err) {
     console.error('Error cancelling listing:', err);
     res.status(500).send('Server Error');
