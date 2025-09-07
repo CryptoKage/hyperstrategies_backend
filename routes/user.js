@@ -81,43 +81,52 @@ router.get('/wallet', authenticateToken, async (req, res) => {
 });
 
 
-// --- THE REFACTORED /profile Endpoint ---
 router.get('/profile', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const client = await pool.connect();
   try {
-    const userId = req.user.id;
-    const [profileResult, stakedResult, pinsResult] = await Promise.all([
-      // Query 1: Gets main user details (no longer selects 'tags')
-      pool.query(`
-        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, COALESCE(SUM(bp.points_amount), 0) AS total_bonus_points
+    // 1. Fetch all necessary data in parallel
+    const [profileResult, ownedPinsResult, activePinIdsResult, userEffects] = await Promise.all([
+      client.query(`
+        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier 
         FROM users u 
-        LEFT JOIN bonus_points bp ON u.user_id = bp.user_id
-        WHERE u.user_id = $1 
-        GROUP BY u.user_id;
+        WHERE u.user_id = $1;
       `, [userId]),
-      // Query 2: Gets total staked capital (unchanged)
-      pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]),
-      // Query 3 (NEW): Fetches all pin names for the user from the new 'pins' table.
-      pool.query("SELECT pin_name FROM pins WHERE owner_id = $1", [userId])
+      // Get ALL pins the user owns, with details
+      client.query(`
+        SELECT p.pin_id, pd.pin_name, pd.pin_description, pd.image_url 
+        FROM pins p
+        JOIN pin_definitions pd ON p.pin_name = pd.pin_name
+        WHERE p.owner_id = $1 
+        ORDER BY p.pin_id;
+      `, [userId]),
+      // Get a simple list of which pin IDs are active
+      client.query('SELECT pin_id FROM user_active_pins WHERE user_id = $1', [userId]),
+      // Use our engine to calculate total available slots
+      calculateActiveEffects(userId, client)
     ]);
 
     if (profileResult.rows.length === 0) {
       return res.status(404).json({ error: 'User not found.' });
     }
 
+    // 2. Assemble the final, rich data payload for the frontend
     const profileData = profileResult.rows[0];
-    const totalStakedCapital = parseFloat(stakedResult.rows[0].total);
-    // This creates the simple array of pin names that the frontend expects.
-    const userPins = pinsResult.rows.map(row => row.pin_name);
+    const ownedPins = ownedPinsResult.rows;
+    const activePinIds = activePinIdsResult.rows.map(r => r.pin_id);
+    const totalPinSlots = userEffects.total_pin_slots;
 
-    // Combine all data into the final response, adding the new 'pins' property.
     res.json({
       ...profileData,
-      total_staked_capital: totalStakedCapital,
-      pins: userPins 
+      ownedPins: ownedPins,         // Array of objects with full pin details
+      activePinIds: activePinIds,   // Array of integers, e.g., [101, 102]
+      totalPinSlots: totalPinSlots  // A single number, e.g., 3
     });
   } catch (err) {
-    console.error('Error fetching profile data:', err);
+    console.error('Error fetching rich profile data:', err);
     res.status(500).send('Server Error');
+  } finally {
+    client.release();
   }
 });
 
@@ -369,5 +378,68 @@ router.post('/mint-troll-pin', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
+
+const { calculateActiveEffects } = require('../utils/effectsEngine');
+
+router.post('/active-pins', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  // Expecting an array of unique pin IDs from the frontend, e.g., [101, 102, 103]
+  const { activePinIds } = req.body;
+
+  // Basic validation
+  if (!Array.isArray(activePinIds)) {
+    return res.status(400).json({ error: 'activePinIds must be an array.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Determine the user's total available slots.
+    // We call the engine first, as a pin MIGHT grant bonus slots.
+    const userEffects = await calculateActiveEffects(userId, client);
+    const availableSlots = userEffects.total_pin_slots;
+
+    if (activePinIds.length > availableSlots) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `You can only equip up to ${availableSlots} pins.` });
+    }
+
+    // 2. Verify that the user actually owns all the pins they are trying to equip.
+    // This is a critical security check.
+    const ownedPinsResult = await client.query(
+      'SELECT pin_id FROM pins WHERE owner_id = $1 AND pin_id = ANY($2::int[])',
+      [userId, activePinIds]
+    );
+
+    if (ownedPinsResult.rows.length !== activePinIds.length) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'You are trying to equip a pin you do not own.' });
+    }
+    
+    // 3. If all checks pass, update their active loadout.
+    // We first delete all of their old active pins.
+    await client.query('DELETE FROM user_active_pins WHERE user_id = $1', [userId]);
+
+    // Then, we insert the new loadout.
+    if (activePinIds.length > 0) {
+      const insertValues = activePinIds.map((pinId, index) => `('${userId}', ${pinId}, ${index + 1})`).join(',');
+      const insertQuery = `INSERT INTO user_active_pins (user_id, pin_id, slot_number) VALUES ${insertValues}`;
+      await client.query(insertQuery);
+    }
+    
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Pin loadout updated successfully.' });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`Error updating active pins for user ${userId}:`, error);
+    res.status(500).json({ error: 'An error occurred while updating your pin loadout.' });
+  } finally {
+    client.release();
+  }
+});
+
+
 
 module.exports = router;

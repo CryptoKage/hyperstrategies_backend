@@ -6,6 +6,7 @@ const { ethers } = require('ethers');
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
+const { calculateActiveEffects } = require('../utils/effectsEngine');
 
 const router = express.Router();
 
@@ -13,46 +14,43 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
     const tokenDecimals = tokenMap.usdc.decimals;
     const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmount.toString(), tokenDecimals);
 
-    const vaultResult = await dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
-    const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
+    // 1. Fetch vault details and ALL user effects in parallel.
+    const [vaultResult, userEffects] = await Promise.all([
+        dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
+        calculateActiveEffects(userId, dbClient) // <-- We call our new engine here!
+    ]);
 
-    if (vaultResult.rows.length === 0 || userResult.rows.length === 0) {
-        throw new Error('User or Vault not found for fee calculation.');
+    if (vaultResult.rows.length === 0) {
+        throw new Error('Vault not found for fee calculation.');
     }
     const theVault = vaultResult.rows[0];
-    const theUser = userResult.rows[0];
 
+    // 2. Start with the vault's base fee.
     const baseFeePct = parseFloat(theVault.fee_percentage) * 100;
+
+    // 3. Get discounts directly from our effects engine.
     let tierDiscountPct = 0;
-    if (theVault.is_fee_tier_based && theUser.account_tier > 1) {
-        tierDiscountPct = (theUser.account_tier - 1) * 0.5;
-    }
-
-    // --- THE FIX: This query now joins the new 'pins' table with pin_definitions ---
-    const userPinsResult = await dbClient.query(`
-        SELECT pd.pin_effects_config FROM pins p
-        JOIN pin_definitions pd ON p.pin_name = pd.pin_name
-        WHERE p.owner_id = $1 AND pd.pin_effects_config->>'deposit_fee_discount_pct' IS NOT NULL;
-    `, [userId]);
-
-    let totalPinDiscountPct = 0;
-    if (userPinsResult.rows.length > 0) {
-        for (const perk of userPinsResult.rows) {
-            const discount = parseFloat(perk.pin_effects_config.deposit_fee_discount_pct);
-            if (!isNaN(discount)) {
-                totalPinDiscountPct += discount;
-            }
+    if (theVault.is_fee_tier_based) {
+        // The tier discount logic is now centralized in the engine (or could be).
+        // For now, we'll keep the simple calculation, but use the tier from the user object.
+        const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
+        const userTier = userResult.rows[0].account_tier;
+        if (userTier > 1) {
+            tierDiscountPct = (userTier - 1) * 0.5;
         }
     }
+    const totalPinDiscountPct = userEffects.fee_discount_pct || 0;
 
+    // 4. Calculate the final fee, ensuring it doesn't go below a minimum.
     let finalFeePct = baseFeePct - tierDiscountPct - totalPinDiscountPct;
-    if (finalFeePct < 0.5) finalFeePct = 0.5;
+    if (finalFeePct < 0.5) finalFeePct = 0.5; // Minimum fee clamp
     const finalTradablePct = 100 - finalFeePct;
 
-    const baseFeeAmount = investmentAmountBigNum.mul(Math.round(baseFeePct * 100)).div(10000);
+    // 5. Calculate final amounts using BigNumber for precision.
     const finalFeeAmount = investmentAmountBigNum.mul(Math.round(finalFeePct * 100)).div(10000);
     const finalTradableAmount = investmentAmountBigNum.sub(finalFeeAmount);
 
+    // 6. Return all the data the frontend needs to display the breakdown.
     return {
         baseFeePct,
         tierDiscountPct,
