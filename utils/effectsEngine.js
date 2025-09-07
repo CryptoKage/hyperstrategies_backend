@@ -20,10 +20,16 @@ async function calculateActiveEffects(userId, dbClient = pool) {
   const userQuery = 'SELECT account_tier FROM users WHERE user_id = $1';
   const pinsQuery = `
     SELECT pd.pin_effects_config 
-    FROM user_active_pins uap
-    JOIN pins p ON uap.pin_id = p.pin_id
-    JOIN pin_definitions pd ON p.pin_name = pd.pin_name
-    WHERE uap.user_id = $1 AND pd.pin_effects_config IS NOT NULL;
+    FROM pin_definitions pd
+    WHERE pd.pin_name IN (
+        SELECT p.pin_name 
+        FROM pins p
+        WHERE p.pin_id IN (
+            SELECT uap.pin_id 
+            FROM user_active_pins uap 
+            WHERE uap.user_id = $1
+        )
+    ) AND pd.pin_effects_config IS NOT NULL;
   `;
 
   const [userResult, activePinsResult] = await Promise.all([
