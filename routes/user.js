@@ -88,7 +88,7 @@ router.get('/profile', authenticateToken, async (req, res) => {
     // 1. Fetch all necessary data in parallel
     const [profileResult, ownedPinsResult, activePinIdsResult, userEffects] = await Promise.all([
       client.query(`
-        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier 
+        SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, u.auto_equip_pins
         FROM users u 
         WHERE u.user_id = $1;
       `, [userId]),
@@ -120,7 +120,8 @@ router.get('/profile', authenticateToken, async (req, res) => {
       ...profileData,
       ownedPins: ownedPins,         // Array of objects with full pin details
       activePinIds: activePinIds,   // Array of integers, e.g., [101, 102]
-      totalPinSlots: totalPinSlots  // A single number, e.g., 3
+      totalPinSlots: totalPinSlots,  // A single number, e.g., 3
+      auto_equip_pins: profileData.auto_equip_pins
     });
   } catch (err) {
     console.error('Error fetching rich profile data:', err);
@@ -457,6 +458,38 @@ router.post('/active-pins', authenticateToken, async (req, res) => {
   }
 });
 
+router.put('/pins/auto-equip', authenticateToken, async (req, res) => {
+  const { isEnabled } = req.body;
+  const userId = req.user.id;
 
+  if (typeof isEnabled !== 'boolean') {
+    return res.status(400).json({ error: 'isEnabled must be a boolean.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    await client.query(
+      'UPDATE users SET auto_equip_pins = $1 WHERE user_id = $2',
+      [isEnabled, userId]
+    );
+
+    // If the user is turning auto-equip ON, we should immediately run it for them.
+    if (isEnabled) {
+      const { autoEquipBestPins } = require('../utils/pinUtils');
+      await autoEquipBestPins(userId, client);
+    }
+    
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Setting updated successfully.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`Error updating auto-equip for user ${userId}:`, error);
+    res.status(500).json({ error: 'Failed to update setting.' });
+  } finally {
+    client.release();
+  }
+});
 
 module.exports = router;
