@@ -94,7 +94,7 @@ router.get('/profile', authenticateToken, async (req, res) => {
       `, [userId]),
       // Get ALL pins the user owns, with details
       client.query(`
-        SELECT p.pin_id, pd.pin_name, pd.pin_description, pd.image_url 
+        SELECT p.pin_id, pd.pin_name, pd.pin_description, pd.image_filename
         FROM pins p
         JOIN pin_definitions pd ON p.pin_name = pd.pin_name
         WHERE p.owner_id = $1 
@@ -131,48 +131,65 @@ router.get('/profile', authenticateToken, async (req, res) => {
 });
 
 router.put('/profile', authenticateToken, async (req, res) => {
-  // We'll use a creative variable name here to avoid conflicts.
-  const { username: desiredUsername } = req.body;
+  const { username: newUsername } = req.body;
   const currentUserId = req.user.id;
 
-  // --- 1. Validation and Sanitization ---
-  // We first check if the username is valid and clean it up.
-  if (!desiredUsername || typeof desiredUsername !== 'string' || desiredUsername.trim().length < 3) {
+  if (!newUsername || typeof newUsername !== 'string' || newUsername.trim().length < 3) {
     return res.status(400).json({ error: 'Username must be at least 3 characters long.' });
   }
-  const sanitizedUsername = desiredUsername.trim();
+  const sanitizedUsername = newUsername.trim();
+  
+ 
+  const client = await pool.connect();
 
   try {
-    // --- 2. CRITICAL Security Check: Is the name taken by ANOTHER user? ---
+    await client.query('BEGIN');
+
   
-    const existingUserCheck = await pool.query(
+    const currentUserResult = await client.query('SELECT username FROM users WHERE user_id = $1', [currentUserId]);
+    if (currentUserResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const oldUsername = currentUserResult.rows[0].username;
+
+  
+    const existingUserCheck = await client.query(
       'SELECT user_id FROM users WHERE username = $1 AND user_id != $2',
       [sanitizedUsername, currentUserId]
     );
 
-    // If we find any rows, it means the name is already in use.
     if (existingUserCheck.rows.length > 0) {
-      return res.status(409).json({ error: 'This username is already taken. Please choose another.' }); // 409 Conflict
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This username is already taken. Please choose another.' });
     }
 
-    // --- 3. Database Update ---
-
-    await pool.query(
+  
+    await client.query(
       'UPDATE users SET username = $1 WHERE user_id = $2',
       [sanitizedUsername, currentUserId]
     );
+    
+   
+    await client.query(
+        `INSERT INTO username_history (user_id, old_username, new_username)
+         VALUES ($1, $2, $3)`,
+        [currentUserId, oldUsername, sanitizedUsername]
+    );
+   
 
-    // --- 4. Success Response ---
- 
+    await client.query('COMMIT');
     res.status(200).json({ message: 'Username updated successfully!' });
 
   } catch (err) {
+    await client.query('ROLLBACK');
     if (err.code === '23505') { 
       return res.status(409).json({ error: 'This username was just claimed. Please try another.' });
     }
-    
     console.error(`Error updating username for user ${currentUserId}:`, err);
     res.status(500).json({ error: 'An error occurred while updating your profile.' });
+  } finally {
+    client.release();
   }
 });
 

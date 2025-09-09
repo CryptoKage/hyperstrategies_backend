@@ -7,7 +7,7 @@ const pool = require('../db'); // Your database connection pool
 // Fetches all pin definitions from the database.
 router.get('/definitions', async (req, res) => {
     try {
-        const queryResult = await pool.query('SELECT pin_name, pin_description, image_url FROM pin_definitions ORDER BY pin_name ASC');
+        const queryResult = await pool.query('SELECT pin_name, pin_description, image_filename FROM pin_definitions ORDER BY pin_name ASC');
         const allPinDefinitions = queryResult.rows;
         res.status(200).json(allPinDefinitions);
     } catch (error) {

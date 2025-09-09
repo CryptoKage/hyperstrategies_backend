@@ -11,6 +11,7 @@ const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
+const { autoEquipBestPins } = require('../utils/pinUtils');
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
@@ -139,6 +140,7 @@ router.post(
                     'INSERT INTO pins (owner_id, pin_name) VALUES ($1, $2)',
                     [newUserId, pinToMint]
                 );
+                 await autoEquipBestPins(newUserId, client);
             }
         }
 

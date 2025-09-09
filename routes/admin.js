@@ -172,7 +172,9 @@ router.get('/users/:userId', async (req, res) => {
       // Query 4: Gets bonus points (unchanged)
       pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total FROM bonus_points WHERE user_id = $1', [userId]),
       // Query 5 (NEW): Fetches all pin names for the user from the new 'pins' table.
-      pool.query("SELECT pin_name FROM pins WHERE owner_id = $1", [userId])
+      pool.query("SELECT pin_name FROM pins WHERE owner_id = $1", [userId]),
+      // query 6: name changes
+      pool.query("SELECT old_username, new_username, changed_at FROM username_history WHERE user_id = $1 ORDER BY changed_at DESC LIMIT 10", [userId])
     ]);
 
     if (userDetails.rows.length === 0) {
@@ -190,7 +192,8 @@ router.get('/users/:userId', async (req, res) => {
     res.json({
       details: fullUserDetails,
       positions: userVaults.rows.map(p => ({...p, total_capital: parseFloat(p.total_capital)})),
-      activity: userActivity.rows
+      activity: userActivity.rows,
+      usernameHistory: usernameHistory.rows
     });
   } catch (err) {
     console.error(`Error fetching details for user ${userId}:`, err);

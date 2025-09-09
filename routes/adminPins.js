@@ -46,15 +46,29 @@ router.post('/mint', async (req, res) => {
     if (!userId || !pinName) {
         return res.status(400).json({ message: "userId and pinName are required." });
     }
+    
+    // --- NEW: Use a transaction for safety ---
+    const client = await pool.connect();
     try {
-        const result = await pool.query(
+        await client.query('BEGIN');
+
+        const result = await client.query(
             'INSERT INTO pins (owner_id, pin_name) VALUES ($1, $2) RETURNING *',
             [userId, pinName]
         );
+        
+        // --- THIS IS THE NEW LOGIC: Trigger the auto-equip function ---
+        await autoEquipBestPins(userId, client);
+
+        await client.query('COMMIT');
         res.status(201).json({ message: `Successfully minted '${pinName}' pin for user ${userId}.`, newPin: result.rows[0] });
+
     } catch (error) {
-        console.error("Admin mint pin error:", error);
+        await client.query('ROLLBACK');
+        console.error("Admin mint pin transaction error:", error);
         res.status(500).json({ message: "Failed to mint pin." });
+    } finally {
+        client.release();
     }
 });
 
