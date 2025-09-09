@@ -162,7 +162,7 @@ router.get('/users/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     // --- THE FIX: We now run one extra query to get the pins ---
-    const [userDetails, userVaults, userActivity, bonusPoints, userPins] = await Promise.all([
+    const [userDetails, userVaults, userActivity, bonusPoints, userPins, usernameHistory] = await Promise.all([
       // Query 1: Gets main user details (no longer selects 'tags')
       pool.query('SELECT user_id, username, email, eth_address, xp, account_tier, referral_code, created_at, balance FROM users WHERE user_id = $1', [userId]),
       // Query 2: Gets vault positions (unchanged)
