@@ -492,4 +492,101 @@ router.put('/pins/auto-equip', authenticateToken, async (req, res) => {
   }
 });
 
+router.get('/rewards', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    // We run two queries in parallel for efficiency
+    const [unclaimedResult, historyResult] = await Promise.all([
+      // Query 1: Get the SUM of all 'UNCLAIMED' XP for the user
+      pool.query(
+        `SELECT COALESCE(SUM(amount_primary), 0) as total 
+         FROM user_activity_log 
+         WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type LIKE 'XP_%'`,
+        [userId]
+      ),
+      // Query 2: Get a categorized history of all 'CLAIMED' XP
+      pool.query(
+        `SELECT source, SUM(amount_primary) as total 
+         FROM user_activity_log 
+         WHERE user_id = $1 AND status = 'CLAIMED' AND activity_type LIKE 'XP_%'
+         GROUP BY source 
+         ORDER BY source`,
+        [userId]
+      )
+    ]);
+    
+    const unclaimedXp = parseFloat(unclaimedResult.rows[0].total);
+    const claimedHistory = historyResult.rows.map(row => ({
+        source: row.source || 'General', // Provide a fallback category
+        total: parseFloat(row.total)
+    }));
+
+    res.json({
+      unclaimedXp: unclaimedXp,
+      claimedHistory: claimedHistory
+    });
+
+  } catch (error) {
+    console.error(`Error fetching rewards for user ${userId}:`, error);
+    res.status(500).json({ error: 'Failed to fetch rewards data.' });
+  }
+});
+
+// --- POST Endpoint: Claim all available XP ---
+router.post('/rewards/claim', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Find the total amount of unclaimed XP and lock those rows for the transaction
+    const unclaimedResult = await client.query(
+      `SELECT COALESCE(SUM(amount_primary), 0) as total 
+       FROM user_activity_log 
+       WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type LIKE 'XP_%' FOR UPDATE`,
+      [userId]
+    );
+    const xpToClaim = parseFloat(unclaimedResult.rows[0].total);
+
+    // If there's nothing to claim, we can stop early.
+    if (xpToClaim <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(200).json({ message: 'No XP to claim.', claimedAmount: 0 });
+    }
+
+    // 2. Mark all of the user's unclaimed XP entries as 'CLAIMED'
+    await client.query(
+      `UPDATE user_activity_log SET status = 'CLAIMED' 
+       WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type LIKE 'XP_%'`,
+      [userId]
+    );
+
+    // 3. Add the claimed XP to the user's main XP balance and update their tier
+    const userXpResult = await client.query(
+      'UPDATE users SET xp = xp + $1 WHERE user_id = $2 RETURNING xp, account_tier',
+      [xpToClaim, userId]
+    );
+    
+    const { calculateUserTier } = require('../utils/tierUtils');
+    const newTotalXp = parseFloat(userXpResult.rows[0].xp);
+    const newTier = calculateUserTier(newTotalXp);
+    
+    await client.query('UPDATE users SET account_tier = $1 WHERE user_id = $2', [newTier, userId]);
+
+    await client.query('COMMIT');
+    res.status(200).json({ 
+      message: `Successfully claimed ${xpToClaim.toFixed(2)} XP!`,
+      claimedAmount: xpToClaim,
+      newTotalXp: newTotalXp
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`Error claiming XP for user ${userId}:`, error);
+    res.status(500).json({ error: 'Failed to claim XP.' });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
