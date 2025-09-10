@@ -524,6 +524,73 @@ router.post('/scan-user-wallet', async (req, res) => {
   }
 });
 
+router.post('/bulk-award-xp', async (req, res) => {
+  // Expecting a payload like: { bounties: [{ telegram_id: "user1", usd_value: 100.50 }, ...] }
+  const { bounties } = req.body;
+  const USD_TO_XP_RATIO = 1; // Example: 1 USD = 1 XP. We can configure this.
+
+  if (!Array.isArray(bounties) || bounties.length === 0) {
+    return res.status(400).json({ error: 'A non-empty "bounties" array is required.' });
+  }
+
+  const client = await pool.connect();
+  const results = {
+    success: [],
+    failed: []
+  };
+
+  try {
+    for (const bounty of bounties) {
+      const { telegram_id, usd_value } = bounty;
+      const xpToAward = parseFloat(usd_value) * USD_TO_XP_RATIO;
+
+      // Validate each entry
+      if (!telegram_id || isNaN(xpToAward) || xpToAward <= 0) {
+        results.failed.push({ telegram_id, reason: 'Invalid or missing telegram_id or usd_value.' });
+        continue; // Skip to the next bounty
+      }
+
+      await client.query('BEGIN');
+      try {
+        // Find the user by their Telegram ID
+        const userResult = await client.query('SELECT user_id FROM users WHERE telegram_id = $1', [telegram_id]);
+        
+        if (userResult.rows.length === 0) {
+          throw new Error(`User with Telegram ID '${telegram_id}' not found.`);
+        }
+        const userId = userResult.rows[0].user_id;
+
+        // Create a new, UNCLAIMED XP entry in the activity log
+        const description = `Awarded ${xpToAward.toFixed(2)} XP for Telegram Bounty.`;
+        await client.query(
+          `INSERT INTO user_activity_log (user_id, activity_type, status, source, description, amount_primary, symbol_primary)
+           VALUES ($1, 'XP_BOUNTY', 'UNCLAIMED', 'TELEGRAM_BOUNTY', $2, $3, 'XP')`,
+          [userId, description, xpToAward]
+        );
+        
+        await client.query('COMMIT');
+        results.success.push({ telegram_id, userId, xp_awarded: xpToAward });
+        
+      } catch (innerError) {
+        await client.query('ROLLBACK');
+        results.failed.push({ telegram_id, reason: innerError.message });
+      }
+    }
+    
+    console.log(`[Admin Bulk Award] Processed ${bounties.length} bounties. Success: ${results.success.length}, Failed: ${results.failed.length}`);
+    res.status(200).json({
+      message: `Processing complete. Successfully awarded ${results.success.length} bounties. Failed to award ${results.failed.length}.`,
+      results: results
+    });
+
+  } catch (error) {
+    // This catches errors in the main loop, though inner errors are handled above
+    console.error('Major error in bulk-award-xp endpoint:', error);
+    res.status(500).json({ error: 'A major server error occurred during processing.' });
+  } finally {
+    client.release();
+  }
+});
 
 
 
