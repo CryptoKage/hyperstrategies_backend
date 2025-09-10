@@ -9,7 +9,7 @@ const ethers = require('ethers');
 const pinsRouter = require('./routes/pins');
 const adminPinsRouter = require('./routes/adminPins');
 const authXRoutes = require('./routes/authX');
-// We no longer require the WebSocket provider here.
+const bountyRoutes = require('./routes/bounties');
 
 dotenv.config();
 
@@ -71,6 +71,7 @@ app.use('/api/user', userRoutes);
 app.use('/api/pins', pinsRouter);
 app.use('/api/admin/pins', adminPinsRouter);
 app.use('/api/auth/x', authXRoutes);
+app.use('/api/bounties', bountyRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
