@@ -496,35 +496,35 @@ router.put('/pins/auto-equip', authenticateToken, async (req, res) => {
 router.get('/rewards', authenticateToken, async (req, res) => {
   const userId = req.user.id;
   try {
-    // We run two queries in parallel for efficiency
-    const [unclaimedResult, historyResult] = await Promise.all([
-      // Query 1: Get the SUM of all 'UNCLAIMED' XP for the user
+    const [unclaimedResult, historyResult, totalResult] = await Promise.all([
+      // Query 1: Get the SUM of all 'UNCLAIMED' XP (no change here)
       pool.query(
         `SELECT COALESCE(SUM(amount_primary), 0) as total 
          FROM user_activity_log 
-         WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type LIKE 'XP_%'`,
+         WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type = 'XP_BOUNTY'`,
         [userId]
       ),
-      // Query 2: Get a categorized history of all 'CLAIMED' XP
+      // --- THIS IS THE NEW QUERY ---
+      // Query 2: Get a direct list of all 'CLAIMED' XP transactions.
       pool.query(
-        `SELECT source, SUM(amount_primary) as total 
+        `SELECT activity_id, description, amount_primary, created_at
          FROM user_activity_log 
          WHERE user_id = $1 AND status = 'CLAIMED' AND activity_type LIKE 'XP_%'
-         GROUP BY source 
-         ORDER BY source`,
+         ORDER BY created_at DESC
+         LIMIT 50`, // Add pagination later if needed
         [userId]
-      )
+      ),
+      // Query 3: Get the user's total current XP from the users table.
+      pool.query('SELECT xp FROM users WHERE user_id = $1', [userId])
     ]);
     
     const unclaimedXp = parseFloat(unclaimedResult.rows[0].total);
-    const claimedHistory = historyResult.rows.map(row => ({
-        source: row.source || 'General', // Provide a fallback category
-        total: parseFloat(row.total)
-    }));
+    const totalXp = parseFloat(totalResult.rows.length > 0 ? totalResult.rows[0].xp : 0);
 
     res.json({
       unclaimedXp: unclaimedXp,
-      claimedHistory: claimedHistory
+      totalXp: totalXp,
+      claimedHistory: historyResult.rows // We now return the raw rows
     });
 
   } catch (error) {
@@ -540,31 +540,37 @@ router.post('/rewards/claim', authenticateToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Find the total amount of unclaimed XP and lock those rows for the transaction
-    const unclaimedResult = await client.query(
-      `SELECT COALESCE(SUM(amount_primary), 0) as total 
+    // --- THIS IS THE FIX ---
+    // 1. Select the individual UNCLAIMED rows for this user and lock them.
+    const unclaimedRowsResult = await client.query(
+      `SELECT activity_id, amount_primary 
        FROM user_activity_log 
-       WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type LIKE 'XP_%' FOR UPDATE`,
+       WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type = 'XP_BOUNTY' 
+       FOR UPDATE`,
       [userId]
     );
-    const xpToClaim = parseFloat(unclaimedResult.rows[0].total);
 
-    // If there's nothing to claim, we can stop early.
-    if (xpToClaim <= 0) {
+    const unclaimedActivities = unclaimedRowsResult.rows;
+
+    if (unclaimedActivities.length === 0) {
       await client.query('ROLLBACK');
       return res.status(200).json({ message: 'No XP to claim.', claimedAmount: 0 });
     }
 
-    // 2. Mark all of the user's unclaimed XP entries as 'CLAIMED'
+    // 2. Calculate the total sum in JavaScript.
+    const xpToClaim = unclaimedActivities.reduce((sum, activity) => sum + parseFloat(activity.amount_primary), 0);
+    const activityIdsToUpdate = unclaimedActivities.map(a => a.activity_id);
+
+    // 3. Mark all of the user's unclaimed XP entries as 'CLAIMED' using their IDs.
     await client.query(
       `UPDATE user_activity_log SET status = 'CLAIMED' 
-       WHERE user_id = $1 AND status = 'UNCLAIMED' AND activity_type LIKE 'XP_%'`,
-      [userId]
+       WHERE activity_id = ANY($1::uuid[])`,
+      [activityIdsToUpdate]
     );
 
-    // 3. Add the claimed XP to the user's main XP balance and update their tier
+    // 4. Add the claimed XP to the user's main XP balance and update their tier.
     const userXpResult = await client.query(
-      'UPDATE users SET xp = xp + $1 WHERE user_id = $2 RETURNING xp, account_tier',
+      'UPDATE users SET xp = xp + $1 WHERE user_id = $2 RETURNING xp',
       [xpToClaim, userId]
     );
     

@@ -125,13 +125,32 @@ router.post('/invest', authenticateToken, async (req, res) => {
         await dbClient.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_ALLOCATION', $2, $3, 'USDC', 'COMPLETED')`, [userId, allocationDescription, amount]);
 
         const xpForAmount = investmentAmountBigNum.div(ethers.utils.parseUnits('10', tokenDecimals)).toNumber();
+        
+        // --- FIX #1: Log the Vault Deposit Bonus ---
         if (xpForAmount > 0) {
             await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, userId]);
+            
+            const depositXpDesc = `Earned ${xpForAmount.toFixed(2)} XP for depositing in Vault ${vaultId}.`;
+            await dbClient.query(
+              `INSERT INTO user_activity_log (user_id, activity_type, source, description, amount_primary, symbol_primary, status)
+               VALUES ($1, 'XP_DEPOSIT_BONUS', 'VAULT_DEPOSIT', $2, $3, 'XP', 'CLAIMED')`,
+              [userId, depositXpDesc, xpForAmount]
+            );
         }
 
+        // --- FIX #2: Log the Referral Bonus ---
         const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
         if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
-            await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, theUser.referred_by_user_id]);
+            const referrerId = theUser.referred_by_user_id;
+            await dbClient.query('UPDATE users SET xp = xp + $1 WHERE user_id = $2', [xpForAmount, referrerId]);
+            
+            // Note: We are creating the log for the REFERRER (referrerId)
+            const referralXpDesc = `Earned ${xpForAmount.toFixed(2)} XP from your referral (${theUser.username}) making their first deposit.`;
+            await dbClient.query(
+              `INSERT INTO user_activity_log (user_id, activity_type, source, description, amount_primary, symbol_primary, status)
+               VALUES ($1, 'XP_REFERRAL_BONUS', 'REFERRAL', $2, $3, 'XP', 'CLAIMED')`,
+              [referrerId, referralXpDesc, xpForAmount]
+            );
         }
 
         await dbClient.query('COMMIT');

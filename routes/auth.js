@@ -129,6 +129,17 @@ router.post(
       const newlyCreatedUser = newUserResult.rows[0];
       const newUserId = newlyCreatedUser.user_id;
 
+        if (xpToAward > 0) {
+        const description = `Earned ${xpToAward} XP as an Early Adopter bonus!`;
+        await client.query(
+          `INSERT INTO user_activity_log (user_id, activity_type, source, description, amount_primary, symbol_primary, status)
+           VALUES ($1, 'XP_SIGNUP_BONUS', 'SIGNUP', $2, $3, 'XP', 'CLAIMED')`,
+          [newUserId, description, xpToAward]
+        );
+      }
+
+      
+
       if (referralCode) {
             const syndicateResult = await client.query(
                 'SELECT pin_name_to_grant FROM syndicates WHERE referral_code = $1',
