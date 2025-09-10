@@ -11,29 +11,38 @@ const { decrypt } = require('../utils/walletUtils');
 // --- Helper function to call the X API ---
 // We will build this out with more verification types in the future.
 async function verifyBountyCompletion(user, bounty) {
-  const accessToken = decrypt(user.x_access_token);
-  
   // Use a switch statement to handle different bounty types
   switch (bounty.bounty_type) {
+    // --- NEW: Handle connection bounties ---
+    case 'CONNECT_X':
+      // The user is "complete" if their x_user_id exists in our database.
+      return !!user.x_user_id;
+    case 'CONNECT_TELEGRAM':
+      // The user is "complete" if their telegram_id exists in our database.
+      return !!user.telegram_id;
+
+    // --- Existing X API verification logic ---
     case 'X_LIKE': {
+      if (!user.x_access_token) return false; // Can't check if not connected
+      const accessToken = decrypt(user.x_access_token);
       const url = `https://api.twitter.com/2/tweets/${bounty.target_id}/liking_users`;
       const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
       const data = await response.json();
       if (!response.ok) throw new Error(`X API Error (Liking Users): ${JSON.stringify(data)}`);
       return data.data?.some(likingUser => likingUser.id === user.x_user_id) || false;
     }
-
     case 'X_RETWEET': {
+      if (!user.x_access_token) return false;
+      const accessToken = decrypt(user.x_access_token);
       const url = `https://api.twitter.com/2/tweets/${bounty.target_id}/retweeted_by`;
       const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
       const data = await response.json();
       if (!response.ok) throw new Error(`X API Error (Retweeted By): ${JSON.stringify(data)}`);
       return data.data?.some(retweetingUser => retweetingUser.id === user.x_user_id) || false;
     }
-
     case 'X_FOLLOW': {
-      // For a follow, the bounty's target_id is the account they need to follow (e.g., your company's X ID)
-      // The user.x_user_id is the person we are checking
+      if (!user.x_access_token) return false;
+      const accessToken = decrypt(user.x_access_token);
       const url = `https://api.twitter.com/2/users/${user.x_user_id}/following`;
       const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
       const data = await response.json();
