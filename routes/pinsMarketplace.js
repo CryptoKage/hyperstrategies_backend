@@ -211,4 +211,25 @@ router.delete('/listings/:listingId', async (req, res) => {
   }
 });
 
+router.get('/my-listings', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const { rows } = await pool.query(
+      `SELECT 
+         l.listing_id, l.price, l.created_at,
+         pd.pin_name, pd.image_filename
+       FROM pin_listings l
+       JOIN pins p ON l.pin_id = p.pin_id
+       JOIN pin_definitions pd ON p.pin_name = pd.pin_name
+       WHERE l.seller_id = $1 AND l.status = 'ACTIVE'
+       ORDER BY l.created_at DESC`,
+      [userId]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching my-listings:', err);
+    res.status(500).send('Server Error');
+  }
+});
+
 module.exports = router;
