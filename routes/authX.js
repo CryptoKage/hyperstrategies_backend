@@ -36,20 +36,22 @@ router.get('/callback', async (req, res) => {
       code: code
     });
 
+
+
+     const basicAuth = Buffer.from(`${process.env.X_CLIENT_ID}:${process.env.X_CLIENT_SECRET}`).toString('base64');
+    
     const tokenResponse = await fetch('https://api.twitter.com/2/oauth2/token', {
       method: 'POST',
       headers: { 
           'Content-Type': 'application/x-www-form-urlencoded',
-          // The Authorization header needs to be Basic auth with your Client ID and Secret
-          'Authorization': `Basic ${Buffer.from(`${process.env.X_CLIENT_ID}:${process.env.X_CLIENT_SECRET}`).toString('base64')}`
+          'Authorization': `Basic ${basicAuth}` // <-- This header was missing
       },
       body: tokenRequestBody
     });
 
     const tokenData = await tokenResponse.json();
-    if (!tokenResponse.ok) {
-        throw new Error(`Failed to get token from X: ${JSON.stringify(tokenData)}`);
-    }
+    if (!tokenResponse.ok) { throw new Error(`Token exchange failed: ${JSON.stringify(tokenData)}`); }
+
 
     // 3. Use the new access token to fetch the user's X profile
     const meResponse = await fetch('https://api.twitter.com/2/users/me', {
