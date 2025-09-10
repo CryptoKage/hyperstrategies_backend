@@ -19,24 +19,40 @@ router.use(requireTier(2)); // Example: Tier 2 required to use the marketplace
 // This query is now more powerful, joining multiple tables to provide all necessary data to the frontend.
 router.get('/listings', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT 
-         l.listing_id, 
-         l.price, 
-         l.created_at,
+    // 1. Define allowed filters and sort options to prevent SQL injection
+    const allowedSortBy = ['price', 'created_at'];
+    const { filterByPinName, sortBy, order = 'DESC' } = req.query;
+    
+    // 2. Start building the SQL query
+    let query = `
+      SELECT 
+         l.listing_id, l.price, l.created_at,
          p.pin_id,
          u.username as seller_username,
-         pd.pin_name, 
-         pd.pin_description, 
-         pd.image_url
+         pd.pin_name, pd.pin_description, pd.image_filename
        FROM pin_listings l
        JOIN pins p ON l.pin_id = p.pin_id
        JOIN pin_definitions pd ON p.pin_name = pd.pin_name
        JOIN users u ON l.seller_id = u.user_id
        WHERE l.status = 'ACTIVE'
-       ORDER BY l.created_at DESC`
-    );
+    `;
+    const queryParams = [];
+
+    // 3. Dynamically add a WHERE clause for filtering
+    if (filterByPinName) {
+      queryParams.push(filterByPinName);
+      query += ` AND pd.pin_name = $${queryParams.length}`;
+    }
+
+    // 4. Dynamically and SAFELY add an ORDER BY clause for sorting
+    const sortColumn = allowedSortBy.includes(sortBy) ? sortBy : 'created_at'; // Default sort
+    const sortOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC'; // Default order
+    query += ` ORDER BY l.${sortColumn} ${sortOrder}`;
+
+    // 5. Execute the final, constructed query
+    const { rows } = await pool.query(query, queryParams);
     res.json(rows);
+
   } catch (err) {
     console.error('Error fetching pin listings:', err);
     res.status(500).send('Server Error');
