@@ -78,7 +78,10 @@ router.post('/:bountyId/verify', authenticateToken, async (req, res) => {
     await client.query('BEGIN');
 
     // 1. Get user and bounty details
-    const userResult = await client.query('SELECT user_id, x_user_id, x_access_token FROM users WHERE user_id = $1', [userId]);
+    const userResult = await client.query(
+    'SELECT user_id, x_user_id, x_access_token, telegram_id FROM users WHERE user_id = $1', 
+    [userId]
+);
     const bountyResult = await client.query('SELECT * FROM bounties WHERE bounty_id = $1 AND is_active = TRUE', [bountyId]);
 
     if (userResult.rows.length === 0 || bountyResult.rows.length === 0) {
