@@ -13,6 +13,7 @@ const erc20Abi = require('../utils/abis/erc20.json');
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
 const apeContract = new ethers.Contract(tokenMap.ape.address, erc20Abi, provider);
+const crypto = require('crypto');
 
 const priceCache = {
   apePrice: null,
@@ -641,6 +642,59 @@ router.post('/session-store', (req, res) => {
     req.session[key] = value;
   }
   res.sendStatus(200);
+});
+
+router.post('/link-telegram', authenticateToken, async (req, res) => {
+  // Telegram sends a user object in the request body
+  const telegramUser = req.body;
+  const userId = req.user.id;
+
+  // 1. Basic Validation
+  if (!telegramUser || !telegramUser.id || !telegramUser.hash) {
+    return res.status(400).json({ error: 'Invalid Telegram data received.' });
+  }
+
+  try {
+    // 2. Cryptographic Verification (CRITICAL SECURITY STEP)
+    const secretKey = crypto.createHash('sha256').update(process.env.TELEGRAM_BOT_TOKEN).digest();
+    
+    // Collect all data fields from Telegram, sorted alphabetically
+    const dataCheckString = Object.keys(telegramUser)
+      .filter(key => key !== 'hash')
+      .map(key => `${key}=${telegramUser[key]}`)
+      .sort()
+      .join('\n');
+
+    const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+    // Compare our calculated hash with the hash Telegram sent. If they don't match, the data is fake.
+    if (hmac !== telegramUser.hash) {
+      return res.status(401).json({ error: 'Telegram data verification failed. Invalid hash.' });
+    }
+
+    const telegramId = telegramUser.id.toString();
+
+    // 3. Check if this Telegram account is already linked to another user.
+    const existingLink = await pool.query(
+      'SELECT user_id FROM users WHERE telegram_id = $1 AND user_id != $2',
+      [telegramId, userId]
+    );
+    if (existingLink.rows.length > 0) {
+      return res.status(409).json({ error: 'This Telegram account is already linked to another user.' });
+    }
+
+    // 4. If all checks pass, save the Telegram ID to the user's profile.
+    await pool.query(
+      'UPDATE users SET telegram_id = $1 WHERE user_id = $2',
+      [telegramId, userId]
+    );
+    
+    res.status(200).json({ message: 'Telegram account linked successfully!' });
+
+  } catch (error) {
+    console.error(`Error linking Telegram for user ${userId}:`, error);
+    res.status(500).json({ error: 'An error occurred during Telegram verification.' });
+  }
 });
 
 module.exports = router;
