@@ -589,4 +589,58 @@ router.post('/rewards/claim', authenticateToken, async (req, res) => {
   }
 });
 
+router.post('/link-wallet', authenticateToken, async (req, res) => {
+  const { address, signature, message } = req.body;
+  const userId = req.user.id;
+
+  // 1. Basic Validation
+  if (!address || !signature || !message) {
+    return res.status(400).json({ error: 'Address, signature, and message are required.' });
+  }
+
+  try {
+    // 2. Cryptographic Verification
+    // Ethers.js will recover the address that signed the message.
+    const recoveredAddress = ethers.utils.verifyMessage(message, signature);
+
+    // We compare the recovered address to the address the user claimed to have.
+    // This is case-insensitive for safety.
+    if (recoveredAddress.toLowerCase() !== address.toLowerCase()) {
+      return res.status(401).json({ error: 'Signature verification failed. The address does not match the signature.' });
+    }
+    
+    // 3. Check if this wallet is already linked to another user.
+    // This is a critical security check to prevent takeovers.
+    const existingLink = await pool.query(
+      'SELECT user_id FROM users WHERE external_evm_wallet = $1 AND user_id != $2',
+      [recoveredAddress, userId]
+    );
+
+    if (existingLink.rows.length > 0) {
+      return res.status(409).json({ error: 'This wallet address is already linked to another account.' });
+    }
+
+    // 4. If all checks pass, save the address to the user's profile.
+    await pool.query(
+      'UPDATE users SET external_evm_wallet = $1 WHERE user_id = $2',
+      [recoveredAddress, userId]
+    );
+
+    res.status(200).json({ message: 'Wallet linked successfully!' });
+
+  } catch (error) {
+    // This will catch malformed signatures or other unexpected errors.
+    console.error(`Error linking wallet for user ${userId}:`, error);
+    res.status(500).json({ error: 'An error occurred during wallet verification.' });
+  }
+});
+
+router.post('/session-store', (req, res) => {
+  const { key, value } = req.body;
+  if (key && value) {
+    req.session[key] = value;
+  }
+  res.sendStatus(200);
+});
+
 module.exports = router;
