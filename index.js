@@ -11,6 +11,7 @@ const adminPinsRouter = require('./routes/adminPins');
 const authXRoutes = require('./routes/authX');
 const bountyRoutes = require('./routes/bounties');
 const pinsMarketplaceRoutes = require('./routes/pinsMarketplace');
+const statsRoutes = require('./routes/stats');
 
 dotenv.config();
 
@@ -74,6 +75,7 @@ app.use('/api/admin/pins', adminPinsRouter);
 app.use('/api/auth/x', authXRoutes);
 app.use('/api/bounties', bountyRoutes);
 app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
+app.use('/api/stats', statsRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);

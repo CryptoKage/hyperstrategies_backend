@@ -11,29 +11,41 @@ const { decrypt } = require('../utils/walletUtils');
 // --- Helper function to call the X API ---
 // We will build this out with more verification types in the future.
 async function verifyBountyCompletion(user, bounty) {
-  if (bounty.bounty_type === 'X_LIKE') {
-    const accessToken = decrypt(user.x_access_token);
-    const url = `https://api.twitter.com/2/tweets/${bounty.target_id}/liking_users`;
-    
-    const response = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${accessToken}` }
-    });
-    
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(`X API Error: ${JSON.stringify(data)}`);
+  const accessToken = decrypt(user.x_access_token);
+  
+  // Use a switch statement to handle different bounty types
+  switch (bounty.bounty_type) {
+    case 'X_LIKE': {
+      const url = `https://api.twitter.com/2/tweets/${bounty.target_id}/liking_users`;
+      const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(`X API Error (Liking Users): ${JSON.stringify(data)}`);
+      return data.data?.some(likingUser => likingUser.id === user.x_user_id) || false;
     }
 
-    // Check if the user's X ID is in the list of users who liked the tweet
-    const didUserLike = data.data?.some(likingUser => likingUser.id === user.x_user_id);
-    return didUserLike;
-  }
-  
-  // Add more verification logic for 'X_FOLLOW', etc. here in the future.
-  
-  return false; // Default to false if bounty type is unknown
-}
+    case 'X_RETWEET': {
+      const url = `https://api.twitter.com/2/tweets/${bounty.target_id}/retweeted_by`;
+      const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(`X API Error (Retweeted By): ${JSON.stringify(data)}`);
+      return data.data?.some(retweetingUser => retweetingUser.id === user.x_user_id) || false;
+    }
 
+    case 'X_FOLLOW': {
+      // For a follow, the bounty's target_id is the account they need to follow (e.g., your company's X ID)
+      // The user.x_user_id is the person we are checking
+      const url = `https://api.twitter.com/2/users/${user.x_user_id}/following`;
+      const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(`X API Error (Following): ${JSON.stringify(data)}`);
+      return data.data?.some(followedUser => followedUser.id === bounty.target_id) || false;
+    }
+
+    default:
+      console.warn(`Unknown bounty type encountered: ${bounty.bounty_type}`);
+      return false;
+  }
+}
 
 // --- Endpoint 1: Get all active bounties ---
 router.get('/', authenticateToken, async (req, res) => {
