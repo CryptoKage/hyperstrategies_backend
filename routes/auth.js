@@ -12,6 +12,7 @@ const { body, validationResult } = require('express-validator');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 const { autoEquipBestPins } = require('../utils/pinUtils');
+const { TIER_DATA } = require('../utils/tierUtils');
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
@@ -183,7 +184,7 @@ router.post(
 
     try {
       const { email, password } = req.body;
-      const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin, account_tier FROM users WHERE email = $1', [email]);
+      const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin, account_tier, xp FROM users WHERE email = $1', [email]);
       
       if (result.rows.length === 0) {
         return res.status(401).json({ error: 'Invalid credentials.' });
@@ -196,14 +197,17 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
 
-      const payload = { 
-        user: { 
-          id: user.user_id, 
-          username: user.username, 
-          isAdmin: user.is_admin,
-          account_tier: user.account_tier 
-        } 
-      };
+const nextTier = tiers.find(t => t.tier === user.account_tier + 1);
+const payload = { 
+  user: { 
+    id: user.user_id, 
+    username: user.username, 
+    isAdmin: user.is_admin,
+    account_tier: user.account_tier,
+    xp: parseFloat(user.xp), // Add current XP
+    nextTierXp: nextTier ? nextTier.xpRequired : parseFloat(user.xp) // Add next tier's requirement
+  } 
+};
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
       res.json({ token });
@@ -267,12 +271,18 @@ router.get('/google/callback',
         }
       }
       
+      const currentTierInfo = TIER_DATA.find(t => t.tier === googleUser.account_tier) || TIER_DATA[0];
+      const nextTierInfo = TIER_DATA.find(t => t.tier === googleUser.account_tier + 1);
+
       const payload = { 
         user: { 
           id: googleUser.user_id, 
           username: googleUser.username, 
           isAdmin: googleUser.is_admin,
-          account_tier: googleUser.account_tier
+          account_tier: googleUser.account_tier,
+          xp: parseFloat(googleUser.xp),
+          currentTierXp: currentTierInfo.xpRequired, 
+          nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : parseFloat(googleUser.xp) 
         } 
       };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });

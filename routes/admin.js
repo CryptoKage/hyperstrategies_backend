@@ -353,7 +353,7 @@ router.post('/approve-withdrawal/:activityId', async (req, res) => {
       `UPDATE vault_ledger_entries SET status = 'PENDING_PROCESS' WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'WITHDRAWAL_REQUEST' AND status = 'PENDING_APPROVAL'`,
       [user_id, vaultId]
     );
-    await client.query("UPDATE user_activity_log SET status = 'PROCESSING' WHERE activity_id = $1", [activityId]);
+    await client.query("UPDATE user_activity_log SET status = 'APPROVED' WHERE activity_id = $1", [activityId]);
     await client.query('COMMIT');
     res.status(200).json({ message: `Withdrawal ${activityId} approved. It will be processed by the next background job run.` });
   } catch (err) {

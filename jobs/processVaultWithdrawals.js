@@ -14,7 +14,7 @@ const processPendingVaultWithdrawals = async () => {
     const { rows: pendingRequests } = await client.query(`
       SELECT activity_id, user_id, amount_primary
       FROM user_activity_log
-      WHERE activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND status = 'PENDING'
+      WHERE activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND status = 'APPROVED'
     `);
 
     if (pendingRequests.length === 0) {

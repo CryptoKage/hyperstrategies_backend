@@ -8,11 +8,11 @@ const pool = require('../db');
 router.get('/total-xp-awarded', async (req, res) => {
   try {
     // We only sum up entries from the activity log that are related to XP.
-    const result = await pool.query(
-      `SELECT COALESCE(SUM(amount_primary), 0) as total 
-       FROM user_activity_log 
-       WHERE activity_type LIKE 'XP_%'`
-    );
+const result = await pool.query(
+  `SELECT COALESCE(SUM(amount_primary), 0) as total 
+   FROM user_activity_log 
+   WHERE activity_type LIKE 'XP_%' AND status = 'CLAIMED'`
+);
     
     res.json({
       totalXpAwarded: parseFloat(result.rows[0].total)

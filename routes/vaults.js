@@ -14,10 +14,10 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
     const tokenDecimals = tokenMap.usdc.decimals;
     const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmount.toString(), tokenDecimals);
 
-    // 1. Fetch vault details and ALL user effects in parallel.
+    // 1. Fetch vault details and the user's active pin effects
     const [vaultResult, userEffects] = await Promise.all([
         dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
-        calculateActiveEffects(userId, dbClient) // <-- We call our new engine here!
+        calculateActiveEffects(userId, dbClient)
     ]);
 
     if (vaultResult.rows.length === 0) {
@@ -28,32 +28,23 @@ async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAm
     // 2. Start with the vault's base fee.
     const baseFeePct = parseFloat(theVault.fee_percentage) * 100;
 
-    // 3. Get discounts directly from our effects engine.
-    let tierDiscountPct = 0;
-    if (theVault.is_fee_tier_based) {
-        // The tier discount logic is now centralized in the engine (or could be).
-        // For now, we'll keep the simple calculation, but use the tier from the user object.
-        const userResult = await dbClient.query('SELECT account_tier FROM users WHERE user_id = $1', [userId]);
-        const userTier = userResult.rows[0].account_tier;
-        if (userTier > 1) {
-            tierDiscountPct = (userTier - 1) * 0.5;
-        }
-    }
+    // --- THIS IS THE KEY CHANGE ---
+    // The tierDiscountPct calculation has been completely REMOVED.
+    // We now only get the discount from the effects engine (which reads active pins).
     const totalPinDiscountPct = userEffects.fee_discount_pct || 0;
 
-    // 4. Calculate the final fee, ensuring it doesn't go below a minimum.
-    let finalFeePct = baseFeePct - tierDiscountPct - totalPinDiscountPct;
+    // 3. Calculate the final fee.
+    let finalFeePct = baseFeePct - totalPinDiscountPct;
     if (finalFeePct < 0.5) finalFeePct = 0.5; // Minimum fee clamp
+    
     const finalTradablePct = 100 - finalFeePct;
-
-    // 5. Calculate final amounts using BigNumber for precision.
     const finalFeeAmount = investmentAmountBigNum.mul(Math.round(finalFeePct * 100)).div(10000);
     const finalTradableAmount = investmentAmountBigNum.sub(finalFeeAmount);
 
-    // 6. Return all the data the frontend needs to display the breakdown.
+    // 4. Return the data. tierDiscountPct is now always 0.
     return {
         baseFeePct,
-        tierDiscountPct,
+        tierDiscountPct: 0, // Always return 0 for consistency with the frontend display
         totalPinDiscountPct,
         finalFeePct,
         finalTradablePct,
@@ -264,7 +255,7 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
         const description = `Requested withdrawal of ${withdrawalAmount.toFixed(2)} USDC from Vault ${vaultId}.`;
        await client.query(
     `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, related_vault_id) 
-     VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING', $4)`, 
+     VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING_APPROVAL', $4)`, 
     [userId, description, withdrawalAmount, vaultId] 
 );
         
