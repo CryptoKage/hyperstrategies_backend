@@ -703,4 +703,30 @@ router.post('/link-telegram', authenticateToken, async (req, res) => {
   }
 });
 
+router.get('/presale-eligibility', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const PRESALE_XP_REQUIREMENT = 1000; // The minimum XP needed to participate
+
+  try {
+    const result = await pool.query('SELECT xp FROM users WHERE user_id = $1', [userId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const userXp = parseFloat(result.rows[0].xp);
+    const isEligible = userXp >= PRESALE_XP_REQUIREMENT;
+    
+    res.json({
+      isEligible: isEligible,
+      currentXp: userXp,
+      xpRequired: PRESALE_XP_REQUIREMENT
+    });
+
+  } catch (error) {
+    console.error(`Error fetching presale eligibility for user ${userId}:`, error);
+    res.status(500).json({ error: 'Failed to fetch eligibility status.' });
+  }
+});
+
 module.exports = router;
