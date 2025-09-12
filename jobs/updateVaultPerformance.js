@@ -1,22 +1,20 @@
-// updateVaultPerformance.js
 const pool = require('../db');
 const Moralis = require('moralis').default;
 const { EvmChain } = require('@moralisweb3/common-evm-utils');
 
-// A simple map to convert our internal symbols to Moralis's chain objects
+// A map to convert our DB chain names to Moralis SDK chain objects
 const chainMap = {
-  // Add other chains here as needed, e.g., 'MATIC': EvmChain.POLYGON
-  'DEFAULT': EvmChain.ETHEREUM 
+  'ETHEREUM': EvmChain.ETHEREUM,
+  'POLYGON': EvmChain.POLYGON
+  // Add other chains here as your platform expands
 };
 
 /**
- * An hourly job to calculate and store performance & capital status for each active vault.
- * This version uses the Moralis API for fetching price data.
+ * An hourly job to calculate and store the Net Asset Value (NAV) and P&L for each active vault.
  */
 const updateVaultPerformance = async () => {
   console.log('📈 Starting hourly vault performance update job (using Moralis)...');
   
-  // Initialize Moralis - this only needs to be done once when the job starts.
   if (!Moralis.Core.isStarted) {
     await Moralis.start({ apiKey: process.env.MORALIS_API_KEY });
   }
@@ -28,7 +26,6 @@ const updateVaultPerformance = async () => {
       console.log('No active vaults to process.');
       return;
     }
-    console.log(`Found ${activeVaults.length} active vaults to process.`);
 
     for (const vault of activeVaults) {
       const vaultId = vault.vault_id;
@@ -36,38 +33,79 @@ const updateVaultPerformance = async () => {
       
       await client.query('BEGIN');
       try {
-        const assetsResult = await client.query(
-          'SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', // Assuming you have contract_address and chain columns
+        const principalResult = await client.query(
+          `SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND status = 'ACTIVE_IN_POOL' AND entry_type = 'DEPOSIT'`,
           [vaultId]
         );
-        const assets = assetsResult.rows;
+        const principalCapital = parseFloat(principalResult.rows[0].total);
 
-        let pnlPercentage = 0;
+        const tradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1', [vaultId]);
+        const allTrades = tradesResult.rows;
+
+        const realizedPnl = allTrades.filter(t => t.status === 'CLOSED').reduce((sum, t) => sum + parseFloat(t.pnl_usd), 0);
+
+        const openTrades = allTrades.filter(t => t.status === 'OPEN');
+        let unrealizedPnl = 0;
         
-        if (assets.length > 0) {
-          // 3. Fetch price data from Moralis using the efficient batch endpoint
-          const tokensToFetch = assets.map(a => ({
-            tokenAddress: a.contract_address,
-            chain: chainMap[a.chain] || chainMap['DEFAULT']
+        if (openTrades.length > 0) {
+          const tokensToFetch = openTrades.map(t => ({
+            tokenAddress: t.contract_address,
+            chain: chainMap[t.chain.toUpperCase()] || EvmChain.ETHEREUM // Default to Ethereum if chain not in map
           }));
           
           const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({ tokens: tokensToFetch });
-          const priceData = priceResponse.toJSON();
+          const currentPrices = priceResponse.toJSON();
 
-          // 4. Calculate weighted P&L
-          // NOTE: Moralis Price API's standard response doesn't include 24h change.
-          // This logic will need to be adapted. For now, we'll placeholder the P&L.
-          // In the next step, we will store the PREVIOUS day's price to calculate the change ourselves.
-          pnlPercentage = 0.0; // Placeholder for now
+          for (const trade of openTrades) {
+            const priceInfo = currentPrices.find(p => p.tokenAddress.toLowerCase() === trade.contract_address.toLowerCase());
+            if (priceInfo && priceInfo.usdPrice) {
+              const currentPrice = priceInfo.usdPrice;
+              const entryPrice = parseFloat(trade.entry_price);
+              const quantity = parseFloat(trade.quantity);
+              
+              if (trade.direction === 'LONG') {
+                unrealizedPnl += (currentPrice - entryPrice) * quantity;
+              } else { // SHORT
+                unrealizedPnl += (entryPrice - currentPrice) * quantity;
+              }
+            }
+          }
         }
+
+        const totalPnl = realizedPnl + unrealizedPnl;
+        const netAssetValue = principalCapital + totalPnl;
+        const pnlPercentage = (principalCapital > 0) ? (totalPnl / principalCapital) * 100 : 0;
         
-        // ... (The rest of the logic for calculating capital status and saving to the DB remains the same) ...
+        // --- Capital Status Calculation (from our previous discussion) ---
+        const ledgerStatusQuery = `
+          SELECT 
+            COALESCE(SUM(CASE WHEN status = 'PENDING_SWEEP' THEN amount ELSE 0 END), 0) as capital_in_transit_to_desk,
+            COALESCE(SUM(CASE WHEN entry_type = 'WITHDRAWAL_REQUEST' AND status = 'APPROVED' THEN amount * -1 ELSE 0 END), 0) as capital_in_transit_from_desk
+          FROM vault_ledger_entries
+          WHERE vault_id = $1;
+        `;
+        const ledgerStatusResult = await client.query(ledgerStatusQuery, [vaultId]);
+        const capitalStatus = ledgerStatusResult.rows[0];
 
         const recordDate = new Date();
-        // ... INSERT query ...
-        
+        const insertQuery = `
+          INSERT INTO vault_performance_history 
+            (vault_id, record_date, pnl_percentage, total_value_locked, capital_in_trade, capital_in_transit_to_desk, capital_in_transit_from_desk)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (vault_id, record_date) DO UPDATE SET
+            pnl_percentage = EXCLUDED.pnl_percentage,
+            total_value_locked = EXCLUDED.total_value_locked,
+            capital_in_trade = EXCLUDED.capital_in_trade,
+            capital_in_transit_to_desk = EXCLUDED.capital_in_transit_to_desk,
+            capital_in_transit_from_desk = EXCLUDED.capital_in_transit_from_desk;
+        `;
+        await client.query(insertQuery, [
+          vaultId, recordDate, pnlPercentage.toFixed(4), netAssetValue, principalCapital,
+          capitalStatus.capital_in_transit_to_desk, capitalStatus.capital_in_transit_from_desk
+        ]);
+
         await client.query('COMMIT');
-        console.log(`✅ Successfully saved hourly performance for Vault ID: ${vaultId}.`);
+        console.log(`✅ Successfully saved hourly performance for Vault ID: ${vaultId}. NAV: $${netAssetValue.toFixed(2)}, P&L: ${pnlPercentage.toFixed(2)}%`);
       
       } catch (innerError) {
         await client.query('ROLLBACK');

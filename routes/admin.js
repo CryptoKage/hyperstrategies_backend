@@ -650,5 +650,124 @@ router.delete('/vaults/:vaultId/assets/:symbol', async (req, res) => {
 });
 
 
+// --- Vault Trade Management ---
+
+// POST a new trade into a vault's history
+router.post('/vaults/:vaultId/trades', async (req, res) => {
+  const { vaultId } = req.params;
+  const { 
+    asset_symbol, 
+    direction, 
+    quantity, 
+    entry_price 
+  } = req.body;
+
+  // Basic validation
+  if (!asset_symbol || !direction || !quantity || !entry_price) {
+    return res.status(400).json({ message: 'Missing required trade fields: symbol, direction, quantity, entry_price.' });
+  }
+  if (direction !== 'LONG' && direction !== 'SHORT') {
+    return res.status(400).json({ message: 'Direction must be either LONG or SHORT.' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO vault_trades (vault_id, asset_symbol, direction, quantity, entry_price, status)
+       VALUES ($1, $2, $3, $4, $5, 'OPEN')
+       RETURNING *`, // Return the newly created trade for confirmation
+      [vaultId, asset_symbol.toUpperCase(), direction, quantity, entry_price]
+    );
+    
+    res.status(201).json({ message: 'New trade successfully logged as OPEN.', trade: result.rows[0] });
+
+  } catch (err) {
+    console.error(`Error logging new trade for vault ${vaultId}:`, err);
+    res.status(500).json({ message: 'Failed to log new trade.' });
+  }
+});
+
+// UPDATE an existing trade (e.g., to close it)
+router.patch('/trades/:tradeId/close', async (req, res) => {
+  const { tradeId } = req.params;
+  const { exit_price } = req.body;
+
+  if (!exit_price) {
+    return res.status(400).json({ message: 'Exit price is required to close a trade.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the original trade details
+    const tradeResult = await client.query('SELECT * FROM vault_trades WHERE trade_id = $1', [tradeId]);
+    if (tradeResult.rows.length === 0) {
+      throw new Error('Trade not found.');
+    }
+    const trade = tradeResult.rows[0];
+    if (trade.status === 'CLOSED') {
+      throw new Error('This trade has already been closed.');
+    }
+
+    // 2. Calculate the P&L
+    const entryValue = parseFloat(trade.quantity) * parseFloat(trade.entry_price);
+    const exitValue = parseFloat(trade.quantity) * parseFloat(exit_price);
+    let pnl_usd;
+    if (trade.direction === 'LONG') {
+      pnl_usd = exitValue - entryValue;
+    } else { // SHORT
+      pnl_usd = entryValue - exitValue;
+    }
+
+    // 3. Update the trade to CLOSED with the P&L and exit details
+    const updateResult = await client.query(
+      `UPDATE vault_trades 
+       SET exit_price = $1, pnl_usd = $2, status = 'CLOSED', trade_closed_at = NOW()
+       WHERE trade_id = $3
+       RETURNING *`,
+      [exit_price, pnl_usd.toFixed(8), tradeId]
+    );
+    
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Trade successfully closed and P&L recorded.', trade: updateResult.rows[0] });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`Error closing trade ${tradeId}:`, err);
+    res.status(500).json({ message: err.message || 'Failed to close trade.' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST to move all PENDING_SWEEP capital for a vault into the active pool
+router.post('/vaults/:vaultId/allocate-capital', async (req, res) => {
+  const { vaultId } = req.params;
+  
+  try {
+    // We simply update the status of all relevant ledger entries.
+    // The RETURNING clause gives us back the IDs of the rows that were changed.
+    const result = await pool.query(
+      `UPDATE vault_ledger_entries
+       SET status = 'ACTIVE_IN_POOL'
+       WHERE vault_id = $1 AND status = 'PENDING_SWEEP' AND entry_type = 'DEPOSIT'
+       RETURNING entry_id`,
+      [vaultId]
+    );
+
+    const updatedCount = result.rowCount;
+
+    if (updatedCount === 0) {
+      return res.status(200).json({ message: 'No pending capital to allocate for this vault.' });
+    }
+    
+    res.status(200).json({ message: `Successfully allocated ${updatedCount} pending deposits into the active pool.` });
+
+  } catch (err) {
+    console.error(`Error allocating capital for vault ${vaultId}:`, err);
+    res.status(500).json({ message: 'Failed to allocate capital.' });
+  }
+});
+
 
 module.exports = router;
