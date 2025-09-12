@@ -255,7 +255,7 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
         const description = `Requested withdrawal of ${withdrawalAmount.toFixed(2)} USDC from Vault ${vaultId}.`;
        await client.query(
     `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, related_vault_id) 
-     VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING_APPROVAL', $4)`, 
+     VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING', $4)`, 
     [userId, description, withdrawalAmount, vaultId] 
 );
         
