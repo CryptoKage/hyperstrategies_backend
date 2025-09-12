@@ -25,6 +25,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "moralis": "^2.27.2",
+    "node-cron": "^4.2.1",
     "node-fetch": "^3.3.2",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
