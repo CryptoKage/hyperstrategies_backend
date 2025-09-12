@@ -592,6 +592,63 @@ router.post('/bulk-award-xp', async (req, res) => {
   }
 });
 
+// GET all assets for a specific vault
+router.get('/vaults/:vaultId/assets', async (req, res) => {
+  const { vaultId } = req.params;
+  try {
+    const result = await pool.query(
+      'SELECT asset_id, symbol, weight FROM vault_assets WHERE vault_id = $1 ORDER BY symbol',
+      [vaultId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching vault assets:', err);
+    res.status(500).json({ message: 'Failed to fetch vault assets.' });
+  }
+});
+
+// ADD or UPDATE an asset in a vault
+router.post('/vaults/:vaultId/assets', async (req, res) => {
+  const { vaultId } = req.params;
+  const { symbol, weight } = req.body;
+  const numericWeight = parseFloat(weight);
+  
+  if (!symbol || isNaN(numericWeight) || numericWeight < 0 || numericWeight > 1) {
+    return res.status(400).json({ message: 'Valid symbol and a weight between 0 and 1 are required.' });
+  }
+  
+  try {
+    await pool.query(
+      `INSERT INTO vault_assets (vault_id, symbol, weight)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (vault_id, symbol) DO UPDATE SET weight = EXCLUDED.weight`,
+      [vaultId, symbol.toUpperCase(), numericWeight]
+    );
+    res.status(200).json({ message: 'Vault asset updated successfully.' });
+  } catch (err) {
+    console.error('Error updating vault asset:', err);
+    res.status(500).json({ message: 'Failed to update vault asset.' });
+  }
+});
+
+// DELETE an asset from a vault
+router.delete('/vaults/:vaultId/assets/:symbol', async (req, res) => {
+  const { vaultId, symbol } = req.params;
+  try {
+    const result = await pool.query(
+      'DELETE FROM vault_assets WHERE vault_id = $1 AND symbol = $2',
+      [vaultId, symbol.toUpperCase()]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Asset not found for this vault.' });
+    }
+    res.status(200).json({ message: 'Vault asset removed successfully.' });
+  } catch (err) { // <-- FIX #1: Added the missing opening curly brace '{'
+    console.error('Error removing vault asset:', err);
+    res.status(500).json({ message: 'Failed to remove vault asset.' });
+  } 
+});
+
 
 
 module.exports = router;

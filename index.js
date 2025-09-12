@@ -12,6 +12,9 @@ const authXRoutes = require('./routes/authX');
 const bountyRoutes = require('./routes/bounties');
 const pinsMarketplaceRoutes = require('./routes/pinsMarketplace');
 const statsRoutes = require('./routes/stats');
+const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
+const vaultDetailsRoutes = require('./routes/vaultDetails');
+
 
 dotenv.config();
 
@@ -76,6 +79,7 @@ app.use('/api/auth/x', authXRoutes);
 app.use('/api/bounties', bountyRoutes);
 app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/vault-details', vaultDetailsRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
@@ -147,4 +151,16 @@ app.listen(PORT, async () => {
     try { await processPendingVaultWithdrawals(); } catch (e) { console.error('Error in processVaultWithdrawals job:', e); }
     finally { isProcessingVaultWithdrawals = false; }
   }, SIXTY_SECONDS_IN_MS);
+
+  // job 6
+
+  const cron = require('node-cron');
+
+
+cron.schedule('0 * * * *', () => {
+  console.log('Triggering scheduled hourly vault performance update...');
+  updateVaultPerformance();
+});
+
+
 });
