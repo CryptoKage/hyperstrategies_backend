@@ -197,17 +197,20 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
 
-const nextTier = tiers.find(t => t.tier === user.account_tier + 1);
-const payload = { 
-  user: { 
-    id: user.user_id, 
-    username: user.username, 
-    isAdmin: user.is_admin,
-    account_tier: user.account_tier,
-    xp: parseFloat(user.xp), // Add current XP
-    nextTierXp: nextTier ? nextTier.xpRequired : parseFloat(user.xp) // Add next tier's requirement
-  } 
-};
+ const currentTierInfo = TIER_DATA.find(t => t.tier === user.account_tier) || TIER_DATA[0];
+      const nextTierInfo = TIER_DATA.find(t => t.tier === user.account_tier + 1);
+
+      const payload = { 
+        user: { 
+          id: user.user_id, 
+          username: user.username, 
+          isAdmin: user.is_admin,
+          account_tier: user.account_tier,
+          xp: parseFloat(user.xp),
+          currentTierXp: currentTierInfo.xpRequired, 
+          nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : parseFloat(user.xp) 
+        } 
+      };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
       res.json({ token });
