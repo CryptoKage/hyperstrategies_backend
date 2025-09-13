@@ -403,5 +403,41 @@ router.post(
   }
 );
 
+router.post('/refresh-token', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const result = await pool.query(
+      'SELECT user_id, username, is_admin, account_tier, xp FROM users WHERE user_id = $1',
+      [userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const user = result.rows[0];
+    
+    // We include the tier data here for the XP bar
+    const currentTierInfo = TIER_DATA.find(t => t.tier === user.account_tier) || TIER_DATA[0];
+    const nextTierInfo = TIER_DATA.find(t => t.tier === user.account_tier + 1);
+
+    const payload = { 
+      user: { 
+        id: user.user_id, 
+        username: user.username, 
+        isAdmin: user.is_admin,
+        account_tier: user.account_tier,
+        xp: parseFloat(user.xp),
+        currentTierXp: currentTierInfo.xpRequired, 
+        nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : parseFloat(user.xp)
+      } 
+    };
+    
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+    res.json({ token });
+
+  } catch (err) {
+    console.error('[Token Refresh Error]', err);
+    res.status(500).json({ error: 'Server error during token refresh.' });
+  }
+});
 
 module.exports = router;
