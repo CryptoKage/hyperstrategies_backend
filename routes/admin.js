@@ -762,4 +762,22 @@ router.post('/jobs/trigger/vault-performance', async (req, res) => {
   res.status(202).json({ message: 'Vault performance update job has been triggered. Check server logs for progress.' });
 });
 
+router.get('/vaults/:vaultId/trades', async (req, res) => {
+  const { vaultId } = req.params;
+  try {
+    const tradesResult = await pool.query(
+      'SELECT * FROM vault_trades WHERE vault_id = $1 ORDER BY trade_opened_at DESC',
+      [vaultId]
+    );
+    const allTrades = tradesResult.rows;
+    res.json({
+      openTrades: allTrades.filter(t => t.status === 'OPEN'),
+      tradeHistory: allTrades.filter(t => t.status === 'CLOSED')
+    });
+  } catch (err) {
+    console.error(`Error fetching trades for vault ${vaultId}:`, err);
+    res.status(500).json({ message: 'Failed to fetch trades.' });
+  }
+});
+
 module.exports = router;
