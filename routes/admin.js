@@ -780,4 +780,65 @@ router.get('/vaults/:vaultId/trades', async (req, res) => {
   }
 });
 
+router.get('/vaults/:vaultId/details', async (req, res) => {
+    const { vaultId } = req.params;
+    try {
+        // We fetch the two main pieces of data in parallel
+        const [vaultDetailsResult, participantsResult] = await Promise.all([
+            pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
+            pool.query(
+                `WITH UserTotals AS (
+                  SELECT
+                    user_id,
+                    SUM(amount) as total_capital,
+                    SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END) as pnl
+                  FROM vault_ledger_entries
+                  WHERE vault_id = $1
+                  GROUP BY user_id
+                )
+                SELECT
+                  ut.user_id,
+                  u.username,
+                  ut.total_capital,
+                  ut.pnl,
+                  (ut.total_capital - ut.pnl) as principal
+                FROM UserTotals ut
+                JOIN users u ON ut.user_id = u.user_id
+                WHERE ut.total_capital > 0.000001
+                ORDER BY u.username ASC`,
+                [vaultId]
+            )
+        ]);
+
+        if (vaultDetailsResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Vault not found.' });
+        }
+        
+        const vaultDetails = vaultDetailsResult.rows[0];
+        const participants = participantsResult.rows.map(p => ({
+            ...p,
+            total_capital: parseFloat(p.total_capital),
+            principal: parseFloat(p.principal),
+            pnl: parseFloat(p.pnl)
+        }));
+
+        const totalCapital = participants.reduce((sum, p) => sum + p.total_capital, 0);
+        const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
+        
+        res.json({
+            vault: vaultDetails,
+            participants: participants,
+            stats: {
+                participantCount: participants.length,
+                totalCapital: totalCapital,
+                totalPnl: totalPnl
+            }
+        });
+
+    } catch (err) {
+        console.error(`Error fetching details for vault ${vaultId}:`, err);
+        res.status(500).send('Server Error');
+    }
+});
+
 module.exports = router;
