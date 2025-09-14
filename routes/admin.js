@@ -87,7 +87,7 @@ router.post('/vaults/:vaultId/apply-manual-pnl', async (req, res) => {
 router.get('/vaults/:vaultId/details', async (req, res) => {
     const { vaultId } = req.params;
     try {
-        const vaultDetailsResult = await pool.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
+        const vaultDetailsResult = await pool.query('SELECT * FROM vault_trades WHERE vault_id = $1 ORDER BY trade_opened_at DESC', [vaultId])
         if (vaultDetailsResult.rows.length === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
         const vaultDetails = vaultDetailsResult.rows[0];
 
@@ -769,5 +769,17 @@ router.post('/vaults/:vaultId/allocate-capital', async (req, res) => {
   }
 });
 
+router.post('/jobs/trigger/vault-performance', async (req, res) => {
+  console.log(`[ADMIN] Manual trigger of Vault Performance job by ${req.user.id}`);
+  
+  // We import the job here to ensure we're using the latest version
+  const { updateVaultPerformance } = require('../jobs/updateVaultPerformance');
+  
+  // We call the job but do NOT wait for it to finish (await).
+  // This lets the API respond instantly while the job runs in the background.
+  updateVaultPerformance();
+  
+  res.status(202).json({ message: 'Vault performance update job has been triggered. Check server logs for progress.' });
+});
 
 module.exports = router;
