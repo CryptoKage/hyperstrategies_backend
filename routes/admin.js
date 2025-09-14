@@ -84,63 +84,43 @@ router.post('/vaults/:vaultId/apply-manual-pnl', async (req, res) => {
 });
 
 // --- Vault Details Endpoint (Ledger-Based) ---
-router.get('/vaults/:vaultId/details', async (req, res) => {
-    const { vaultId } = req.params;
-    try {
-        const vaultDetailsResult = await pool.query('SELECT * FROM vault_trades WHERE vault_id = $1 ORDER BY trade_opened_at DESC', [vaultId])
-        if (vaultDetailsResult.rows.length === 0) { return res.status(404).json({ message: 'Vault not found.' }); }
-        const vaultDetails = vaultDetailsResult.rows[0];
+router.post('/vaults/:vaultId/trades', async (req, res) => {
+  const { vaultId } = req.params;
+  const { 
+    asset_symbol, 
+    direction, 
+    quantity, 
+    entry_price,
+    contract_address, // Now expecting this from the form
+    chain = 'ETHEREUM'   // Default to ETHEREUM if not provided
+  } = req.body;
 
-        // --- THIS IS THE DEFINITIVE, CORRECTED QUERY ---
-        const participantsResult = await pool.query(
-            `WITH UserTotals AS (
-              SELECT
-                user_id,
-                SUM(amount) as total_capital,
-                SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END) as pnl
-              FROM vault_ledger_entries
-              WHERE vault_id = $1
-              GROUP BY user_id
-            )
-            SELECT
-              ut.user_id,
-              u.username,
-              ut.total_capital,
-              ut.pnl,
-              (ut.total_capital - ut.pnl) as principal -- Principal is calculated correctly here
-            FROM UserTotals ut
-            JOIN users u ON ut.user_id = u.user_id
-            WHERE ut.total_capital > 0.000001 -- Only show users with a current balance
-            ORDER BY u.username ASC`,
-            [vaultId]
-        );
+  // --- Full Validation ---
+  if (!asset_symbol || !direction || !quantity || !entry_price) {
+    return res.status(400).json({ message: 'Missing required trade fields: symbol, direction, quantity, entry_price.' });
+  }
+  if (direction !== 'LONG' && direction !== 'SHORT') {
+    return res.status(400).json({ message: 'Direction must be either LONG or SHORT.' });
+  }
+  if (!contract_address) {
+    // We now require a contract address for Moralis to work
+    return res.status(400).json({ message: 'Contract address is required for performance tracking.' });
+  }
 
-        const participants = participantsResult.rows.map(p => ({
-            ...p,
-            total_capital: parseFloat(p.total_capital),
-            principal: parseFloat(p.principal),
-            pnl: parseFloat(p.pnl)
-        }));
+  try {
+    const result = await pool.query(
+      `INSERT INTO vault_trades (vault_id, asset_symbol, direction, quantity, entry_price, status, contract_address, chain)
+       VALUES ($1, $2, $3, $4, $5, 'OPEN', $6, $7)
+       RETURNING *`,
+      [vaultId, asset_symbol.toUpperCase(), direction, quantity, entry_price, contract_address, chain.toUpperCase()]
+    );
+    
+    res.status(201).json({ message: 'New trade successfully logged as OPEN.', trade: result.rows[0] });
 
-        const totalCapital = participants.reduce((sum, p) => sum + p.total_capital, 0);
-        const totalPnl = participants.reduce((sum, p) => sum + p.pnl, 0);
-        const totalPrincipal = totalCapital - totalPnl;
-        const currentPnlPercentage = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
-        
-        res.json({
-            vault: vaultDetails,
-            participants: participants,
-            stats: {
-                participantCount: participants.length,
-                totalCapital: totalCapital,
-                totalPnl: totalPnl,
-                currentPnlPercentage: currentPnlPercentage
-            }
-        });
-    } catch (err) {
-        console.error(`Error fetching ledger-based details for vault ${vaultId}:`, err);
-        res.status(500).send('Server Error');
-    }
+  } catch (err) {
+    console.error(`Error logging new trade for vault ${vaultId}:`, err);
+    res.status(500).json({ message: 'Failed to log new trade.' });
+  }
 });
 
 router.get('/users/search', async (req, res) => {
