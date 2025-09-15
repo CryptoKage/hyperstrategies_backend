@@ -7,6 +7,10 @@ const isAdmin = require('../middleware/isAdmin');
 const { sweepDepositsToTradingDesk } = require('../jobs/sweepDeposits');
 const { processLedgerSweeps } = require('../jobs/processLedgerSweeps');
 const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
+const { decrypt } = require('../utils/walletUtils'); 
+const tokenMap = require('../utils/tokens/tokenMap'); 
+const erc20Abi = require('../utils/abis/erc20.json'); 
+
 
 // Authenticate first, then verify admin status via asynchronous DB lookup.
 router.use(authenticateToken);
@@ -899,6 +903,131 @@ router.get('/vaults/:vaultId/details', async (req, res) => {
         console.error(`Error fetching details for vault ${vaultId}:`, err);
         res.status(500).send('Server Error');
     }
+});
+
+// --- New Withdrawal Flow Step 1: Sweep funds from Vault to User's platform wallet ---
+router.post('/withdrawals/:activityId/sweep', async (req, res) => {
+  const { activityId } = req.params;
+  const adminUserId = req.user.id;
+  
+  console.log(`[Admin Sweep] Request received for activity ID ${activityId} by admin ${adminUserId}`);
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the withdrawal request details, ensuring it's in the correct state
+    const requestResult = await client.query(
+      `SELECT user_id, amount_primary, related_vault_id 
+       FROM user_activity_log 
+       WHERE activity_id = $1 AND status = 'PENDING_FUNDING'`,
+      [activityId]
+    );
+
+    if (requestResult.rows.length === 0) {
+      throw new Error('Withdrawal request not found or not in the correct state for sweeping.');
+    }
+    const request = requestResult.rows[0];
+    const { user_id, amount_primary, related_vault_id } = request;
+    const amountToSweep = amount_primary.toString();
+
+    // 2. Get the destination (user's platform wallet) and the source (vault's wallet)
+    const [userWalletResult, vaultWalletResult] = await Promise.all([
+      client.query('SELECT eth_address FROM users WHERE user_id = $1', [user_id]),
+      client.query('SELECT wallet_address, wallet_private_key_encrypted FROM vaults WHERE vault_id = $1', [related_vault_id])
+    ]);
+
+    if (userWalletResult.rows.length === 0 || vaultWalletResult.rows.length === 0) {
+      throw new Error('Could not find user or vault wallet information.');
+    }
+    const userWalletAddress = userWalletResult.rows[0].eth_address;
+    const vaultWallet = vaultWalletResult.rows[0];
+
+    if (!vaultWallet.wallet_private_key_encrypted) {
+      throw new Error(`Vault ID ${related_vault_id} is missing its encrypted private key. Cannot perform sweep.`);
+    }
+
+    // 3. Perform the on-chain transaction
+    const privateKey = decrypt(vaultWallet.wallet_private_key_encrypted);
+    const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
+    const vaultEthersWallet = new ethers.Wallet(privateKey, provider);
+    
+    const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, vaultEthersWallet);
+    const amount_BN = ethers.utils.parseUnits(amountToSweep, tokenMap.usdc.decimals);
+
+    console.log(`[Admin Sweep] Sweeping ${amountToSweep} USDC from Vault ${related_vault_id} (${vaultEthersWallet.address}) to User ${user_id} (${userWalletAddress})...`);
+    
+    const tx = await usdcContract.transfer(userWalletAddress, amount_BN);
+    await tx.wait(1); // Wait for 1 block confirmation
+
+    console.log(`[Admin Sweep] Sweep transaction successful. Hash: ${tx.hash}`);
+
+    // 4. Update the activity log with the transaction hash and new status
+    await client.query(
+      "UPDATE user_activity_log SET status = 'PENDING_CONFIRMATION', related_sweep_tx_hash = $1 WHERE activity_id = $2",
+      [tx.hash, activityId]
+    );
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Sweep transaction successful. Awaiting final confirmation.', transactionHash: tx.hash });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`[Admin Sweep] FAILED for activity ID ${activityId}. Error:`, error.message);
+    res.status(500).json({ error: error.message || 'Failed to perform sweep.' });
+  } finally {
+    client.release();
+  }
+});
+
+
+router.post('/withdrawals/:activityId/finalize', async (req, res) => {
+  const { activityId } = req.params;
+  const adminUserId = req.user.id;
+
+  console.log(`[Admin Finalize] Request received for activity ID ${activityId} by admin ${adminUserId}`);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the request, ensuring it has been confirmed by our verifier job
+    const requestResult = await client.query(
+      `SELECT user_id, amount_primary 
+       FROM user_activity_log 
+       WHERE activity_id = $1 AND status = 'SWEEP_CONFIRMED' FOR UPDATE`, // Lock the row
+      [activityId]
+    );
+
+    if (requestResult.rows.length === 0) {
+      throw new Error('Withdrawal request not found or not in the correct state for finalization.');
+    }
+    const request = requestResult.rows[0];
+    const { user_id, amount_primary } = request;
+    const amountToCredit = parseFloat(amount_primary);
+
+    // 2. Perform the internal accounting: credit the user's main balance
+    await client.query(
+      'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+      [amountToCredit, user_id]
+    );
+
+    // 3. Mark the entire withdrawal process as complete
+    await client.query(
+      "UPDATE user_activity_log SET status = 'COMPLETED' WHERE activity_id = $1",
+      [activityId]
+    );
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: `Successfully finalized withdrawal. User ${user_id} has been credited with ${amountToCredit} USDC.` });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`[Admin Finalize] FAILED for activity ID ${activityId}. Error:`, error.message);
+    res.status(500).json({ error: error.message || 'Failed to finalize withdrawal.' });
+  } finally {
+    client.release();
+  }
 });
 
 module.exports = router;

@@ -14,7 +14,7 @@ const pinsMarketplaceRoutes = require('./routes/pinsMarketplace');
 const statsRoutes = require('./routes/stats');
 const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
 const vaultDetailsRoutes = require('./routes/vaultDetails');
-
+const { verifyWithdrawalSweeps } = require('./jobs/verifyWithdrawalSweeps');
 
 dotenv.config();
 
@@ -160,6 +160,13 @@ app.listen(PORT, async () => {
 cron.schedule('0 * * * *', () => {
   console.log('Triggering scheduled hourly vault performance update...');
   updateVaultPerformance();
+});
+
+ // job 7 vaultwithdrawl sweep
+
+ cron.schedule('0 */4 * * *', () => {
+  console.log('Triggering scheduled withdrawal sweep verification...');
+  verifyWithdrawalSweeps();
 });
 
 
