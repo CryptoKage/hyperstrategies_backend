@@ -55,32 +55,45 @@ async function getApePrice() {
 router.get('/wallet', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const [userResult, portfolioSumsResult, bonusPointsResult] = await Promise.all([
+    // --- FIX #1: Add the new 'pendingCheckResult' variable to the list ---
+    const [userResult, portfolioSumsResult, bonusPointsResult, pendingCheckResult] = await Promise.all([
       pool.query('SELECT balance, eth_address FROM users WHERE user_id = $1', [userId]),
       pool.query(
         `SELECT 
            COALESCE(SUM(amount), 0) as total_capital,
            COALESCE(SUM(CASE WHEN entry_type = 'PNL_DISTRIBUTION' THEN amount ELSE 0 END), 0) as total_pnl
          FROM vault_ledger_entries WHERE user_id = $1`, [userId]),
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
+      // This is your new query, which is already correctly placed.
+      pool.query(
+        `SELECT EXISTS (
+            SELECT 1 FROM user_activity_log 
+            WHERE user_id = $1 
+            AND activity_type = 'VAULT_WITHDRAWAL_REQUEST' 
+            AND status = 'PENDING'
+        ) as has_pending`,
+        [userId]
+      )
     ]);
     if (userResult.rows.length === 0) { return res.status(404).json({ error: 'User not found.' }); }
     const userData = userResult.rows[0];
     const portfolioData = portfolioSumsResult.rows[0];
     const bonusPointsData = bonusPointsResult.rows[0];
+    
+    // --- FIX #2: Add the new 'pendingVaultWithdrawal' flag to the response ---
     res.json({
       address: userData.eth_address,
       availableBalance: parseFloat(userData.balance),
       totalCapitalInVaults: parseFloat(portfolioData.total_capital),
       totalUnrealizedPnl: parseFloat(portfolioData.total_pnl),
-      totalBonusPoints: parseFloat(bonusPointsData.total_bonus_points)
+      totalBonusPoints: parseFloat(bonusPointsData.total_bonus_points),
+      pendingVaultWithdrawal: pendingCheckResult.rows[0].has_pending
     });
   } catch (err) {
     console.error('Error in /wallet endpoint:', err);
     res.status(500).send('Server Error');
   }
 });
-
 
 router.get('/profile', authenticateToken, async (req, res) => {
   const userId = req.user.id;

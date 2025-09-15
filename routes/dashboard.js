@@ -13,7 +13,8 @@ router.get('/', authenticateToken, async (req, res) => {
       userResult, 
       vaultsResult, 
       userPositionsResult,
-      bonusPointsResult
+      bonusPointsResult,
+      pendingCheckResult 
     ] = await Promise.all([
       pool.query('SELECT username, balance, eth_address, account_tier FROM users WHERE user_id = $1', [userId]),
       pool.query("SELECT vault_id, name, description, status, image_url, fee_percentage, is_fee_tier_based, risk_level, display_pnl_percentage FROM vaults WHERE status IN ('active', 'coming_soon') ORDER BY vault_id ASC"),
@@ -39,7 +40,9 @@ router.get('/', authenticateToken, async (req, res) => {
         WHERE up.tradable_capital > 0.000001
       `, [userId]),
 
-      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId])
+      pool.query('SELECT COALESCE(SUM(points_amount), 0) AS total_bonus_points FROM bonus_points WHERE user_id = $1', [userId]),
+
+      pool.query(    `SELECT EXISTS (        SELECT 1 FROM user_activity_log         WHERE user_id = $1         AND activity_type = 'VAULT_WITHDRAWAL_REQUEST'         AND status = 'PENDING'    ) as has_pending`,    [userId])
     ]);
 
     if (userResult.rows.length === 0) {
@@ -67,7 +70,8 @@ router.get('/', authenticateToken, async (req, res) => {
       vaults: availableVaults,
       userPositions: userPositions,
       totalCapitalInVaults: totalCapitalInVaults,
-      totalUnrealizedPnl: totalUnrealizedPnl
+      totalUnrealizedPnl: totalUnrealizedPnl,
+      pendingVaultWithdrawal: pendingCheckResult.rows[0].has_pending
     };
 
     res.json(dashboardData);
