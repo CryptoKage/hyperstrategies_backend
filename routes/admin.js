@@ -27,7 +27,16 @@ router.get('/dashboard-stats', async (req, res) => {
       provider.getBalance(process.env.HOT_WALLET_ADDRESS),
       pool.query(`SELECT d.amount, u.username, u.user_id, d.detected_at FROM deposits d JOIN users u ON d.user_id = u.user_id ORDER BY d.detected_at DESC LIMIT 5;`),
       pool.query(`SELECT w.amount, u.username, w.created_at, u.user_id FROM withdrawal_queue w JOIN users u ON w.user_id = u.user_id ORDER BY w.created_at DESC LIMIT 5;`),
-      pool.query(`SELECT log.activity_id, log.user_id, log.amount_primary, log.description, u.username, log.created_at FROM user_activity_log log JOIN users u ON log.user_id = u.user_id WHERE log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' AND log.status = 'PENDING' ORDER BY log.created_at ASC;`)
+        pool.query(`
+        SELECT log.activity_id, log.user_id, log.amount_primary, log.description, u.username, log.created_at, log.status
+        FROM user_activity_log log 
+        JOIN users u ON log.user_id = u.user_id 
+        WHERE 
+          log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' 
+          AND log.status NOT IN ('COMPLETED', 'FAILED') -- <-- THIS IS THE FIX
+        ORDER BY 
+          log.created_at ASC;
+      `)
     ]);
     res.json({
       userCount: parseInt(userCount.rows[0].count),
