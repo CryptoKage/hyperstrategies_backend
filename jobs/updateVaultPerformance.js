@@ -50,7 +50,7 @@ const updateVaultPerformance = async () => {
 
           const tokensToFetch = [];
           for (const trade of openTrades) {
-            const assetDetail = vaultAssetDetails.find(a => a.symbol === trade.asset_symbol);
+            const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
             if (assetDetail && assetDetail.contract_address) {
               tokensToFetch.push({
                 tokenAddress: assetDetail.contract_address,
