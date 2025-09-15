@@ -1,5 +1,5 @@
 // ==============================================================================
-// FINAL, DEBUGGING VERSION: PASTE THIS to replace your full updateVaultPerformance.js
+// FINAL, FULL VERSION (v4): PASTE THIS to replace your entire updateVaultPerformance.js
 // ==============================================================================
 const pool = require('../db');
 const Moralis = require('moralis').default;
@@ -46,66 +46,50 @@ const updateVaultPerformance = async () => {
         const realizedPnl = allTrades.filter(t => t.status === 'CLOSED').reduce((sum, t) => sum + parseFloat(t.pnl_usd || 0), 0);
         const openTrades = allTrades.filter(t => t.status === 'OPEN');
         let unrealizedPnl = 0;
-
-        // --- DEEP DEBUGGING LOGS ---
-        console.log(`[Debug Vault ${vaultId}] Found ${openTrades.length} open trades.`);
-        console.log("[Debug Vault " + vaultId + "] Open Trades Data:", JSON.stringify(openTrades, null, 2));
         
         if (openTrades.length > 0) {
           const assetsResult = await client.query('SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', [vaultId]);
           const vaultAssetDetails = assetsResult.rows;
-
-          console.log(`[Debug Vault ${vaultId}] Found ${vaultAssetDetails.length} asset definitions for this vault.`);
-          console.log("[Debug Vault " + vaultId + "] Asset Definitions Data:", JSON.stringify(vaultAssetDetails, null, 2));
-
-          const tokensToFetch = [];
-          for (const trade of openTrades) {
-            console.log(`[Debug Vault ${vaultId}] Looking for asset match for trade symbol: '${trade.asset_symbol}'`);
+          
+          const tradesByChain = openTrades.reduce((acc, trade) => {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
-            
-            if (assetDetail) {
-              console.log(`[Debug Vault ${vaultId}]   ✅ Match FOUND. Asset detail:`, JSON.stringify(assetDetail));
-              if (assetDetail.contract_address) {
-                tokensToFetch.push({
-                  tokenAddress: assetDetail.contract_address,
-                  chain: chainMap[assetDetail.chain.toUpperCase()] || EvmChain.ETHEREUM
-                });
-                console.log(`[Debug Vault ${vaultId}]     ✅ Added to tokensToFetch array.`);
-              } else {
-                console.log(`[Debug Vault ${vaultId}]     ❌ REJECTED: Match found, but 'contract_address' is null or empty.`);
-              }
-            } else {
-              console.log(`[Debug Vault ${vaultId}]   ❌ REJECTED: No matching asset definition found in vault_assets.`);
+            if (assetDetail && assetDetail.contract_address) {
+              const chain = assetDetail.chain.toUpperCase();
+              if (!acc[chain]) acc[chain] = [];
+              // Add the contract address to the trade object for later use
+              acc[chain].push({ ...trade, contract_address: assetDetail.contract_address });
             }
-          }
-          
-          console.log(`[Debug Vault ${vaultId}] Final 'tokensToFetch' array before calling Moralis:`, JSON.stringify(tokensToFetch, null, 2));
-          
-          if (tokensToFetch.length > 0) {
-            const priceResponse =  await Moralis.EvmApi.token.getMultipleTokenPrices({
-              requestBody: { tokens: tokensToFetch }
-            });
-            const currentPrices = priceResponse.toJSON();
+            return acc;
+          }, {});
 
-            for (const trade of openTrades) {
-              const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
-              if (assetDetail && assetDetail.contract_address) {
-                const priceInfo = currentPrices.find(p => p.tokenAddress.toLowerCase() === assetDetail.contract_address.toLowerCase());
-                if (priceInfo && priceInfo.usdPrice) {
-                  const currentPrice = priceInfo.usdPrice;
-                  const entryPrice = parseFloat(trade.entry_price);
-                  const quantity = parseFloat(trade.quantity);
-                  
-                  if (trade.direction === 'LONG') {
-                    unrealizedPnl += (currentPrice - entryPrice) * quantity;
-                  } else {
-                    unrealizedPnl += (entryPrice - currentPrice) * quantity;
-                  }
+          const allPriceData = [];
+
+          for (const chainName in tradesByChain) {
+            const chainTrades = tradesByChain[chainName];
+            const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({
+              chain: chainMap[chainName] || EvmChain.ETHEREUM,
+              tokens: chainTrades.map(t => ({ address: t.contract_address }))
+            });
+            allPriceData.push(...priceResponse.toJSON());
+          }
+
+          for (const trade of openTrades) {
+            // Find the contract address again to match with price data
+            const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
+            if (assetDetail && assetDetail.contract_address) {
+              const priceInfo = allPriceData.find(p => p.tokenAddress.toLowerCase() === assetDetail.contract_address.toLowerCase());
+              if (priceInfo && priceInfo.usdPrice) {
+                const currentPrice = priceInfo.usdPrice;
+                const entryPrice = parseFloat(trade.entry_price);
+                const quantity = parseFloat(trade.quantity);
+                
+                if (trade.direction === 'LONG') {
+                  unrealizedPnl += (currentPrice - entryPrice) * quantity;
+                } else { // SHORT
+                  unrealizedPnl += (entryPrice - currentPrice) * quantity;
                 }
               }
             }
-          } else {
-              console.log(`[Debug Vault ${vaultId}] Skipping Moralis call because 'tokensToFetch' is empty.`);
           }
         }
 
