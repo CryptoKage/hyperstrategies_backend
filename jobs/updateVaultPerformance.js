@@ -51,12 +51,14 @@ const updateVaultPerformance = async () => {
           const assetsResult = await client.query('SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', [vaultId]);
           const vaultAssetDetails = assetsResult.rows;
           
+          // --- THIS IS THE CRITICAL FIX ---
+          // 1. Group trades by their chain
           const tradesByChain = openTrades.reduce((acc, trade) => {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
             if (assetDetail && assetDetail.contract_address) {
               const chain = assetDetail.chain.toUpperCase();
               if (!acc[chain]) acc[chain] = [];
-              // Add the contract address to the trade object for later use
+              // Add the full trade object to the chain's array
               acc[chain].push({ ...trade, contract_address: assetDetail.contract_address });
             }
             return acc;
@@ -64,11 +66,17 @@ const updateVaultPerformance = async () => {
 
           const allPriceData = [];
 
+          // 2. Make one API call PER CHAIN
           for (const chainName in tradesByChain) {
             const chainTrades = tradesByChain[chainName];
+            
+            // 3. Build the tokens array with the CORRECT KEY ('address')
+            const tokensForChain = chainTrades.map(t => ({ address: t.contract_address }));
+
+            // 4. Make the API call with the CORRECT STRUCTURE
             const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({
-              chain: chainMap[chainName] || EvmChain.ETHEREUM,
-              tokens: chainTrades.map(t => ({ address: t.contract_address }))
+              chain: chainMap[chainName] || EvmChain.ETHEREUM, // Chain is at the top level
+              tokens: tokensForChain
             });
             allPriceData.push(...priceResponse.toJSON());
           }
