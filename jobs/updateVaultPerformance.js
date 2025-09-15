@@ -1,22 +1,16 @@
 // ==============================================================================
-// FINAL, FULL VERSION (v4): PASTE THIS to replace your entire updateVaultPerformance.js
+// FINAL, DEFINITIVE VERSION (v6): PASTE THIS to replace your full file
 // ==============================================================================
 const pool = require('../db');
-const Moralis = require('moralis').default;
-const { EvmChain } = require('@moralisweb3/common-evm-utils');
+const fetch = require('node-fetch'); // <-- THIS IS THE CRITICAL MISSING LINE
 
 const chainMap = {
-  'ETHEREUM': EvmChain.ETHEREUM,
-  'POLYGON': EvmChain.POLYGON
+  'ETHEREUM': '0x1',
+  'POLYGON': '0x89'
 };
 
 const updateVaultPerformance = async () => {
-  console.log('📈 Starting hourly vault performance update job (using Moralis)...');
-  
-  if (!Moralis.Core.isStarted) {
-    await Moralis.start({ apiKey: process.env.MORALIS_API_KEY });
-  }
-
+  console.log('📈 Starting hourly vault performance update job...');
   const client = await pool.connect();
   try {
     const { rows: activeVaults } = await client.query("SELECT vault_id FROM vaults WHERE status = 'active'");
@@ -51,14 +45,11 @@ const updateVaultPerformance = async () => {
           const assetsResult = await client.query('SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', [vaultId]);
           const vaultAssetDetails = assetsResult.rows;
           
-          // --- THIS IS THE CRITICAL FIX ---
-          // 1. Group trades by their chain
           const tradesByChain = openTrades.reduce((acc, trade) => {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
             if (assetDetail && assetDetail.contract_address) {
               const chain = assetDetail.chain.toUpperCase();
               if (!acc[chain]) acc[chain] = [];
-              // Add the full trade object to the chain's array
               acc[chain].push({ ...trade, contract_address: assetDetail.contract_address });
             }
             return acc;
@@ -66,23 +57,32 @@ const updateVaultPerformance = async () => {
 
           const allPriceData = [];
 
-          // 2. Make one API call PER CHAIN
           for (const chainName in tradesByChain) {
             const chainTrades = tradesByChain[chainName];
-            
-            // 3. Build the tokens array with the CORRECT KEY ('address')
-            const tokensForChain = chainTrades.map(t => ({ address: t.contract_address }));
+            const apiUrl = `https://deep-index.moralis.io/api/v2.2/erc20/prices?chain=${chainMap[chainName] || '0x1'}`;
+            const apiOptions = {
+              method: 'POST',
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-API-Key': process.env.MORALIS_API_KEY
+              },
+              body: JSON.stringify({
+                // Note: The REST API expects 'token_address'
+                tokens: chainTrades.map(t => ({ token_address: t.contract_address }))
+              })
+            };
 
-            // 4. Make the API call with the CORRECT STRUCTURE
-            const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({
-              chain: chainMap[chainName] || EvmChain.ETHEREUM, // Chain is at the top level
-              tokens: tokensForChain
-            });
-            allPriceData.push(...priceResponse.toJSON());
+            const response = await fetch(apiUrl, apiOptions);
+            if (!response.ok) {
+              const errorBody = await response.text();
+              throw new Error(`Moralis REST API Error: ${response.status} ${errorBody}`);
+            }
+            const priceData = await response.json();
+            allPriceData.push(...priceData);
           }
-
+          
           for (const trade of openTrades) {
-            // Find the contract address again to match with price data
             const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
             if (assetDetail && assetDetail.contract_address) {
               const priceInfo = allPriceData.find(p => p.tokenAddress.toLowerCase() === assetDetail.contract_address.toLowerCase());
