@@ -82,7 +82,9 @@ const updateVaultPerformance = async () => {
           console.log(`[Debug Vault ${vaultId}] Final 'tokensToFetch' array before calling Moralis:`, JSON.stringify(tokensToFetch, null, 2));
           
           if (tokensToFetch.length > 0) {
-            const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({ tokens: tokensToFetch });
+            const priceResponse =  await Moralis.EvmApi.token.getMultipleTokenPrices({
+              requestBody: { tokens: tokensToFetch }
+            });
             const currentPrices = priceResponse.toJSON();
 
             for (const trade of openTrades) {
