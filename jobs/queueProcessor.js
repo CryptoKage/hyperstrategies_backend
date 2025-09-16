@@ -1,4 +1,4 @@
-// server/jobs/queueProcessor.js
+// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/queueProcessor.js
 
 const { ethers } = require('ethers');
 const pool = require('../db');
@@ -16,13 +16,10 @@ async function processWithdrawals() {
 
   try {
     const { rows: queuedWithdrawals } = await client.query(
-      `SELECT * FROM withdrawal_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`
+      `SELECT * FROM withdrawal_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`
     );
 
     if (queuedWithdrawals.length === 0) {
-      // --- THE FIX ---
-      // We no longer release the client here. We just return.
-      // The 'finally' block will handle the release for us.
       return; 
     }
 
@@ -51,6 +48,8 @@ async function processWithdrawals() {
     await tx.wait(1);
     console.log(`✅ Withdrawal tx confirmed: ${tx.hash}`);
     
+    // --- On Success, we simply move the record to the permanent withdrawals table ---
+    // The balance was already deducted, so no further user balance update is needed.
     await client.query('BEGIN');
     await client.query(`DELETE FROM withdrawal_queue WHERE id = $1`, [id]);
     await client.query(
@@ -63,11 +62,33 @@ async function processWithdrawals() {
   } catch (err) {
     console.error(`❌ FAILED to process withdrawal:`, err.message);
     if (client && withdrawal) {
-      console.log(`Marking withdrawal #${withdrawal.id} as failed.`);
-      await client.query(`UPDATE withdrawal_queue SET status = 'failed', error_message = $1 WHERE id = $2`, [err.message, withdrawal.id]);
+      // ==============================================================================
+      // --- REFACTOR: On failure, re-credit the user's balance ---
+      // ==============================================================================
+      console.log(`Marking withdrawal #${withdrawal.id} as failed and refunding user.`);
+      await client.query('BEGIN');
+      try {
+        // 1. Add the funds back to the user's balance.
+        await client.query(
+            'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
+            [withdrawal.amount, withdrawal.user_id]
+        );
+        // 2. Mark the withdrawal as failed so it won't be picked up again.
+        await client.query(
+            `UPDATE withdrawal_queue SET status = 'failed', error_message = $1 WHERE id = $2`, 
+            [err.message, withdrawal.id]
+        );
+        await client.query('COMMIT');
+        console.log(`✅ User ${withdrawal.user_id} has been refunded ${withdrawal.amount}.`);
+      } catch (refundErr) {
+        await client.query('ROLLBACK');
+        console.error(`CRITICAL ERROR: FAILED TO REFUND USER ${withdrawal.user_id} for failed withdrawal #${withdrawal.id}. MANUAL INTERVENTION REQUIRED.`, refundErr);
+      }
+      // ==============================================================================
+      // --- END OF REFACTOR ---
+      // ==============================================================================
     }
   } finally {
-    // This is now the ONLY place the client is released.
     if (client) {
       client.release();
     }

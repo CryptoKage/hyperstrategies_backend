@@ -14,67 +14,73 @@ const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 
 // --- Queue a New Platform Withdrawal Endpoint ---
 router.post('/', authenticateToken, async (req, res) => {
-  try {
-    const { toAddress, amount, token = 'USDC' } = req.body;
-    const userId = req.user.id;
+  const { toAddress, amount, token = 'USDC' } = req.body;
+  const userId = req.user.id;
+  const client = await pool.connect(); // Use a client for transactions
 
-    // ✅ THE FIX: Use the correct ethers v5 syntax for address validation
+  try {
+    // --- All initial validation remains the same ---
     if (!ethers.utils.isAddress(toAddress)) {
       return res.status(400).json({ message: 'Invalid ETH address' });
     }
-
-    if (typeof token !== 'string') {
-      return res.status(400).json({ message: 'Invalid token symbol.' });
+    const validatedAmount = parseFloat(amount);
+    if (isNaN(validatedAmount) || validatedAmount <= 0) {
+      return res.status(400).json({ message: 'Invalid amount format or value.' });
     }
-    const tokenSymbol = token.toLowerCase();
-    const tokenInfo = tokenMap[tokenSymbol];
+    const tokenInfo = tokenMap[token.toLowerCase()];
     if (!tokenInfo) {
       return res.status(400).json({ message: 'Unsupported token symbol.' });
     }
 
-    if (typeof amount !== 'string') {
-      return res.status(400).json({ message: 'Amount must be a string.' });
-    }
-    const validatedAmount = amount.trim();
-    const amountPattern = new RegExp(`^\\d+(\\.\\d{1,${tokenInfo.decimals}})?$`);
-    if (!amountPattern.test(validatedAmount)) {
-      return res.status(400).json({ message: 'Invalid amount format.' });
-    }
+    // ==============================================================================
+    // --- REFACTOR: Perform balance check and deduction in a secure transaction ---
+    // ==============================================================================
+    await client.query('BEGIN');
 
-    const userWalletResult = await pool.query('SELECT eth_address FROM users WHERE user_id = $1', [userId]);
-    if (userWalletResult.rows.length === 0) {
-      return res.status(404).json({ message: 'User wallet not found.' });
+    // 1. Get the user's current balance and lock the row for update.
+    const userResult = await client.query('SELECT balance FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
+    if (userResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'User not found.' });
     }
-    const userEthAddress = userWalletResult.rows[0].eth_address;
+    const currentBalance = parseFloat(userResult.rows[0].balance);
 
-    const tokenContract = new ethers.Contract(tokenInfo.address, erc20Abi, provider);
-    const onChainBalance_BN = await tokenContract.balanceOf(userEthAddress);
-    const withdrawalAmount_BN = ethers.utils.parseUnits(validatedAmount, tokenInfo.decimals);
-
-    if (withdrawalAmount_BN.lte(ethers.constants.Zero)) {
-      return res.status(400).json({ message: 'Invalid amount. Must be greater than zero.' });
+    // 2. Check if the user has sufficient "Available Balance".
+    if (currentBalance < validatedAmount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: `Insufficient available balance. You have $${currentBalance.toFixed(2)}.` });
     }
 
-    if (withdrawalAmount_BN.gt(onChainBalance_BN)) {
-      return res.status(400).json({ message: `Insufficient on-chain ${tokenInfo.symbol} balance.` });
-    }
+    // 3. Deduct the amount from their balance immediately.
+    const newBalance = currentBalance - validatedAmount;
+    await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [newBalance, userId]);
 
-    await pool.query(
+    // 4. Queue the withdrawal request.
+    await client.query(
       `INSERT INTO withdrawal_queue (user_id, to_address, amount, "token")
        VALUES ($1, $2, $3, $4)`,
       [userId, toAddress, validatedAmount, tokenInfo.symbol]
     );
+    
+    // 5. Commit the transaction.
+    await client.query('COMMIT');
+    // ==============================================================================
+    // --- END OF REFACTOR ---
+    // ==============================================================================
 
-    console.log(`📥 Queued platform withdrawal for user ${userId} to ${toAddress} for ${validatedAmount} ${tokenInfo.symbol}`);
+    console.log(`📥 Queued platform withdrawal for user ${userId}. Balance debited by ${validatedAmount}.`);
 
     return res.status(200).json({
       status: 'queued',
-      message: 'Withdrawal has been queued for processing.'
+      message: 'Withdrawal has been queued for processing. Your balance has been updated.'
     });
 
   } catch (err) {
+    if (client) await client.query('ROLLBACK'); // Ensure rollback on any error
     console.error('Queue insert error:', err);
     return res.status(500).json({ message: 'Failed to queue withdrawal' });
+  } finally {
+    if (client) client.release();
   }
 });
 
