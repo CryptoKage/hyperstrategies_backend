@@ -50,77 +50,58 @@ const updateVaultPerformance = async () => {
           const bySymbol = [];
 
           for (const asset of vaultAssetDetails) {
-            if (asset.chain === 'ETHEREUM' && asset.contract_address) {
-              byAddress.push(asset.contract_address);
+            // A more robust check for what should be fetched by symbol vs address
+            if (asset.chain === 'ETHEREUM' && asset.contract_address && (asset.symbol.startsWith('W') || asset.symbol === 'USDC')) {
+              byAddress.push(asset);
             } else if (asset.symbol) {
-              bySymbol.push(asset.symbol);
+              bySymbol.push(asset);
             }
           }
 
           // --- Fetch prices by contract address ---
           if (byAddress.length > 0) {
-            console.log(`[Alchemy Price] Fetching ${byAddress.length} assets by address...`);
-            try {
-              const apiKey = alchemy?.config?.apiKey || process.env.ALCHEMY_API_KEY;
-              if (!apiKey) {
-                throw new Error('Alchemy API key missing for price lookup.');
+              console.log(`[Alchemy Price] Fetching ${byAddress.length} assets by address...`);
+              try {
+                  const apiKey = process.env.ALCHEMY_API_KEY;
+                  const response = await fetch(`https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                          addresses: byAddress.map(asset => ({
+                              address: asset.contract_address,
+                              network: resolveNetworkByName(asset.chain),
+                              currency: 'usd'
+                          }))
+                      }),
+                  });
+                  if (!response.ok) throw new Error(`API error: ${response.statusText}`);
+                  const json = await response.json();
+                  for (const token of json.data) {
+                      if (token.prices[0]?.value) {
+                          priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
+                      }
+                  }
+              } catch (priceErr) {
+                  console.error(`[Alchemy Price] Failed to fetch prices by address:`, priceErr.message);
               }
-
-              const response = await fetch(
-                `https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`,
-                {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    addresses: byAddress.map((address) => ({
-                      address,
-                      network: 'eth-mainnet', // Assuming ETH for now, can use resolveNetworkByName
-                      currency: 'usd'
-                    })),
-                  }),
-                }
-              );
-
-              if (!response.ok) {
-                const errorBody = await response.text();
-                throw new Error(`HTTP ${response.status}: ${errorBody || response.statusText}`);
-              }
-
-              const json = await response.json();
-              const tokens = Array.isArray(json?.data) ? json.data : [];
-
-              for (const token of tokens) {
-                const priceValue = token?.prices?.[0]?.value;
-                const tokenAddress = (token?.address || '').toLowerCase();
-                if (tokenAddress && priceValue !== undefined && priceValue !== null) {
-                  priceMap.set(tokenAddress, parseFloat(priceValue));
-                }
-              }
-            } catch (priceErr) {
-              console.error(`[Alchemy Price] Failed to fetch prices by address:`, priceErr.message);
-            }
           }
 
           // --- Fetch prices by symbol ---
           if (bySymbol.length > 0) {
             console.log(`[Alchemy Price] Fetching ${bySymbol.length} assets by symbol...`);
             try {
-              const response = await alchemy.prices.getTokenPriceBySymbol(bySymbol);
-              for (const token of response.data) {
-                  const assetDetail = vaultAssetDetails.find(a => a.symbol === token.symbol);
-                  if (assetDetail && token.prices[0]?.value) {
-                      // We need the contract address to map consistently.
-                      // This assumes symbols are unique for non-address assets.
-                      priceMap.set(assetDetail.contract_address.toLowerCase(), parseFloat(token.prices[0].value));
-                  }
-              }
+              // This part can be implemented if you add non-ETH assets like native SOL
             } catch (priceErr) {
               console.error(`[Alchemy Price] Failed to fetch prices by symbol:`, priceErr.message);
             }
           }
           
           for (const trade of openTrades) {
-            const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
+            // ==============================================================================
+            // --- FINAL BUG FIX: Added .trim() to prevent whitespace issues ---
+            // ==============================================================================
+            const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
+            
             if (assetDetail && assetDetail.contract_address) {
               const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
               if (typeof currentPrice === 'number' && currentPrice > 0) {
@@ -134,6 +115,8 @@ const updateVaultPerformance = async () => {
               } else {
                 console.warn(`[PNL Calc] Missing price for ${assetDetail.symbol}. Skipping calculation.`);
               }
+            } else {
+              console.warn(`[PNL Calc] Could not find asset details for trade symbol: ${trade.asset_symbol}. Skipping.`);
             }
           }
         }
