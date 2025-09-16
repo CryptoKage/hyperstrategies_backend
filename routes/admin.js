@@ -448,11 +448,6 @@ router.post('/force-scan-block', async (req, res) => {
   try {
     console.log(`[ADMIN] Manual scan triggered for block #${blockNum} by admin ${req.user.id}`);
     
-    // ==============================================================================
-    // --- FINAL FIX: Using the newly exported function from pollDeposits.js ---
-    // This now correctly imports the function you exposed in your refactor.
-    // The previous "require inside the function" is no longer needed.
-    // ==============================================================================
     const { scanBlockForDeposits } = require('../jobs/pollDeposits');
     
     await scanBlockForDeposits(blockNum);
@@ -498,14 +493,7 @@ router.post('/scan-user-wallet', async (req, res) => {
       if (existingDeposit.rows.length === 0) {
         newDepositsFound++;
         
-        // ==============================================================================
-        // --- BUG FIX #2: Apply the same robust parsing fix here ---
-        // Convert the raw value from Alchemy to a string before passing to ethers.
-        // This prevents the "underflow" error.
-        // ==============================================================================
-        const rawValueString = event.value.toString();
-        const depositAmount_string = ethers.utils.formatUnits(rawValueString, tokenMap.usdc.decimals);
-
+         const depositAmount_string = event.value;
         console.log(`   - Found new deposit for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
         await client.query('BEGIN');
         await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
