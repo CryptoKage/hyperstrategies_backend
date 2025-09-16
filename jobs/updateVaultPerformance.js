@@ -35,17 +35,11 @@ const updateVaultPerformance = async () => {
           const vaultAssetDetails = assetsResult.rows;
           const priceMap = new Map();
 
-          // ==============================================================================
-          // --- HYBRID PRICE ORACLE LOGIC ---
-          // ==============================================================================
-          
-          // 1. Hardcode USDC price
           priceMap.set('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'.toLowerCase(), 1.0);
 
-          // 2. Fetch all other prices from Hyperliquid first
-          const hyperliquidAssets = vaultAssetDetails.filter(a => a.symbol.toUpperCase() !== 'USDC');
-          if (hyperliquidAssets.length > 0) {
-            console.log(`[Oracle] Querying Hyperliquid for ${hyperliquidAssets.length} assets...`);
+          const assetsToFetch = vaultAssetDetails.filter(a => a.symbol.toUpperCase() !== 'USDC');
+          if (assetsToFetch.length > 0) {
+            console.log(`[Oracle] Querying Hyperliquid for symbols: ${assetsToFetch.map(a => a.symbol).join(', ')}...`);
             try {
               const response = await fetch(HYPERLIQUID_API_URL, {
                 method: 'POST',
@@ -55,47 +49,22 @@ const updateVaultPerformance = async () => {
               if (!response.ok) throw new Error(`Hyperliquid API error: ${response.statusText}`);
               const mids = await response.json();
               
-              for (const asset of hyperliquidAssets) {
+              for (const asset of assetsToFetch) {
                 const priceStr = mids[asset.symbol.toUpperCase()];
                 if (priceStr) {
-                  const assetAddress = asset.contract_address.toLowerCase();
-                  if (!priceMap.has(assetAddress)) { // Don't overwrite USDC
-                    priceMap.set(assetAddress, parseFloat(priceStr));
-                  }
+                  priceMap.set(asset.contract_address.toLowerCase(), parseFloat(priceStr));
                 }
               }
             } catch (err) {
               console.error('[Oracle] Hyperliquid fetch failed:', err.message);
             }
           }
+          
+          // ==============================================================================
+          // --- DEBUGGING: Log the final price map to the console ---
+          console.log('[Oracle] Final Price Map:', Object.fromEntries(priceMap));
+          // ==============================================================================
 
-          // 3. For any assets still missing a price, fall back to Alchemy
-          const assetsMissingPrice = vaultAssetDetails.filter(a => !priceMap.has(a.contract_address.toLowerCase()));
-          if (assetsMissingPrice.length > 0) {
-            console.log(`[Oracle] Falling back to Alchemy for ${assetsMissingPrice.length} assets...`);
-            try {
-              const alchemy = getAlchemyClient();
-              const apiKey = process.env.ALCHEMY_API_KEY;
-              const response = await fetch(`https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  addresses: assetsMissingPrice.map(asset => ({ address: asset.contract_address, network: resolveNetworkByName(asset.chain) }))
-                }),
-              });
-              if (!response.ok) throw new Error(`Alchemy API error: ${response.statusText}`);
-              const json = await response.json();
-              for (const token of json.data) {
-                if (token.prices[0]?.value) {
-                  priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
-                }
-              }
-            } catch (err) {
-              console.error('[Oracle] Alchemy fallback failed:', err.message);
-            }
-          }
-
-          // 4. Calculate PNL using the populated priceMap
           for (const trade of openTrades) {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
             if (assetDetail && assetDetail.contract_address) {
