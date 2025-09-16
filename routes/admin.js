@@ -10,7 +10,7 @@ const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
 const { decrypt } = require('../utils/walletUtils'); 
 const tokenMap = require('../utils/tokens/tokenMap'); 
 const erc20Abi = require('../utils/abis/erc20.json'); 
-const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
+
 const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
 
