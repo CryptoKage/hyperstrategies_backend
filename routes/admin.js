@@ -448,11 +448,16 @@ router.post('/force-scan-block', async (req, res) => {
   try {
     console.log(`[ADMIN] Manual scan triggered for block #${blockNum} by admin ${req.user.id}`);
     
-    // We import the specific function we need here.
-    // The original code tried to call pollDeposits, which no longer exists.
+    // ==============================================================================
+    // --- BUG FIX #1: Correctly import the named export ---
+    // The module exports an object `{ scanBlockForDeposits }`, so we must destructure it.
+    // ==============================================================================
     const { scanBlockForDeposits } = require('../jobs/pollDeposits');
     
-    // We now call the new function and await its completion.
+    if (typeof scanBlockForDeposits !== 'function') {
+      throw new TypeError("scanBlockForDeposits is not a function. Check the import in admin.js.");
+    }
+    
     await scanBlockForDeposits(blockNum);
 
     res.status(200).json({ message: `Successfully triggered scan for block #${blockNum}. Check logs for any new deposits found.` });
@@ -462,8 +467,6 @@ router.post('/force-scan-block', async (req, res) => {
   }
 });
 
-
-// --- NEW ADMIN TOOL: Scan a specific user's wallet history ---
 router.post('/scan-user-wallet', async (req, res) => {
   const { userId } = req.body;
   if (!userId) {
@@ -480,7 +483,6 @@ router.post('/scan-user-wallet', async (req, res) => {
     }
     const userWalletAddress = userResult.rows[0].eth_address;
 
-    // The original code was missing the alchemy.core part. This is the fix.
     const allTransfers = await alchemy.core.getAssetTransfers({
       toAddress: userWalletAddress,
       category: [AssetTransfersCategory.ERC20],
@@ -489,18 +491,24 @@ router.post('/scan-user-wallet', async (req, res) => {
       fromBlock: "0x0", 
     });
 
-
     let newDepositsFound = 0;
     let existingDepositsFound = 0;
 
-    // Use the same trusted logic from pollDeposits to process the results
     for (const event of allTransfers.transfers) {
       const txHash = event.hash;
       const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
       
       if (existingDeposit.rows.length === 0) {
         newDepositsFound++;
-        const depositAmount_string = ethers.utils.formatUnits(event.value, tokenMap.usdc.decimals);
+        
+        // ==============================================================================
+        // --- BUG FIX #2: Apply the same robust parsing fix here ---
+        // Convert the raw value from Alchemy to a string before passing to ethers.
+        // This prevents the "underflow" error.
+        // ==============================================================================
+        const rawValueString = event.value.toString();
+        const depositAmount_string = ethers.utils.formatUnits(rawValueString, tokenMap.usdc.decimals);
+
         console.log(`   - Found new deposit for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
         await client.query('BEGIN');
         await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
@@ -516,7 +524,7 @@ router.post('/scan-user-wallet', async (req, res) => {
     res.status(200).json({ message: summaryMessage, newDeposits: newDepositsFound, existingDeposits: existingDepositsFound });
 
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (client) await client.query('ROLLBACK').catch(console.error);
     console.error(`Admin scan-user-wallet failed:`, err);
     res.status(500).json({ message: "Failed to scan wallet. See server logs for details." });
   } finally {
