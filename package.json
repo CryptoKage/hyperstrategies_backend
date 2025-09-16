@@ -11,7 +11,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@moralisweb3/common-evm-utils": "^2.27.2",
     "@moralisweb3/core": "^2.7.4",
     "alchemy-sdk": "^3.6.1",
     "axios": "^1.10.0",
@@ -25,13 +24,15 @@
     "express-validator": "^7.2.1",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "lru-cache": "^11.2.1",
     "moralis": "^2.27.2",
     "node-cron": "^4.2.1",
     "node-fetch": "^3.3.2",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
     "pg": "^8.16.3",
-    "resend": "^6.0.1"
+    "resend": "^6.0.1",
+    "zod": "^4.1.8"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
