@@ -1,11 +1,7 @@
 // PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/updateVaultPerformance.js
 
 const pool = require('../db');
-const {
-  getAlchemyClient,
-  resolveNetworkByName,
-  extractPrice, // We might not need this if the new SDK call is simpler
-} = require('../services/alchemy');
+const { getAlchemyClient } = require('../services/alchemy');
 
 const updateVaultPerformance = async () => {
   console.log('📈 Starting hourly vault performance update job (using Alchemy Price API)...');
@@ -33,7 +29,7 @@ const updateVaultPerformance = async () => {
       await client.query('BEGIN');
       try {
         const principalResult = await client.query(
-          `SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND status = 'ACTIVE_IN_POOL' AND entry_type = 'DEPOSIT'`,
+          `SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`,
           [vaultId]
         );
         const principalCapital = parseFloat(principalResult.rows[0].total);
@@ -49,23 +45,29 @@ const updateVaultPerformance = async () => {
           const vaultAssetDetails = assetsResult.rows;
           const priceMap = new Map();
 
-          // Batch all unique contract addresses to fetch prices for
           const uniqueAddresses = [...new Set(vaultAssetDetails.map(a => a.contract_address).filter(Boolean))];
 
           if (uniqueAddresses.length > 0) {
             console.log(`[Alchemy Price] Fetching prices for ${uniqueAddresses.length} unique assets...`);
-            for (const address of uniqueAddresses) {
-              try {
-                // The modern alchemy-sdk uses alchemy.core.getTokenPrice(address) for this.
-                const priceData = await alchemy.core.getTokenPrice(address);
-                if (priceData) {
-                  priceMap.set(address.toLowerCase(), priceData);
+            
+            // ==============================================================================
+            // --- FINAL BUG FIX: Use the correct alchemy.prices.getTokensPrice method ---
+            // The method is in the 'prices' namespace, not 'core'.
+            // It takes an array of addresses and returns their prices.
+            // ==============================================================================
+            try {
+              const priceData = await alchemy.prices.getTokensPrice(uniqueAddresses);
+              
+              priceData.forEach(token => {
+                if (token.usdPrice) {
+                  priceMap.set(token.contractAddress.toLowerCase(), token.usdPrice);
                 } else {
-                   console.warn(`[Alchemy Price] No price data returned for ${address}.`);
+                  console.warn(`[Alchemy Price] No USD price found for ${token.contractAddress}.`);
                 }
-              } catch (priceErr) {
-                console.error(`[Alchemy Price] Failed to fetch price for ${address}:`, priceErr.message);
-              }
+              });
+
+            } catch (priceErr) {
+              console.error(`[Alchemy Price] Failed to fetch token prices:`, priceErr.message);
             }
           }
 
@@ -119,5 +121,3 @@ const updateVaultPerformance = async () => {
 };
 
 module.exports = { updateVaultPerformance };
-
-// test
