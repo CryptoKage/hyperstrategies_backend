@@ -1,4 +1,4 @@
-// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/pollDeposits.js
+//  hyperstrategies_backend/jobs/pollDeposits.js
 
 const { ethers } = require('ethers');
 const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
@@ -12,11 +12,27 @@ const alchemy = new Alchemy(config);
 /**
  * Scans a specific block for new deposits. This function is now triggered by
  * an event from the WebSocket provider instead of running on a timer.
- * @param {number} blockNumber - The block number to scan.
+ * @param {number|string} blockNumber - The block number (hex string or number) to scan.
  */
+function normalizeBlockTag(blockNumber) {
+  if (typeof blockNumber === 'string') {
+    const trimmed = blockNumber.trim();
+    if (trimmed.startsWith('0x')) {
+      return ethers.BigNumber.from(trimmed).toHexString();
+    }
+    if (/^\d+$/.test(trimmed)) {
+      return ethers.BigNumber.from(trimmed).toHexString();
+    }
+    // Fallback for unexpected strings like 'latest'.
+    return trimmed;
+  }
+
+  return ethers.BigNumber.from(blockNumber).toHexString();
+}
+
 async function scanBlockForDeposits(blockNumber) {
   console.log(`⚡️ [WebSocket] New block #${blockNumber} received. Scanning for deposits...`);
-  
+
   const client = await pool.connect();
   try {
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
@@ -26,16 +42,24 @@ async function scanBlockForDeposits(blockNumber) {
     
     const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
+    let blockTag;
+    try {
+      blockTag = normalizeBlockTag(blockNumber);
+    } catch (normalizationError) {
+      console.error(`❌ [WebSocket] Unable to normalize block number ${blockNumber}:`, normalizationError);
+      return;
+    }
+
     const allTransfers = await alchemy.core.getAssetTransfers({
-      fromBlock: ethers.utils.hexlify(blockNumber),
-      toBlock: ethers.utils.hexlify(blockNumber),
+      fromBlock: blockTag,
+      toBlock: blockTag,
       category: [AssetTransfersCategory.ERC20],
       contractAddresses: [tokenMap.usdc.address],
       excludeZeroValue: true,
     });
 
     if (allTransfers.transfers.length === 0) {
-        return;
+      return;
     }
 
     for (const event of allTransfers.transfers) {
@@ -82,12 +106,20 @@ async function scanBlockForDeposits(blockNumber) {
  * Subscribes the deposit scanning logic to the global newBlock event emitter.
  * This should be called once when the server starts up.
  */
+let isSubscribed = false;
+
 function subscribeToNewBlocks() {
-    blockEmitter.on('newBlock', (blockNumber) => {
-        scanBlockForDeposits(blockNumber);
-    });
-    console.log('✅ Deposit scanner is now subscribed to new block events from WebSocket.');
+  if (isSubscribed) {
+    return;
+  }
+
+  blockEmitter.on('newBlock', (blockNumber) => {
+    scanBlockForDeposits(blockNumber);
+  });
+
+  isSubscribed = true;
+  console.log('✅ Deposit scanner is now subscribed to new block events from WebSocket.');
 }
 
-// We now export the subscription function instead of the pollDeposits function.
-module.exports = { subscribeToNewBlocks };
+// We now export the subscription function and the block scanner for manual triggers.
+module.exports = { subscribeToNewBlocks, scanBlockForDeposits };

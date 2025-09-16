@@ -448,7 +448,11 @@ router.post('/force-scan-block', async (req, res) => {
   try {
     console.log(`[ADMIN] Manual scan triggered for block #${blockNum} by admin ${req.user.id}`);
     
- 
+    // ==============================================================================
+    // --- FINAL FIX: Using the newly exported function from pollDeposits.js ---
+    // This now correctly imports the function you exposed in your refactor.
+    // The previous "require inside the function" is no longer needed.
+    // ==============================================================================
     const { scanBlockForDeposits } = require('../jobs/pollDeposits');
     
     await scanBlockForDeposits(blockNum);
