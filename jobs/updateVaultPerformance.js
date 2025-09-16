@@ -1,11 +1,19 @@
 // PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/updateVaultPerformance.js
 
 const pool = require('../db');
-const fetch = require('node-fetch'); // Make sure node-fetch is in your package.json
-const { resolveNetworkByName } = require('../services/alchemy');
+const fetch = require('node-fetch'); // <-- Import the fetch polyfill
+const { getAlchemyClient } = require('../services/alchemy');
 
 const updateVaultPerformance = async () => {
   console.log('📈 Starting hourly vault performance update job (using Alchemy Price API)...');
+
+  let alchemy;
+  try {
+    alchemy = getAlchemyClient();
+  } catch (err) {
+    console.error('❌ Alchemy client not configured for vault performance job:', err.message || err);
+    return;
+  }
 
   const client = await pool.connect();
   try {
@@ -38,57 +46,61 @@ const updateVaultPerformance = async () => {
           const vaultAssetDetails = assetsResult.rows;
           const priceMap = new Map();
 
-          const uniqueAddressesByChain = vaultAssetDetails.reduce((acc, asset) => {
-            if (asset.contract_address) {
-              const chain = asset.chain || 'ETHEREUM';
-              if (!acc[chain]) acc[chain] = [];
-              acc[chain].push(asset.contract_address);
-            }
-            return acc;
-          }, {});
-
           // ==============================================================================
-          // --- FINAL FIX: Use a direct `fetch` call to the Alchemy Price API endpoint ---
-          // This bypasses the SDK helpers and uses the raw POST method for reliability.
+          // --- FINAL, CORRECTED PRICE FETCHING LOGIC ---
+          // Based on expert advice, we use a hybrid approach.
           // ==============================================================================
-          const apiKey = process.env.ALCHEMY_API_KEY;
-          const apiUrl = `https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`;
+          const byAddress = [];
+          const bySymbol = [];
 
-          for (const chainName in uniqueAddressesByChain) {
-            const addresses = uniqueAddressesByChain[chainName];
-            console.log(`[Alchemy Price] Fetching prices for ${addresses.length} assets on ${chainName}...`);
-
-            try {
-              const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  addresses: addresses.map(addr => ({
-                    address: addr,
-                    network: resolveNetworkByName(chainName), // Uses our helper to get 'eth-mainnet', etc.
-                    currency: 'usd'
-                  }))
-                }),
-              });
-
-              if (!response.ok) {
-                throw new Error(`API responded with status ${response.status}`);
-              }
-              
-              const priceData = await response.json();
-
-              for (const token of priceData.data) {
-                if (token.prices && token.prices[0] && typeof token.prices[0].value === 'string') {
-                  priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
-                } else {
-                  console.warn(`[Alchemy Price] No USD price data found for ${token.address}.`);
-                }
-              }
-
-            } catch (priceErr) {
-              console.error(`[Alchemy Price] Failed to fetch prices for ${chainName}:`, priceErr.message);
+          for (const asset of vaultAssetDetails) {
+            // Use by-address for specific ERC20s, by-symbol for others like SOL
+            if (asset.chain === 'ETHEREUM' && asset.contract_address) {
+              byAddress.push(asset.contract_address);
+            } else {
+              bySymbol.push(asset.symbol);
             }
           }
+
+          // --- Fetch prices by contract address ---
+          if (byAddress.length > 0) {
+            console.log(`[Alchemy Price] Fetching ${byAddress.length} assets by address...`);
+            try {
+              // Using the SDK's underlying fetch mechanism for the raw endpoint
+              const response = await alchemy.config.axios.post(`/prices/v1/${alchemy.config.apiKey}/tokens/by-address`, {
+                addresses: byAddress.map(address => ({ address, network: 'eth-mainnet' }))
+              });
+
+              for (const token of response.data.data) {
+                if (token.prices[0]?.value) {
+                  priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
+                }
+              }
+            } catch (priceErr) {
+              console.error(`[Alchemy Price] Failed to fetch prices by address:`, priceErr.message);
+            }
+          }
+
+          // --- Fetch prices by symbol ---
+          if (bySymbol.length > 0) {
+            console.log(`[Alchemy Price] Fetching ${bySymbol.length} assets by symbol...`);
+            try {
+              const response = await alchemy.prices.getTokenPriceBySymbol(bySymbol);
+              for (const token of response.data) {
+                  // Find the corresponding assetDetail to get the contract address for the map key
+                  const assetDetail = vaultAssetDetails.find(a => a.symbol === token.symbol);
+                  if(assetDetail && token.prices[0]?.value) {
+                      // We still map by address for consistency in the PNL calculation step
+                      priceMap.set(assetDetail.contract_address.toLowerCase(), parseFloat(token.prices[0].value));
+                  }
+              }
+            } catch (priceErr) {
+              console.error(`[Alchemy Price] Failed to fetch prices by symbol:`, priceErr.message);
+            }
+          }
+          // ==============================================================================
+          // --- END OF PRICE FETCHING LOGIC ---
+          // ==============================================================================
 
           for (const trade of openTrades) {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
@@ -103,7 +115,7 @@ const updateVaultPerformance = async () => {
                   unrealizedPnl += (entryPrice - currentPrice) * quantity;
                 }
               } else {
-                console.warn(`[PNL Calc] Missing price for ${assetDetail.symbol}. Skipping for unrealized PNL calculation.`);
+                console.warn(`[PNL Calc] Missing price for ${assetDetail.symbol}. Skipping calculation.`);
               }
             }
           }

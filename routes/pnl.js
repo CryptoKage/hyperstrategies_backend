@@ -2,25 +2,23 @@
 
 const express = require('express');
 // ==============================================================================
-// --- FINAL BUG FIX: Use destructuring to import the LRU class ---
-// The latest version of the 'lru-cache' library uses a named export.
+// --- FINAL, CORRECT FIX: The main class is now named 'LRUCache' ---
+// Your research was correct. We need to import LRUCache and instantiate it.
 // ==============================================================================
-const { LRU } = require('lru-cache');
+const { LRUCache } = require('lru-cache');
 const { z } = require('zod');
 const {
   getAlchemyClient,
   resolveNetworkByChainId,
-  extractPrice,
-  DEFAULT_PRICE_CURRENCY,
 } = require('../services/alchemy');
 
 const router = express.Router();
-const cache = new LRU({ max: 500, ttl: 5 * 60 * 1000 }); // 5 min cache
+// Use the correct constructor name here
+const cache = new LRUCache({ max: 500, ttl: 5 * 60 * 1000 }); // 5 min cache
 
-// Zod schema for input validation
 const QuerySchema = z.object({
   address: z.string().min(42).regex(/^0x[a-fA-F0-9]{40}$/, "Invalid Ethereum address"),
-  chain: z.string().default(process.env.DEFAULT_CHAIN || "0x1"), // hex chainId
+  chain: z.string().default(process.env.DEFAULT_CHAIN || "0x1"),
 });
 
 const keyFor = (addr, chain) => `pnl:${chain}:${addr.toLowerCase()}`;
@@ -40,13 +38,17 @@ router.get("/:address", async (req, res) => {
     const alchemy = getAlchemyClient();
     const alchemyNetwork = resolveNetworkByChainId(chain);
 
+    // This logic remains simplified for now as it's a non-critical feature.
     const balancesResponse = await alchemy.core.getTokenBalances(address, { network: alchemyNetwork });
-    const nonZeroBalances = balancesResponse.tokenBalances.filter(token => token.tokenBalance !== '0');
+    const holdings = balancesResponse.tokenBalances
+      .filter(token => token.tokenBalance !== '0')
+      .map(token => ({
+          address: token.contractAddress,
+          balance: token.tokenBalance,
+          // More details could be fetched from getTokenMetadata if needed
+      }));
     
-    const holdings = [];
-    // The rest of this logic can be built out later as a feature enhancement.
-    // For now, it will return an empty holdings array but will not crash the server.
-    const portfolioValue = 0; 
+    const portfolioValue = 0; // Placeholder for future price logic
 
     const payload = {
       address,
@@ -54,8 +56,7 @@ router.get("/:address", async (req, res) => {
       portfolioValueUSD: portfolioValue,
       holdings: holdings,
       updatedAt: new Date().toISOString(),
-      priceSource: "alchemy",
-      priceCurrency: DEFAULT_PRICE_CURRENCY,
+      priceSource: "alchemy"
     };
 
     cache.set(cacheKey, payload);
