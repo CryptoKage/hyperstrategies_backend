@@ -73,16 +73,8 @@ async function scanBlockForDeposits(blockNumber) {
           
           await client.query('BEGIN');
           try {
-            // ==============================================================================
-            // --- BUG FIX: Correctly handle BigNumber parsing between libraries ---
-            // The `event.value` from alchemy-sdk is a BigNumber-like object.
-            // We convert it to a string (.toString()) before passing it to ethers.js's
-            // formatUnits function to prevent cross-library type conflicts.
-            // This resolves the "underflow" error.
-            // ==============================================================================
-            const rawValueString = event.value.toString();
-            const depositAmount_string = ethers.utils.formatUnits(rawValueString, tokenMap.usdc.decimals);
 
+            const depositAmount_string = event.value;
             console.log(`✅ [WebSocket] New deposit found for user ${userId}: ${depositAmount_string} USDC, tx: ${txHash}`);
             
             await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
