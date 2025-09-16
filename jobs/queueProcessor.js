@@ -48,32 +48,36 @@ async function processWithdrawals() {
     await tx.wait(1);
     console.log(`✅ Withdrawal tx confirmed: ${tx.hash}`);
     
-    // --- On Success, we simply move the record to the permanent withdrawals table ---
-    // The balance was already deducted, so no further user balance update is needed.
+    // ==============================================================================
+    // --- REFACTOR: On success, update status to 'processed' instead of deleting ---
+    // This provides a much safer and more auditable trail.
+    // ==============================================================================
     await client.query('BEGIN');
-    await client.query(`DELETE FROM withdrawal_queue WHERE id = $1`, [id]);
+    
+    // 1. Mark the queue item as processed and add the transaction hash.
+    await client.query(`UPDATE withdrawal_queue SET status = 'processed', tx_hash = $1 WHERE id = $2`, [tx.hash, id]);
+    
+    // 2. Copy the successful record to the permanent withdrawals history table.
     await client.query(
-      `INSERT INTO withdrawals (user_id, to_address, amount, token, tx_hash, status)
-       VALUES ($1, $2, $3, $4, $5, 'sent')`,
-      [user_id, to_address, amount, token, tx.hash]
+      `INSERT INTO withdrawals (id, user_id, to_address, amount, token, tx_hash, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'sent')`,
+      [id, user_id, to_address, amount, token, tx.hash]
     );
     await client.query('COMMIT');
+    // ==============================================================================
+    // --- END OF REFACTOR ---
+    // ==============================================================================
 
   } catch (err) {
     console.error(`❌ FAILED to process withdrawal:`, err.message);
     if (client && withdrawal) {
-      // ==============================================================================
-      // --- REFACTOR: On failure, re-credit the user's balance ---
-      // ==============================================================================
       console.log(`Marking withdrawal #${withdrawal.id} as failed and refunding user.`);
       await client.query('BEGIN');
       try {
-        // 1. Add the funds back to the user's balance.
         await client.query(
             'UPDATE users SET balance = balance + $1 WHERE user_id = $2',
             [withdrawal.amount, withdrawal.user_id]
         );
-        // 2. Mark the withdrawal as failed so it won't be picked up again.
         await client.query(
             `UPDATE withdrawal_queue SET status = 'failed', error_message = $1 WHERE id = $2`, 
             [err.message, withdrawal.id]
@@ -84,9 +88,6 @@ async function processWithdrawals() {
         await client.query('ROLLBACK');
         console.error(`CRITICAL ERROR: FAILED TO REFUND USER ${withdrawal.user_id} for failed withdrawal #${withdrawal.id}. MANUAL INTERVENTION REQUIRED.`, refundErr);
       }
-      // ==============================================================================
-      // --- END OF REFACTOR ---
-      // ==============================================================================
     }
   } finally {
     if (client) {
