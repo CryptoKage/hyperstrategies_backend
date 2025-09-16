@@ -1,5 +1,7 @@
 // server/index.js
 const dotenv = require('dotenv');
+dotenv.config();
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -15,8 +17,7 @@ const statsRoutes = require('./routes/stats');
 const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
 const vaultDetailsRoutes = require('./routes/vaultDetails');
 const { verifyWithdrawalSweeps } = require('./jobs/verifyWithdrawalSweeps');
-
-dotenv.config();
+const rateLimit = require('express-rate-limit');
 
 // --- Startup Configuration Checks ---
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === '') {
@@ -49,6 +50,16 @@ const PORT = process.env.PORT || 5000;
 // --- Middleware ---
 app.use(cors(corsOptions));
 app.use(helmet());
+
+const globalLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 100, // Limit each IP to 100 requests per windowMs
+	standardHeaders: true,
+	legacyHeaders: false, 
+  message: 'Too many requests from this IP, please try again after 15 minutes.'
+});
+app.use(globalLimiter);
+
 app.use(express.json());
 
 const isProduction = process.env.NODE_ENV === 'production';
@@ -97,7 +108,7 @@ app.listen(PORT, async () => {
   let isPollingDeposits = false;
   let isProcessingWithdrawals = false;
   let isProcessingTimeRewards = false;
-  let isProcessingVaultWithdrawals = false;
+  // let isProcessingVaultWithdrawals = false;
   let isSweepingLedger = false;
 
   // --- THE FIX: Switched to a reliable setInterval for deposit polling ---
@@ -143,14 +154,14 @@ app.listen(PORT, async () => {
   }, TWENTY_FOUR_HOURS_IN_MS);
 
   // Job 5: Process pending INTERNAL vault withdrawals (every minute)
-  const { processPendingVaultWithdrawals } = require('./jobs/processVaultWithdrawals');
-  const SIXTY_SECONDS_IN_MS = 60 * 1000;
-  setInterval(async () => {
-    if (isProcessingVaultWithdrawals) { return; }
-    isProcessingVaultWithdrawals = true;
-    try { await processPendingVaultWithdrawals(); } catch (e) { console.error('Error in processVaultWithdrawals job:', e); }
-    finally { isProcessingVaultWithdrawals = false; }
-  }, SIXTY_SECONDS_IN_MS);
+  //const { processPendingVaultWithdrawals } = require('./jobs/processVaultWithdrawals');
+  //const SIXTY_SECONDS_IN_MS = 60 * 1000;
+  //setInterval(async () => {
+   // if (isProcessingVaultWithdrawals) { return; }
+   // isProcessingVaultWithdrawals = true;
+   // try { await processPendingVaultWithdrawals(); } catch (e) { console.error('Error in processVaultWithdrawals job:', e); }
+   // finally { isProcessingVaultWithdrawals = false; }
+  //}, SIXTY_SECONDS_IN_MS);
 
   // job 6
 

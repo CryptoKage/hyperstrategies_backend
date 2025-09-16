@@ -1,21 +1,26 @@
-/* /config/cors.js */
+// PASTE THIS ENTIRE CONTENT INTO: hyperstrategies_backend/config/cors.js
 
-/**
- * CORS configuration for the API server.
- * Update the `allowedOrigins` array whenever the list of trusted
- * front-end domains changes.
- */
-
- const allowedOrigins = [
-  'http://localhost:3000',
-  'https://www.hyper-strategies.com', // <-- The correct domain from the error
-  'https://hyper-strategies.com'    // <-- Good practice to include the naked domain too
+const allowedOrigins = [
+  process.env.FRONTEND_URL, // Your Vercel URL from .env
 ];
 
+// In development, we might also allow requests from localhost
+if (process.env.NODE_ENV !== 'production') {
+  allowedOrigins.push('http://localhost:3000');
+}
+
 const corsOptions = {
-  origin: allowedOrigins,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  credentials: true,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true, // This allows cookies to be sent
 };
 
-module.exports = { corsOptions, allowedOrigins };
+module.exports = { corsOptions };
