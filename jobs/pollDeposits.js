@@ -1,90 +1,62 @@
+// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/pollDeposits.js
+
 const { ethers } = require('ethers');
 const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
 const pool = require('../db');
 const tokenMap = require('../utils/tokens/tokenMap');
+const { blockEmitter } = require('../utils/alchemyWebsocketProvider'); // <-- Import the emitter
 
 const config = { apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET };
 const alchemy = new Alchemy(config);
 
-async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOverride } = {}) {
-  const jobTitle = fromBlockOverride ? '[ADMIN SCAN]' : '🔄';
-  console.log(`${jobTitle} Checking for new deposits by transaction hash...`);
+/**
+ * Scans a specific block for new deposits. This function is now triggered by
+ * an event from the WebSocket provider instead of running on a timer.
+ * @param {number} blockNumber - The block number to scan.
+ */
+async function scanBlockForDeposits(blockNumber) {
+  console.log(`⚡️ [WebSocket] New block #${blockNumber} received. Scanning for deposits...`);
   
   const client = await pool.connect();
   try {
-    const lastCheckedBlockResult = await client.query("SELECT value FROM system_state WHERE key = 'lastCheckedBlock'");
-    if (!lastCheckedBlockResult.rows[0]) {
-        throw new Error("FATAL: 'lastCheckedBlock' key not found in system_state table.");
-    }
-    const lastProcessedBlock = parseInt(lastCheckedBlockResult.rows[0].value, 10);
-
-    let fromBlock = fromBlockOverride || (lastProcessedBlock + 1);
-    let toBlock;
-
-    if (toBlockOverride) {
-      toBlock = toBlockOverride;
-    } else {
-      const latestBlock = await alchemy.core.getBlockNumber();
-      const finalityBuffer = 5;
-      toBlock = latestBlock - finalityBuffer;
-    }
-    
-    const MAX_SCAN_RANGE = 500;
-    if (!fromBlockOverride && (toBlock - fromBlock) > MAX_SCAN_RANGE) {
-      console.log(`[CATCH-UP MODE] Scanner is far behind. Processing a chunk of ${MAX_SCAN_RANGE} blocks.`);
-      toBlock = fromBlock + MAX_SCAN_RANGE - 1;
-    }
-
-    if (fromBlock > toBlock) {
-      if (!toBlockOverride) console.log('Scanner is up to date. No new blocks to process.');
-      return;
-    }
-
-    console.log(`Scanning from block #${fromBlock} to #${toBlock}`);
-    
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     if (users.length === 0) {
-      client.release();
-      return;
+      return; // No users with wallets to check.
     }
     
+    // Create a fast lookup map of user addresses.
     const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
+    // Use Alchemy's getAssetTransfers to efficiently find all USDC transfers in this specific block.
     const allTransfers = await alchemy.core.getAssetTransfers({
-      fromBlock: ethers.utils.hexlify(fromBlock),
-      toBlock: ethers.utils.hexlify(toBlock),
+      fromBlock: ethers.utils.hexlify(blockNumber),
+      toBlock: ethers.utils.hexlify(blockNumber), // Scan only this single block
       category: [AssetTransfersCategory.ERC20],
       contractAddresses: [tokenMap.usdc.address],
       excludeZeroValue: true,
     });
 
-    console.log(`[DEBUG] Found ${allTransfers.transfers.length} potential USDC transfers to filter.`);
+    if (allTransfers.transfers.length === 0) {
+        // No USDC transfers in this block, we're done.
+        return;
+    }
 
+    // Process each transfer found in the block.
     for (const event of allTransfers.transfers) {
       const toAddress = event.to?.toLowerCase();
       if (userAddressMap.has(toAddress)) {
         const userId = userAddressMap.get(toAddress);
         const txHash = event.hash;
         
+        // Final check to prevent any possible double-processing.
         const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
         if (existingDeposit.rows.length === 0) {
+          const depositAmount_string = ethers.utils.formatUnits(event.value, tokenMap.usdc.decimals);
+          
+          console.log(`✅ [WebSocket] New deposit found for user ${userId}: ${depositAmount_string} USDC, tx: ${txHash}`);
+          
+          await client.query('BEGIN');
           try {
-            // --- THE FIX: A more robust, two-step sanitization for the amount ---
-            const rawAmountFromAlchemy = event.value;
-            
-            // 1. First, safely parse the (potentially messy) number into a clean BigNumber.
-            // We use parseFloat and toFixed() to prevent any floating point errors before parsing.
-            const amountAsBigNumber = ethers.utils.parseUnits(
-              parseFloat(rawAmountFromAlchemy).toFixed(tokenMap.usdc.decimals), 
-              tokenMap.usdc.decimals
-            );
-            
-            // 2. Now, format the clean BigNumber back into a string for the database.
-            const depositAmount_string = ethers.utils.formatUnits(amountAsBigNumber, tokenMap.usdc.decimals);
-
-            console.log(`✅ New USDC deposit detected for user ${userId}: ${depositAmount_string}, tx: ${txHash}`);
-            
-            await client.query('BEGIN');
             await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
             await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [depositAmount_string, userId]);
             await client.query('COMMIT');
@@ -95,22 +67,23 @@ async function pollDeposits({ fromBlock: fromBlockOverride, toBlock: toBlockOver
         }
       }
     }
-
-    if (!fromBlockOverride) {
-      await client.query("UPDATE system_state SET value = $1 WHERE key = 'lastCheckedBlock'", [toBlock]);
-      console.log(`✅ Finished automated scan. Next scan will start from block #${toBlock + 1}`);
-    } else {
-      console.log(`✅ Finished manual scan of block range ${fromBlock}-${toBlock}.`);
-    }
-
   } catch (error) {
-    console.error('❌ Major error in pollDeposits job:', error);
-    if (fromBlockOverride) {
-      throw error;
-    }
+    console.error(`❌ Major error in scanBlockForDeposits for block #${blockNumber}:`, error);
   } finally {
     if (client) client.release();
   }
 }
 
-module.exports = { pollDeposits };
+/**
+ * Subscribes the deposit scanning logic to the global newBlock event emitter.
+ * This should be called once when the server starts up.
+ */
+function subscribeToNewBlocks() {
+    blockEmitter.on('newBlock', (blockNumber) => {
+        scanBlockForDeposits(blockNumber);
+    });
+    console.log('✅ Deposit scanner is now subscribed to new block events from WebSocket.');
+}
+
+// We now export the subscription function instead of the pollDeposits function.
+module.exports = { subscribeToNewBlocks };

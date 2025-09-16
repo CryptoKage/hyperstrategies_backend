@@ -14,6 +14,8 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const { autoEquipBestPins } = require('../utils/pinUtils');
 const { TIER_DATA } = require('../utils/tierUtils');
 const { sendEmail } = require('../utils/msGraphMailer');
+const { awardXp } = require('../utils/xpEngine');
+
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
@@ -85,7 +87,6 @@ router.post(
 
      let referrerId = null;
       if (referralCode) {
-        // We now use LOWER() on both the database column and the input to ensure a match.
         const referrerResult = await client.query(
           'SELECT user_id FROM users WHERE LOWER(referral_code) = LOWER($1)', 
           [referralCode]
@@ -105,13 +106,16 @@ router.post(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING user_id, email, username, eth_address`;
 
+      // We set initial XP to 0 here, as the engine will handle the addition.
+      const initialXp = 0; 
+      
       let newUserResult;
       let attempts = 0;
       while (!newUserResult && attempts < 5) {
         const newReferralCode = await generateUniqueReferralCode(client);
         const newUserParams = [
           email, passwordHash, username, null, 0.0, wallet.address,
-          encryptedKey, referrerId, xpToAward, null, 'dark',
+          encryptedKey, referrerId, initialXp, null, 'dark',
           newReferralCode, false, 1,
         ];
         try {
@@ -131,17 +135,15 @@ router.post(
       const newlyCreatedUser = newUserResult.rows[0];
       const newUserId = newlyCreatedUser.user_id;
 
-        if (xpToAward > 0) {
-        const description = `Earned ${xpToAward} XP as an Early Adopter bonus!`;
-        await client.query(
-          `INSERT INTO user_activity_log (user_id, activity_type, source, description, amount_primary, symbol_primary, status)
-           VALUES ($1, 'XP_SIGNUP_BONUS', 'SIGNUP', $2, $3, 'XP', 'CLAIMED')`,
-          [newUserId, description, xpToAward]
-        );
+      if (xpToAward > 0) {
+        await awardXp({
+          userId: newUserId,
+          xpAmount: xpToAward,
+          type: 'SIGNUP_BONUS',
+          description: `Earned ${xpToAward} XP as an Early Adopter bonus!`,
+        }, client);
       }
-
-      
-
+     
       if (referralCode) {
             const syndicateResult = await client.query(
                 'SELECT pin_name_to_grant FROM syndicates WHERE referral_code = $1',

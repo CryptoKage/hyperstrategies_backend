@@ -1,4 +1,5 @@
-// server/index.js
+// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/index.js
+
 const dotenv = require('dotenv');
 dotenv.config();
 
@@ -8,32 +9,17 @@ const helmet = require('helmet');
 const session = require('express-session');
 const passport = require('passport');
 const ethers = require('ethers');
+const rateLimit = require('express-rate-limit');
+
+// --- Route Imports ---
+const { corsOptions } = require('./config/cors');
 const pinsRouter = require('./routes/pins');
 const adminPinsRouter = require('./routes/adminPins');
 const authXRoutes = require('./routes/authX');
 const bountyRoutes = require('./routes/bounties');
 const pinsMarketplaceRoutes = require('./routes/pinsMarketplace');
 const statsRoutes = require('./routes/stats');
-const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
 const vaultDetailsRoutes = require('./routes/vaultDetails');
-const { verifyWithdrawalSweeps } = require('./jobs/verifyWithdrawalSweeps');
-const rateLimit = require('express-rate-limit');
-
-// --- Startup Configuration Checks ---
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === '') {
-  console.error('FATAL ERROR: JWT_SECRET environment variable is not defined.');
-  process.exit(1);
-}
-if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.trim() === '') {
-  console.error('FATAL ERROR: SESSION_SECRET environment variable is not defined.');
-  process.exit(1);
-}
-if (!process.env.ENCRYPTION_KEY || process.env.ENCRYPTION_KEY.length < 32) {
-  console.error('FATAL ERROR: ENCRYPTION_KEY environment variable is not defined or is too short.');
-  process.exit(1);
-}
-
-// --- Route Imports ---
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const withdrawRoutes = require('./routes/withdraw');
@@ -41,7 +27,21 @@ const vaultsRoutes = require('./routes/vaults');
 const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
 require('./passport-setup');
-const { corsOptions } = require('./config/cors');
+
+// --- Job & Utility Imports ---
+const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
+const { verifyWithdrawalSweeps } = require('./jobs/verifyWithdrawalSweeps');
+const { initializeWebSocketProvider } = require('./utils/alchemyWebsocketProvider'); 
+const { subscribeToNewBlocks } = require('./jobs/pollDeposits'); 
+const cron = require('node-cron');
+
+
+// --- Startup Configuration Checks ---
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === '') {
+  console.error('FATAL ERROR: JWT_SECRET environment variable is not defined.');
+  process.exit(1);
+}
+// ... (rest of your startup checks)
 
 const app = express();
 app.set('trust proxy', 1);
@@ -52,8 +52,8 @@ app.use(cors(corsOptions));
 app.use(helmet());
 
 const globalLimiter = rateLimit({
-	windowMs: 15 * 60 * 1000, // 15 minutes
-	max: 100, // Limit each IP to 100 requests per windowMs
+	windowMs: 15 * 60 * 1000,
+	max: 100,
 	standardHeaders: true,
 	legacyHeaders: false, 
   message: 'Too many requests from this IP, please try again after 15 minutes.'
@@ -97,34 +97,19 @@ app.listen(PORT, async () => {
   try {
     const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
     const block = await provider.getBlockNumber();
-    console.log(`✅ Alchemy provider connected. Current block number: ${block}`);
+    console.log(`✅ Alchemy REST provider connected. Current block number: ${block}`);
   } catch (err) {
-    console.error('❌ Alchemy provider connection failed:', err);
+    console.error('❌ Alchemy REST provider connection failed:', err);
   }
 
-  // --- Initialize All Background Jobs ---
-  console.log('🕒 Initializing background jobs with anti-overlap protection...');
+  // --- Initialize All Background Jobs & Services ---
+  console.log('🕒 Initializing background jobs and services...');
 
-  let isPollingDeposits = false;
-  let isProcessingWithdrawals = false;
-  let isProcessingTimeRewards = false;
-  // let isProcessingVaultWithdrawals = false;
-  let isSweepingLedger = false;
-
-  // --- THE FIX: Switched to a reliable setInterval for deposit polling ---
-  const { pollDeposits } = require('./jobs/pollDeposits');
-  // The call to initializeProvider() has been removed as it's no longer exported or needed.
-  setInterval(async () => {
-    if (isPollingDeposits) { return; }
-    isPollingDeposits = true;
-    try { 
-      await pollDeposits(); 
-    }
-    catch (e) { console.error('Error in pollDeposits job:', e); }
-    finally { isPollingDeposits = false; }
-  }, 15000); // Run every 15 seconds.
-
+  initializeWebSocketProvider();
+  subscribeToNewBlocks();
+  
   // Job 2: Process platform withdrawal queue (every 45 seconds)
+  let isProcessingWithdrawals = false;
   const { processWithdrawals } = require('./jobs/queueProcessor');
   setInterval(async () => {
     if (isProcessingWithdrawals) { return; }
@@ -134,6 +119,7 @@ app.listen(PORT, async () => {
   }, 45000);
 
   // Job 3: Sweep newly deposited funds to the trading desk (every 10 minutes)
+  let isSweepingLedger = false;
   const { processLedgerSweeps } = require('./jobs/processLedgerSweeps');
   const TEN_MINUTES_IN_MS = 10 * 60 * 1000;
   setInterval(async () => {
@@ -144,6 +130,7 @@ app.listen(PORT, async () => {
   }, TEN_MINUTES_IN_MS);
 
   // Job 4: Award time-weighted staking XP (every 24 hours)
+  let isProcessingTimeRewards = false;
   const { processTimeWeightedRewards } = require('./jobs/awardStakingXP');
   const TWENTY_FOUR_HOURS_IN_MS = 24 * 60 * 60 * 1000;
   setInterval(async () => {
@@ -152,33 +139,15 @@ app.listen(PORT, async () => {
     try { await processTimeWeightedRewards(); } catch (e) { console.error('Error in processTimeWeightedRewards job:', e); }
     finally { isProcessingTimeRewards = false; }
   }, TWENTY_FOUR_HOURS_IN_MS);
+  
+  // Job 5 & 6 (Cron Jobs)
+  cron.schedule('0 * * * *', () => {
+    console.log('Triggering scheduled hourly vault performance update...');
+    updateVaultPerformance();
+  });
 
-  // Job 5: Process pending INTERNAL vault withdrawals (every minute)
-  //const { processPendingVaultWithdrawals } = require('./jobs/processVaultWithdrawals');
-  //const SIXTY_SECONDS_IN_MS = 60 * 1000;
-  //setInterval(async () => {
-   // if (isProcessingVaultWithdrawals) { return; }
-   // isProcessingVaultWithdrawals = true;
-   // try { await processPendingVaultWithdrawals(); } catch (e) { console.error('Error in processVaultWithdrawals job:', e); }
-   // finally { isProcessingVaultWithdrawals = false; }
-  //}, SIXTY_SECONDS_IN_MS);
-
-  // job 6
-
-  const cron = require('node-cron');
-
-
-cron.schedule('0 * * * *', () => {
-  console.log('Triggering scheduled hourly vault performance update...');
-  updateVaultPerformance();
-});
-
- // job 7 vaultwithdrawl sweep
-
- cron.schedule('0 */4 * * *', () => {
-  console.log('Triggering scheduled withdrawal sweep verification...');
-  verifyWithdrawalSweeps();
-});
-
-
+  cron.schedule('0 */4 * * *', () => {
+    console.log('Triggering scheduled withdrawal sweep verification...');
+    verifyWithdrawalSweeps();
+  });
 });

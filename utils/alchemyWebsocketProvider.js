@@ -1,61 +1,64 @@
-// hyperstrategies_backend/utils/alchemyWebsocketProvider.js
-// This new version is a robust module that handles connection errors and auto-reconnects.
+// PASTE THIS ENTIRE CONTENT INTO: hyperstrategies_backend/utils/alchemyWebsocketProvider.js
 
-const { ethers } = require('ethers');
+const { Alchemy, Network } = require('alchemy-sdk');
+const EventEmitter = require('events');
 
-const network = process.env.ALCHEMY_NETWORK || 'homestead';
-const apiKey = process.env.ALCHEMY_API_KEY;
+// We create an EventEmitter to allow other parts of our application to "subscribe" to new blocks.
+class BlockEmitter extends EventEmitter {}
+const blockEmitter = new BlockEmitter();
 
-let provider;
-let connectionAttempts = 0;
+let alchemy;
+let isConnected = false;
 
+/**
+ * Initializes the Alchemy WebSocket connection.
+ * This function is designed to be called once when the server starts.
+ * It sets up a listener for new blocks and handles automatic reconnection.
+ */
 function initializeWebSocketProvider() {
-  console.log('Attempting to connect to Alchemy WebSocket...');
+  console.log('🔌 Initializing Alchemy WebSocket provider...');
+
+  const config = {
+    apiKey: process.env.ALCHEMY_API_KEY,
+    network: Network.ETH_MAINNET,
+  };
   
-  // Create a new provider instance
-  provider = new ethers.providers.AlchemyWebSocketProvider(network, apiKey);
+  alchemy = new Alchemy(config);
 
-  // --- THIS IS THE CRITICAL ERROR HANDLING ---
-  // Listen for the 'error' event on the provider's WebSocket connection
-  provider._websocket.on('error', (error) => {
-    console.error('--- WebSocket Error ---');
-    console.error('An error occurred with the Alchemy WebSocket connection:', error.message);
-    // The 'error' event is usually followed by a 'close' event, which will handle reconnection.
-  });
-
-  // Listen for the 'close' event
-  provider._websocket.on('close', (code) => {
-    console.warn(`--- WebSocket Closed ---`);
-    console.warn(`Connection closed with code: ${code}. Attempting to reconnect in 10 seconds...`);
+  const connect = () => {
+    console.log('Attempting to connect to Alchemy WebSocket...');
     
-    // Clear the old provider and listeners to prevent memory leaks
-    provider.removeAllListeners();
-    
-    // Attempt to reconnect after a delay
-    connectionAttempts++;
-    const delay = Math.min(10000 * connectionAttempts, 60000); // Exponential backoff, max 1 minute
-    setTimeout(initializeWebSocketProvider, delay);
-  });
+    // Subscribe to new block headers
+    alchemy.ws.on('block', (blockNumber) => {
+      if (!isConnected) {
+        isConnected = true;
+        console.log(`✅ WebSocket connected! First new block received: #${blockNumber}`);
+      }
+      // When a new block arrives, we "emit" an event that other files can listen for.
+      blockEmitter.emit('newBlock', blockNumber);
+    });
 
-  // Listen for a successful 'open' event
-  provider._websocket.on('open', () => {
-    console.log('✅ Alchemy WebSocket connection established successfully.');
-    connectionAttempts = 0; // Reset connection attempts on success
-  });
+    // It's good practice to have a way to know when the connection drops
+    const ws = alchemy.ws.getWebSocket();
+    ws.on('close', () => {
+      if (isConnected) {
+        console.warn('🔌 WebSocket connection closed. Attempting to reconnect in 10 seconds...');
+        isConnected = false;
+        setTimeout(connect, 10000); // Attempt to reconnect after a delay
+      }
+    });
 
-  // We also need to attach the 'block' listener here now
-  // We will pass this listener in from index.js
+    ws.on('error', (error) => {
+      console.error('🔌 WebSocket error:', error.message);
+      // The 'close' event will usually fire after an error, triggering our reconnect logic.
+    });
+  };
+
+  connect();
 }
 
-function getProvider() {
-    if (!provider) {
-        throw new Error("WebSocket provider has not been initialized.");
-    }
-    return provider;
-}
-
-// Start the initial connection attempt
-initializeWebSocketProvider();
-
-// Export the function to get the provider instance
-module.exports = { getProvider };
+// We export the initializer and the emitter so other files can use them.
+module.exports = {
+  initializeWebSocketProvider,
+  blockEmitter
+};
