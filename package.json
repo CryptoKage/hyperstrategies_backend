@@ -11,6 +11,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@azure/msal-node": "^3.7.3",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "@moralisweb3/core": "^2.7.4",
     "alchemy-sdk": "^3.6.1",
     "axios": "^1.10.0",
@@ -23,6 +25,7 @@
     "express-session": "^1.18.1",
     "express-validator": "^7.2.1",
     "helmet": "^8.1.0",
+    "isomorphic-fetch": "^3.0.0",
     "jsonwebtoken": "^9.0.2",
     "lru-cache": "^11.2.1",
     "moralis": "^2.27.2",

@@ -13,6 +13,7 @@ const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 const { autoEquipBestPins } = require('../utils/pinUtils');
 const { TIER_DATA } = require('../utils/tierUtils');
+const { sendEmail } = require('../utils/msGraphMailer');
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
@@ -304,9 +305,6 @@ router.get('/google/callback',
   }
 );
 
-// --- FIX ENDS HERE ---
-
-
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT user_id, username, eth_address FROM users WHERE user_id = $1', [req.user.id]);
@@ -318,10 +316,7 @@ router.get('/me', authenticateToken, async (req, res) => {
   }
 });
 
-router.post(
-  '/forgot-password',
-  authLimiter,
-  [ body('email').isEmail().normalizeEmail() ],
+router.post('/forgot-password', authLimiter, [ body('email').isEmail().normalizeEmail() ],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -330,6 +325,8 @@ router.post(
     const { email } = req.body;
     try {
       const userResult = await pool.query('SELECT user_id FROM users WHERE email = $1', [email]);
+      
+      // Security: Always return the same message to prevent email enumeration attacks.
       if (userResult.rows.length === 0) {
         return res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
       }
@@ -337,7 +334,7 @@ router.post(
 
       const resetToken = crypto.randomBytes(32).toString('hex');
       const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-      const tokenExpires = new Date(Date.now() + 3600000); 
+      const tokenExpires = new Date(Date.now() + 3600000); // Token expires in 1 hour
 
       await pool.query(
         'UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE user_id = $3',
@@ -345,8 +342,8 @@ router.post(
       );
 
       const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
-      await resend.emails.send({
-        from: 'password-reset@hyper-strategies.com',
+      
+      await sendEmail({
         to: email,
         subject: 'Your HyperStrategies Password Reset Link',
         html: `<p>You requested a password reset. Please click this link to set a new password:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>This link will expire in one hour.</p>`,
@@ -356,7 +353,8 @@ router.post(
 
     } catch (err) {
       console.error('Forgot password error:', err);
-      res.status(500).json({ error: 'An error occurred.' });
+      // Don't leak internal errors to the user.
+      res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
     }
   }
 );
