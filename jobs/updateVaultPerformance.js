@@ -4,24 +4,14 @@ const pool = require('../db');
 const fetch = require('node-fetch');
 const { getAlchemyClient, resolveNetworkByName } = require('../services/alchemy');
 
+const HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info";
+
 const updateVaultPerformance = async () => {
-  console.log('📈 Starting hourly vault performance update job (using Alchemy Price API)...');
-
-  let alchemy;
-  try {
-    alchemy = getAlchemyClient();
-  } catch (err) {
-    console.error('❌ Alchemy client not configured for vault performance job:', err.message || err);
-    return;
-  }
-
+  console.log('📈 Starting hourly vault performance update job (Hybrid Oracle)...');
   const client = await pool.connect();
   try {
     const { rows: activeVaults } = await client.query("SELECT vault_id FROM vaults WHERE status = 'active'");
-    if (activeVaults.length === 0) {
-      console.log('No active vaults to process.');
-      return;
-    }
+    if (activeVaults.length === 0) return;
 
     for (const vault of activeVaults) {
       const vaultId = vault.vault_id;
@@ -29,16 +19,15 @@ const updateVaultPerformance = async () => {
       
       await client.query('BEGIN');
       try {
-        const principalResult = await client.query(
-          `SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`,
-          [vaultId]
-        );
+        const principalResult = await client.query(`SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`, [vaultId]);
         const principalCapital = parseFloat(principalResult.rows[0].total);
 
-        const tradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1', [vaultId]);
-        const allTrades = tradesResult.rows;
-        const realizedPnl = allTrades.filter(t => t.status === 'CLOSED').reduce((sum, t) => sum + parseFloat(t.pnl_usd || 0), 0);
-        const openTrades = allTrades.filter(t => t.status === 'OPEN');
+        const tradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1 AND status = \'OPEN\'', [vaultId]);
+        const openTrades = tradesResult.rows;
+        
+        const realizedPnlResult = await client.query(`SELECT COALESCE(SUM(pnl_usd), 0) as total FROM vault_trades WHERE vault_id = $1 AND status = 'CLOSED'`, [vaultId]);
+        const realizedPnl = parseFloat(realizedPnlResult.rows[0].total);
+
         let unrealizedPnl = 0;
         
         if (openTrades.length > 0) {
@@ -46,77 +35,80 @@ const updateVaultPerformance = async () => {
           const vaultAssetDetails = assetsResult.rows;
           const priceMap = new Map();
 
-          const byAddress = [];
-          const bySymbol = [];
-
-          for (const asset of vaultAssetDetails) {
-            // A more robust check for what should be fetched by symbol vs address
-            if (asset.chain === 'ETHEREUM' && asset.contract_address && (asset.symbol.startsWith('W') || asset.symbol === 'USDC')) {
-              byAddress.push(asset);
-            } else if (asset.symbol) {
-              bySymbol.push(asset);
-            }
-          }
-
-          // --- Fetch prices by contract address ---
-          if (byAddress.length > 0) {
-              console.log(`[Alchemy Price] Fetching ${byAddress.length} assets by address...`);
-              try {
-                  const apiKey = process.env.ALCHEMY_API_KEY;
-                  const response = await fetch(`https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                          addresses: byAddress.map(asset => ({
-                              address: asset.contract_address,
-                              network: resolveNetworkByName(asset.chain),
-                              currency: 'usd'
-                          }))
-                      }),
-                  });
-                  if (!response.ok) throw new Error(`API error: ${response.statusText}`);
-                  const json = await response.json();
-                  for (const token of json.data) {
-                      if (token.prices[0]?.value) {
-                          priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
-                      }
-                  }
-              } catch (priceErr) {
-                  console.error(`[Alchemy Price] Failed to fetch prices by address:`, priceErr.message);
-              }
-          }
-
-          // --- Fetch prices by symbol ---
-          if (bySymbol.length > 0) {
-            console.log(`[Alchemy Price] Fetching ${bySymbol.length} assets by symbol...`);
-            try {
-              // This part can be implemented if you add non-ETH assets like native SOL
-            } catch (priceErr) {
-              console.error(`[Alchemy Price] Failed to fetch prices by symbol:`, priceErr.message);
-            }
-          }
+          // ==============================================================================
+          // --- HYBRID PRICE ORACLE LOGIC ---
+          // ==============================================================================
           
+          // 1. Hardcode USDC price
+          priceMap.set('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'.toLowerCase(), 1.0);
+
+          // 2. Fetch all other prices from Hyperliquid first
+          const hyperliquidAssets = vaultAssetDetails.filter(a => a.symbol.toUpperCase() !== 'USDC');
+          if (hyperliquidAssets.length > 0) {
+            console.log(`[Oracle] Querying Hyperliquid for ${hyperliquidAssets.length} assets...`);
+            try {
+              const response = await fetch(HYPERLIQUID_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type: "allMids" }),
+              });
+              if (!response.ok) throw new Error(`Hyperliquid API error: ${response.statusText}`);
+              const mids = await response.json();
+              
+              for (const asset of hyperliquidAssets) {
+                const priceStr = mids[asset.symbol.toUpperCase()];
+                if (priceStr) {
+                  const assetAddress = asset.contract_address.toLowerCase();
+                  if (!priceMap.has(assetAddress)) { // Don't overwrite USDC
+                    priceMap.set(assetAddress, parseFloat(priceStr));
+                  }
+                }
+              }
+            } catch (err) {
+              console.error('[Oracle] Hyperliquid fetch failed:', err.message);
+            }
+          }
+
+          // 3. For any assets still missing a price, fall back to Alchemy
+          const assetsMissingPrice = vaultAssetDetails.filter(a => !priceMap.has(a.contract_address.toLowerCase()));
+          if (assetsMissingPrice.length > 0) {
+            console.log(`[Oracle] Falling back to Alchemy for ${assetsMissingPrice.length} assets...`);
+            try {
+              const alchemy = getAlchemyClient();
+              const apiKey = process.env.ALCHEMY_API_KEY;
+              const response = await fetch(`https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  addresses: assetsMissingPrice.map(asset => ({ address: asset.contract_address, network: resolveNetworkByName(asset.chain) }))
+                }),
+              });
+              if (!response.ok) throw new Error(`Alchemy API error: ${response.statusText}`);
+              const json = await response.json();
+              for (const token of json.data) {
+                if (token.prices[0]?.value) {
+                  priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
+                }
+              }
+            } catch (err) {
+              console.error('[Oracle] Alchemy fallback failed:', err.message);
+            }
+          }
+
+          // 4. Calculate PNL using the populated priceMap
           for (const trade of openTrades) {
-            // ==============================================================================
-            // --- FINAL BUG FIX: Added .trim() to prevent whitespace issues ---
-            // ==============================================================================
             const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
-            
             if (assetDetail && assetDetail.contract_address) {
               const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
-              if (typeof currentPrice === 'number' && currentPrice > 0) {
+              if (typeof currentPrice === 'number') {
                 const entryPrice = parseFloat(trade.entry_price);
                 const quantity = parseFloat(trade.quantity);
-                if (trade.direction === 'LONG') {
-                  unrealizedPnl += (currentPrice - entryPrice) * quantity;
-                } else {
-                  unrealizedPnl += (entryPrice - currentPrice) * quantity;
-                }
+                unrealizedPnl += (trade.direction === 'LONG') 
+                  ? (currentPrice - entryPrice) * quantity 
+                  : (entryPrice - currentPrice) * quantity;
               } else {
-                console.warn(`[PNL Calc] Missing price for ${assetDetail.symbol}. Skipping calculation.`);
+                console.warn(`[PNL Calc] Final price for ${assetDetail.symbol} is missing. Skipping trade.`);
               }
-            } else {
-              console.warn(`[PNL Calc] Could not find asset details for trade symbol: ${trade.asset_symbol}. Skipping.`);
             }
           }
         }
@@ -125,15 +117,11 @@ const updateVaultPerformance = async () => {
         const netAssetValue = principalCapital + totalPnl;
         const pnlPercentage = (principalCapital > 0) ? (totalPnl / principalCapital) * 100 : 0;
         
-        const recordDate = new Date();
-        const insertQuery = `
-          INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (vault_id, record_date) DO UPDATE SET
-            pnl_percentage = EXCLUDED.pnl_percentage,
-            total_value_locked = EXCLUDED.total_value_locked;
-        `;
-        await client.query(insertQuery, [vaultId, recordDate, pnlPercentage.toFixed(4), netAssetValue]);
+        await client.query(
+          `INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked) VALUES ($1, NOW(), $2, $3)
+           ON CONFLICT (vault_id, record_date) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, total_value_locked = EXCLUDED.total_value_locked`,
+          [vaultId, pnlPercentage.toFixed(4), netAssetValue]
+        );
         
         await client.query('COMMIT');
         console.log(`✅ Successfully saved hourly performance for Vault ID: ${vaultId}. NAV: $${netAssetValue.toFixed(2)}, P&L: ${pnlPercentage.toFixed(2)}%`);
@@ -147,7 +135,6 @@ const updateVaultPerformance = async () => {
     console.error('❌ Major error in updateVaultPerformance job:', error.message);
   } finally {
     if (client) client.release();
-    console.log('📈 Hourly vault performance update job finished.');
   }
 };
 
