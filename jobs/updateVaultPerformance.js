@@ -1,18 +1,11 @@
 // PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/updateVaultPerformance.js
 
 const pool = require('../db');
-const { getAlchemyClient } = require('../services/alchemy');
+const fetch = require('node-fetch'); // Make sure node-fetch is in your package.json
+const { resolveNetworkByName } = require('../services/alchemy');
 
 const updateVaultPerformance = async () => {
   console.log('📈 Starting hourly vault performance update job (using Alchemy Price API)...');
-
-  let alchemy;
-  try {
-    alchemy = getAlchemyClient();
-  } catch (err) {
-    console.error('❌ Alchemy client not configured for vault performance job:', err.message || err);
-    return;
-  }
 
   const client = await pool.connect();
   try {
@@ -45,29 +38,55 @@ const updateVaultPerformance = async () => {
           const vaultAssetDetails = assetsResult.rows;
           const priceMap = new Map();
 
-          const uniqueAddresses = [...new Set(vaultAssetDetails.map(a => a.contract_address).filter(Boolean))];
+          const uniqueAddressesByChain = vaultAssetDetails.reduce((acc, asset) => {
+            if (asset.contract_address) {
+              const chain = asset.chain || 'ETHEREUM';
+              if (!acc[chain]) acc[chain] = [];
+              acc[chain].push(asset.contract_address);
+            }
+            return acc;
+          }, {});
 
-          if (uniqueAddresses.length > 0) {
-            console.log(`[Alchemy Price] Fetching prices for ${uniqueAddresses.length} unique assets...`);
-            
-            // ==============================================================================
-            // --- FINAL BUG FIX: Use the correct alchemy.prices.getTokensPrice method ---
-            // The method is in the 'prices' namespace, not 'core'.
-            // It takes an array of addresses and returns their prices.
-            // ==============================================================================
+          // ==============================================================================
+          // --- FINAL FIX: Use a direct `fetch` call to the Alchemy Price API endpoint ---
+          // This bypasses the SDK helpers and uses the raw POST method for reliability.
+          // ==============================================================================
+          const apiKey = process.env.ALCHEMY_API_KEY;
+          const apiUrl = `https://api.g.alchemy.com/prices/v1/${apiKey}/tokens/by-address`;
+
+          for (const chainName in uniqueAddressesByChain) {
+            const addresses = uniqueAddressesByChain[chainName];
+            console.log(`[Alchemy Price] Fetching prices for ${addresses.length} assets on ${chainName}...`);
+
             try {
-              const priceData = await alchemy.prices.getTokensPrice(uniqueAddresses);
-              
-              priceData.forEach(token => {
-                if (token.usdPrice) {
-                  priceMap.set(token.contractAddress.toLowerCase(), token.usdPrice);
-                } else {
-                  console.warn(`[Alchemy Price] No USD price found for ${token.contractAddress}.`);
-                }
+              const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  addresses: addresses.map(addr => ({
+                    address: addr,
+                    network: resolveNetworkByName(chainName), // Uses our helper to get 'eth-mainnet', etc.
+                    currency: 'usd'
+                  }))
+                }),
               });
 
+              if (!response.ok) {
+                throw new Error(`API responded with status ${response.status}`);
+              }
+              
+              const priceData = await response.json();
+
+              for (const token of priceData.data) {
+                if (token.prices && token.prices[0] && typeof token.prices[0].value === 'string') {
+                  priceMap.set(token.address.toLowerCase(), parseFloat(token.prices[0].value));
+                } else {
+                  console.warn(`[Alchemy Price] No USD price data found for ${token.address}.`);
+                }
+              }
+
             } catch (priceErr) {
-              console.error(`[Alchemy Price] Failed to fetch token prices:`, priceErr.message);
+              console.error(`[Alchemy Price] Failed to fetch prices for ${chainName}:`, priceErr.message);
             }
           }
 
