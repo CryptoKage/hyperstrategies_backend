@@ -1,18 +1,21 @@
-const pool = require('../db');
-const Moralis = require('moralis').default;
-const { EvmChain } = require('@moralisweb3/common-evm-utils');
-const fetch = require('node-fetch');
+// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/updateVaultPerformance.js
 
-const chainMap = {
-  'ETHEREUM': EvmChain.ETHEREUM,
-  'POLYGON': EvmChain.POLYGON
-};
+const pool = require('../db');
+const {
+  getAlchemyClient,
+  resolveNetworkByName,
+  extractPrice, // We might not need this if the new SDK call is simpler
+} = require('../services/alchemy');
 
 const updateVaultPerformance = async () => {
-  console.log('📈 Starting hourly vault performance update job (using Moralis SDK)...');
-  
-  if (!Moralis.Core.isStarted) {
-    await Moralis.start({ apiKey: process.env.MORALIS_API_KEY });
+  console.log('📈 Starting hourly vault performance update job (using Alchemy Price API)...');
+
+  let alchemy;
+  try {
+    alchemy = getAlchemyClient();
+  } catch (err) {
+    console.error('❌ Alchemy client not configured for vault performance job:', err.message || err);
+    return;
   }
 
   const client = await pool.connect();
@@ -20,7 +23,6 @@ const updateVaultPerformance = async () => {
     const { rows: activeVaults } = await client.query("SELECT vault_id FROM vaults WHERE status = 'active'");
     if (activeVaults.length === 0) {
       console.log('No active vaults to process.');
-      client.release();
       return;
     }
 
@@ -45,46 +47,42 @@ const updateVaultPerformance = async () => {
         if (openTrades.length > 0) {
           const assetsResult = await client.query('SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', [vaultId]);
           const vaultAssetDetails = assetsResult.rows;
-          
-          const tradesByChain = openTrades.reduce((acc, trade) => {
-            const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
-            if (assetDetail && assetDetail.contract_address) {
-              const chain = assetDetail.chain.toUpperCase();
-              if (!acc[chain]) acc[chain] = [];
-              acc[chain].push({ ...trade, contract_address: assetDetail.contract_address });
+          const priceMap = new Map();
+
+          // Batch all unique contract addresses to fetch prices for
+          const uniqueAddresses = [...new Set(vaultAssetDetails.map(a => a.contract_address).filter(Boolean))];
+
+          if (uniqueAddresses.length > 0) {
+            console.log(`[Alchemy Price] Fetching prices for ${uniqueAddresses.length} unique assets...`);
+            for (const address of uniqueAddresses) {
+              try {
+                // The modern alchemy-sdk uses alchemy.core.getTokenPrice(address) for this.
+                const priceData = await alchemy.core.getTokenPrice(address);
+                if (priceData) {
+                  priceMap.set(address.toLowerCase(), priceData);
+                } else {
+                   console.warn(`[Alchemy Price] No price data returned for ${address}.`);
+                }
+              } catch (priceErr) {
+                console.error(`[Alchemy Price] Failed to fetch price for ${address}:`, priceErr.message);
+              }
             }
-            return acc;
-          }, {});
-
-          const allPriceData = [];
-          
-          for (const chainName in tradesByChain) {
-            const chainTrades = tradesByChain[chainName];
-            const tokensForChain = chainTrades.map(t => ({ address: t.contract_address }));
-
-            console.log(`[Moralis Call] Fetching prices for ${tokensForChain.length} tokens on chain ${chainName}`);
-
-            const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({
-              chain: chainMap[chainName] || EvmChain.ETHEREUM,
-              tokens: tokensForChain
-            });
-            allPriceData.push(...priceResponse.toJSON());
           }
-          
+
           for (const trade of openTrades) {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.toUpperCase() === trade.asset_symbol.toUpperCase());
             if (assetDetail && assetDetail.contract_address) {
-              const priceInfo = allPriceData.find(p => p.tokenAddress.toLowerCase() === assetDetail.contract_address.toLowerCase());
-              if (priceInfo && priceInfo.usdPrice) {
-                const currentPrice = priceInfo.usdPrice;
+              const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
+              if (typeof currentPrice === 'number' && currentPrice > 0) {
                 const entryPrice = parseFloat(trade.entry_price);
                 const quantity = parseFloat(trade.quantity);
-                
                 if (trade.direction === 'LONG') {
                   unrealizedPnl += (currentPrice - entryPrice) * quantity;
                 } else {
                   unrealizedPnl += (entryPrice - currentPrice) * quantity;
                 }
+              } else {
+                console.warn(`[PNL Calc] Missing price for ${assetDetail.symbol}. Skipping for unrealized PNL calculation.`);
               }
             }
           }
@@ -94,25 +92,16 @@ const updateVaultPerformance = async () => {
         const netAssetValue = principalCapital + totalPnl;
         const pnlPercentage = (principalCapital > 0) ? (totalPnl / principalCapital) * 100 : 0;
         
-        const ledgerStatusQuery = `SELECT COALESCE(SUM(CASE WHEN status = 'PENDING_SWEEP' THEN amount ELSE 0 END), 0) as capital_in_transit_to_desk, COALESCE(SUM(CASE WHEN entry_type = 'WITHDRAWAL_REQUEST' AND status = 'APPROVED' THEN amount * -1 ELSE 0 END), 0) as capital_in_transit_from_desk FROM vault_ledger_entries WHERE vault_id = $1;`;
-        const ledgerStatusResult = await client.query(ledgerStatusQuery, [vaultId]);
-        const capitalStatus = ledgerStatusResult.rows[0];
-
         const recordDate = new Date();
-        // --- THIS IS THE FULL, CORRECT INSERT QUERY ---
         const insertQuery = `
-          INSERT INTO vault_performance_history 
-            (vault_id, record_date, pnl_percentage, total_value_locked, capital_in_trade, capital_in_transit_to_desk, capital_in_transit_from_desk)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked)
+          VALUES ($1, $2, $3, $4)
           ON CONFLICT (vault_id, record_date) DO UPDATE SET
             pnl_percentage = EXCLUDED.pnl_percentage,
-            total_value_locked = EXCLUDED.total_value_locked,
-            capital_in_trade = EXCLUDED.capital_in_trade,
-            capital_in_transit_to_desk = EXCLUDED.capital_in_transit_to_desk,
-            capital_in_transit_from_desk = EXCLUDED.capital_in_transit_from_desk;
+            total_value_locked = EXCLUDED.total_value_locked;
         `;
-        await client.query(insertQuery, [vaultId, recordDate, pnlPercentage.toFixed(4), netAssetValue, principalCapital, capitalStatus.capital_in_transit_to_desk, capitalStatus.capital_in_transit_from_desk]);
-
+        await client.query(insertQuery, [vaultId, recordDate, pnlPercentage.toFixed(4), netAssetValue]);
+        
         await client.query('COMMIT');
         console.log(`✅ Successfully saved hourly performance for Vault ID: ${vaultId}. NAV: $${netAssetValue.toFixed(2)}, P&L: ${pnlPercentage.toFixed(2)}%`);
       
@@ -124,7 +113,7 @@ const updateVaultPerformance = async () => {
   } catch (error) {
     console.error('❌ Major error in updateVaultPerformance job:', error.message);
   } finally {
-    client.release();
+    if (client) client.release();
     console.log('📈 Hourly vault performance update job finished.');
   }
 };

@@ -20,6 +20,7 @@ const bountyRoutes = require('./routes/bounties');
 const pinsMarketplaceRoutes = require('./routes/pinsMarketplace');
 const statsRoutes = require('./routes/stats');
 const vaultDetailsRoutes = require('./routes/vaultDetails');
+const pnlRoutes = require('./routes/pnl');
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const withdrawRoutes = require('./routes/withdraw');
@@ -91,6 +92,7 @@ app.use('/api/bounties', bountyRoutes);
 app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
+app.use('/api/pnl', pnlRoutes);
 
 
 app.listen(PORT, async () => {
