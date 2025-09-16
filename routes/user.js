@@ -68,9 +68,11 @@ router.get('/wallet', authenticateToken, async (req, res) => {
       pool.query(
         `SELECT EXISTS (
             SELECT 1 FROM user_activity_log 
-            WHERE user_id = $1 
-            AND activity_type = 'VAULT_WITHDRAWAL_REQUEST' 
-            AND status = 'PENDING'
+            WHERE 
+              user_id = $1 
+              AND activity_type = 'VAULT_WITHDRAWAL_REQUEST' 
+              AND status IS NOT NULL 
+              AND status NOT IN ('COMPLETED', 'FAILED')
         ) as has_pending`,
         [userId]
       )
