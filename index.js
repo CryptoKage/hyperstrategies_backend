@@ -52,8 +52,8 @@ app.use(cors(corsOptions));
 app.use(helmet());
 
 const globalLimiter = rateLimit({
-	windowMs: 15 * 60 * 1000,
-	max: 100,
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 250, // Increase the limit
 	standardHeaders: true,
 	legacyHeaders: false, 
   message: 'Too many requests from this IP, please try again after 15 minutes.'
@@ -91,6 +91,7 @@ app.use('/api/bounties', bountyRoutes);
 app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
+
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
