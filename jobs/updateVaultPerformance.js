@@ -1,16 +1,20 @@
-// ==============================================================================
-// FINAL, DEFINITIVE VERSION (v6): PASTE THIS to replace your full file
-// ==============================================================================
 const pool = require('../db');
-const fetch = require('node-fetch'); // <-- THIS IS THE CRITICAL MISSING LINE
+const Moralis = require('moralis').default;
+const { EvmChain } = require('@moralisweb3/common-evm-utils');
+const fetch = require('node-fetch');
 
 const chainMap = {
-  'ETHEREUM': '0x1',
-  'POLYGON': '0x89'
+  'ETHEREUM': EvmChain.ETHEREUM,
+  'POLYGON': EvmChain.POLYGON
 };
 
 const updateVaultPerformance = async () => {
-  console.log('📈 Starting hourly vault performance update job...');
+  console.log('📈 Starting hourly vault performance update job (using Moralis SDK)...');
+  
+  if (!Moralis.Core.isStarted) {
+    await Moralis.start({ apiKey: process.env.MORALIS_API_KEY });
+  }
+
   const client = await pool.connect();
   try {
     const { rows: activeVaults } = await client.query("SELECT vault_id FROM vaults WHERE status = 'active'");
@@ -27,16 +31,13 @@ const updateVaultPerformance = async () => {
       await client.query('BEGIN');
       try {
         const principalResult = await client.query(
-          `SELECT COALESCE(SUM(amount), 0) as total 
-           FROM vault_ledger_entries 
-           WHERE vault_id = $1 AND status = 'ACTIVE_IN_POOL' AND entry_type = 'DEPOSIT'`,
+          `SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND status = 'ACTIVE_IN_POOL' AND entry_type = 'DEPOSIT'`,
           [vaultId]
         );
         const principalCapital = parseFloat(principalResult.rows[0].total);
 
         const tradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1', [vaultId]);
         const allTrades = tradesResult.rows;
-
         const realizedPnl = allTrades.filter(t => t.status === 'CLOSED').reduce((sum, t) => sum + parseFloat(t.pnl_usd || 0), 0);
         const openTrades = allTrades.filter(t => t.status === 'OPEN');
         let unrealizedPnl = 0;
@@ -56,30 +57,18 @@ const updateVaultPerformance = async () => {
           }, {});
 
           const allPriceData = [];
-
+          
           for (const chainName in tradesByChain) {
             const chainTrades = tradesByChain[chainName];
-            const apiUrl = `https://deep-index.moralis.io/api/v2.2/erc20/prices?chain=${chainMap[chainName] || '0x1'}`;
-            const apiOptions = {
-              method: 'POST',
-              headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'X-API-Key': process.env.MORALIS_API_KEY
-              },
-              body: JSON.stringify({
-                // Note: The REST API expects 'token_address'
-                tokens: chainTrades.map(t => ({ token_address: t.contract_address }))
-              })
-            };
+            const tokensForChain = chainTrades.map(t => ({ address: t.contract_address }));
 
-            const response = await fetch(apiUrl, apiOptions);
-            if (!response.ok) {
-              const errorBody = await response.text();
-              throw new Error(`Moralis REST API Error: ${response.status} ${errorBody}`);
-            }
-            const priceData = await response.json();
-            allPriceData.push(...priceData);
+            console.log(`[Moralis Call] Fetching prices for ${tokensForChain.length} tokens on chain ${chainName}`);
+
+            const priceResponse = await Moralis.EvmApi.token.getMultipleTokenPrices({
+              chain: chainMap[chainName] || EvmChain.ETHEREUM,
+              tokens: tokensForChain
+            });
+            allPriceData.push(...priceResponse.toJSON());
           }
           
           for (const trade of openTrades) {
@@ -93,7 +82,7 @@ const updateVaultPerformance = async () => {
                 
                 if (trade.direction === 'LONG') {
                   unrealizedPnl += (currentPrice - entryPrice) * quantity;
-                } else { // SHORT
+                } else {
                   unrealizedPnl += (entryPrice - currentPrice) * quantity;
                 }
               }
@@ -110,7 +99,18 @@ const updateVaultPerformance = async () => {
         const capitalStatus = ledgerStatusResult.rows[0];
 
         const recordDate = new Date();
-        const insertQuery = `INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked, capital_in_trade, capital_in_transit_to_desk, capital_in_transit_from_desk) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (vault_id, record_date) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, total_value_locked = EXCLUDED.total_value_locked, capital_in_trade = EXCLUDED.capital_in_trade, capital_in_transit_to_desk = EXCLUDED.capital_in_transit_to_desk, capital_in_transit_from_desk = EXCLUDED.capital_in_transit_from_desk;`;
+        // --- THIS IS THE FULL, CORRECT INSERT QUERY ---
+        const insertQuery = `
+          INSERT INTO vault_performance_history 
+            (vault_id, record_date, pnl_percentage, total_value_locked, capital_in_trade, capital_in_transit_to_desk, capital_in_transit_from_desk)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (vault_id, record_date) DO UPDATE SET
+            pnl_percentage = EXCLUDED.pnl_percentage,
+            total_value_locked = EXCLUDED.total_value_locked,
+            capital_in_trade = EXCLUDED.capital_in_trade,
+            capital_in_transit_to_desk = EXCLUDED.capital_in_transit_to_desk,
+            capital_in_transit_from_desk = EXCLUDED.capital_in_transit_from_desk;
+        `;
         await client.query(insertQuery, [vaultId, recordDate, pnlPercentage.toFixed(4), netAssetValue, principalCapital, capitalStatus.capital_in_transit_to_desk, capitalStatus.capital_in_transit_from_desk]);
 
         await client.query('COMMIT');
@@ -130,6 +130,3 @@ const updateVaultPerformance = async () => {
 };
 
 module.exports = { updateVaultPerformance };
-// ==============================================================================
-// END OF FILE
-// ==============================================================================
