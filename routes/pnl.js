@@ -1,7 +1,11 @@
-// PASTE THIS ENTIRE CONTENT INTO: hyperstrategies_backend/routes/pnl.js
+// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/routes/pnl.js
 
 const express = require('express');
-const LRU = require('lru-cache');
+// ==============================================================================
+// --- FINAL BUG FIX: Use destructuring to import the LRU class ---
+// The latest version of the 'lru-cache' library uses a named export.
+// ==============================================================================
+const { LRU } = require('lru-cache');
 const { z } = require('zod');
 const {
   getAlchemyClient,
@@ -36,37 +40,19 @@ router.get("/:address", async (req, res) => {
     const alchemy = getAlchemyClient();
     const alchemyNetwork = resolveNetworkByChainId(chain);
 
-    // ==============================================================================
-    // --- REFACTOR: Use Alchemy to fetch token balances, removing Moralis ---
-    // ==============================================================================
     const balancesResponse = await alchemy.core.getTokenBalances(address, { network: alchemyNetwork });
     const nonZeroBalances = balancesResponse.tokenBalances.filter(token => token.tokenBalance !== '0');
-    // ==============================================================================
-
-    const holdings = [];
-    const priceMap = new Map();
-
-    if (nonZeroBalances.length > 0) {
-      // Get prices for all non-zero balance tokens
-      const priceResponse = await alchemy.core.getTokensMetadata(nonZeroBalances.map(t => t.contractAddress));
-      
-      for(const tokenMeta of priceResponse) {
-          // This is a simplified price fetch. For real assets, you'd use a dedicated price API.
-          // For now, let's assume metadata might contain price, or we can use another Alchemy endpoint.
-          // This part can be enhanced later with a more direct price fetching method.
-      }
-    }
     
-    // This part of the logic requires a reliable way to get prices for a list of tokens.
-    // Since this is a bonus feature, we can implement the full pricing logic later.
-    // For now, the structure is in place.
-    const portfolioValue = holdings.reduce((a, x) => a + x.value, 0);
+    const holdings = [];
+    // The rest of this logic can be built out later as a feature enhancement.
+    // For now, it will return an empty holdings array but will not crash the server.
+    const portfolioValue = 0; 
 
     const payload = {
       address,
       chain,
       portfolioValueUSD: portfolioValue,
-      holdings: holdings.sort((a, b) => b.value - a.value),
+      holdings: holdings,
       updatedAt: new Date().toISOString(),
       priceSource: "alchemy",
       priceCurrency: DEFAULT_PRICE_CURRENCY,
