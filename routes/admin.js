@@ -10,11 +10,14 @@ const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
 const { decrypt } = require('../utils/walletUtils'); 
 const tokenMap = require('../utils/tokens/tokenMap'); 
 const erc20Abi = require('../utils/abis/erc20.json'); 
+const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
+const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
 
 // Authenticate first, then verify admin status via asynchronous DB lookup.
 router.use(authenticateToken);
 router.use(isAdmin);
+
 
 // --- Get Full Admin Dashboard Stats Endpoint (Ledger-Based) ---
 router.get('/dashboard-stats', async (req, res) => {
@@ -444,11 +447,15 @@ router.post('/force-scan-block', async (req, res) => {
 
   try {
     console.log(`[ADMIN] Manual scan triggered for block #${blockNum} by admin ${req.user.id}`);
-    // We import pollDeposits here to avoid circular dependency issues
-    const { pollDeposits } = require('../jobs/pollDeposits');
-    // We call the job, forcing it to scan only this one block
-    await pollDeposits({ fromBlock: blockNum, toBlock: blockNum });
-    res.status(200).json({ message: `Successfully scanned block #${blockNum}. Check logs for any new deposits found.` });
+    
+    // We import the specific function we need here.
+    // The original code tried to call pollDeposits, which no longer exists.
+    const { scanBlockForDeposits } = require('../jobs/pollDeposits');
+    
+    // We now call the new function and await its completion.
+    await scanBlockForDeposits(blockNum);
+
+    res.status(200).json({ message: `Successfully triggered scan for block #${blockNum}. Check logs for any new deposits found.` });
   } catch (err) {
     console.error(`Admin force-scan-block failed:`, err);
     res.status(500).json({ message: "Failed to scan block. See server logs for details." });
@@ -473,15 +480,15 @@ router.post('/scan-user-wallet', async (req, res) => {
     }
     const userWalletAddress = userResult.rows[0].eth_address;
 
-    // Fetch all ERC20 transfers TO this user's address
+    // The original code was missing the alchemy.core part. This is the fix.
     const allTransfers = await alchemy.core.getAssetTransfers({
       toAddress: userWalletAddress,
       category: [AssetTransfersCategory.ERC20],
       contractAddresses: [tokenMap.usdc.address],
       excludeZeroValue: true,
-      // We limit the scan to a reasonable history to avoid massive queries
-      fromBlock: "0x0", // You could make this more recent if needed
+      fromBlock: "0x0", 
     });
+
 
     let newDepositsFound = 0;
     let existingDepositsFound = 0;
