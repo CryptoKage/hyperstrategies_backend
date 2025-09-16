@@ -21,42 +21,46 @@ async function scanBlockForDeposits(blockNumber) {
   try {
     const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
     if (users.length === 0) {
-      return; // No users with wallets to check.
+      return;
     }
     
-    // Create a fast lookup map of user addresses.
     const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
-    // Use Alchemy's getAssetTransfers to efficiently find all USDC transfers in this specific block.
     const allTransfers = await alchemy.core.getAssetTransfers({
       fromBlock: ethers.utils.hexlify(blockNumber),
-      toBlock: ethers.utils.hexlify(blockNumber), // Scan only this single block
+      toBlock: ethers.utils.hexlify(blockNumber),
       category: [AssetTransfersCategory.ERC20],
       contractAddresses: [tokenMap.usdc.address],
       excludeZeroValue: true,
     });
 
     if (allTransfers.transfers.length === 0) {
-        // No USDC transfers in this block, we're done.
         return;
     }
 
-    // Process each transfer found in the block.
     for (const event of allTransfers.transfers) {
       const toAddress = event.to?.toLowerCase();
       if (userAddressMap.has(toAddress)) {
         const userId = userAddressMap.get(toAddress);
         const txHash = event.hash;
         
-        // Final check to prevent any possible double-processing.
         const existingDeposit = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
         if (existingDeposit.rows.length === 0) {
-          const depositAmount_string = ethers.utils.formatUnits(event.value, tokenMap.usdc.decimals);
-          
-          console.log(`✅ [WebSocket] New deposit found for user ${userId}: ${depositAmount_string} USDC, tx: ${txHash}`);
           
           await client.query('BEGIN');
           try {
+            // ==============================================================================
+            // --- BUG FIX: Correctly handle BigNumber parsing between libraries ---
+            // The `event.value` from alchemy-sdk is a BigNumber-like object.
+            // We convert it to a string (.toString()) before passing it to ethers.js's
+            // formatUnits function to prevent cross-library type conflicts.
+            // This resolves the "underflow" error.
+            // ==============================================================================
+            const rawValueString = event.value.toString();
+            const depositAmount_string = ethers.utils.formatUnits(rawValueString, tokenMap.usdc.decimals);
+
+            console.log(`✅ [WebSocket] New deposit found for user ${userId}: ${depositAmount_string} USDC, tx: ${txHash}`);
+            
             await client.query(`INSERT INTO deposits (user_id, amount, "token", tx_hash) VALUES ($1, $2, 'usdc', $3)`, [userId, depositAmount_string, txHash]);
             await client.query('UPDATE users SET balance = balance + $1 WHERE user_id = $2', [depositAmount_string, userId]);
             await client.query('COMMIT');
