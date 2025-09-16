@@ -448,15 +448,8 @@ router.post('/force-scan-block', async (req, res) => {
   try {
     console.log(`[ADMIN] Manual scan triggered for block #${blockNum} by admin ${req.user.id}`);
     
-    // ==============================================================================
-    // --- BUG FIX #1: Correctly import the named export ---
-    // The module exports an object `{ scanBlockForDeposits }`, so we must destructure it.
-    // ==============================================================================
+ 
     const { scanBlockForDeposits } = require('../jobs/pollDeposits');
-    
-    if (typeof scanBlockForDeposits !== 'function') {
-      throw new TypeError("scanBlockForDeposits is not a function. Check the import in admin.js.");
-    }
     
     await scanBlockForDeposits(blockNum);
 
