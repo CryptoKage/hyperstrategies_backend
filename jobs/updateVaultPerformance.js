@@ -60,10 +60,7 @@ const updateVaultPerformance = async () => {
             }
           }
           
-          // ==============================================================================
-          // --- DEBUGGING: Log the final price map to the console ---
           console.log('[Oracle] Final Price Map:', Object.fromEntries(priceMap));
-          // ==============================================================================
 
           for (const trade of openTrades) {
             const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
@@ -86,10 +83,20 @@ const updateVaultPerformance = async () => {
         const netAssetValue = principalCapital + totalPnl;
         const pnlPercentage = (principalCapital > 0) ? (totalPnl / principalCapital) * 100 : 0;
         
+        // ==============================================================================
+        // --- FINAL UPGRADE: Save the price snapshot to the database ---
+        // 1. Add asset_prices_snapshot to the INSERT statement.
+        // 2. Add the priceMap as the final parameter.
+        // 3. Update the ON CONFLICT clause to also update the snapshot.
+        // ==============================================================================
         await client.query(
-          `INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked) VALUES ($1, NOW(), $2, $3)
-           ON CONFLICT (vault_id, record_date) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, total_value_locked = EXCLUDED.total_value_locked`,
-          [vaultId, pnlPercentage.toFixed(4), netAssetValue]
+          `INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked, asset_prices_snapshot) 
+           VALUES ($1, NOW(), $2, $3, $4)
+           ON CONFLICT (vault_id, record_date) DO UPDATE SET 
+             pnl_percentage = EXCLUDED.pnl_percentage, 
+             total_value_locked = EXCLUDED.total_value_locked,
+             asset_prices_snapshot = EXCLUDED.asset_prices_snapshot`,
+          [vaultId, pnlPercentage.toFixed(4), netAssetValue, JSON.stringify(Object.fromEntries(priceMap))]
         );
         
         await client.query('COMMIT');
