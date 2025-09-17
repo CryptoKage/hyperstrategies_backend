@@ -40,12 +40,19 @@ const run = async () => {
         const { processWithdrawals } = require('./jobs/queueProcessor');
         await processWithdrawals();
         break;
+    
+
+     case 'backfillPnl':
+        const { runPnlBackfill } = require('./jobs/backfillVaultHistory');
+        await runPnlBackfill();
+        break;
+
         
       // Add other job names here as needed...
 
       default:
         console.error(`❌ ERROR: Job "${jobName}" not found.`);
-        console.log('Available jobs: updateVaultPerformance, pollDeposits, processWithdrawals');
+        console.log('Available jobs: updateVaultPerformance, pollDeposits, processWithdrawals, backfillPnl');
         process.exit(1);
     }
     
