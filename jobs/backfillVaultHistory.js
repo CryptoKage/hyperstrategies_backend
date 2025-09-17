@@ -62,10 +62,13 @@ async function runPnlBackfill() {
             
             const priceSnapshot = { BTC: btcPrice, ETH: ethPrice, SOL: solPrice };
 
-            const insertStatement = `
+             const insertStatement = `
                 INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked, asset_prices_snapshot) 
                 VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (vault_id, record_date) DO NOTHING;
+                ON CONFLICT (vault_id, record_date) DO UPDATE SET
+                    pnl_percentage = EXCLUDED.pnl_percentage,
+                    total_value_locked = EXCLUDED.total_value_locked,
+                    asset_prices_snapshot = EXCLUDED.asset_prices_snapshot;
             `;
             await dbClient.query(insertStatement, [VAULT_ID_TO_BACKFILL, recordDate, pnlPercentage.toFixed(4), totalNav.toFixed(4), priceSnapshot]);
         }
@@ -80,6 +83,7 @@ async function runPnlBackfill() {
         dbClient.release();
     }
 }
+
 
 function findClosestPrice(prices, targetTimestamp) {
     // This helper function remains the same
