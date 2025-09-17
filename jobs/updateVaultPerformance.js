@@ -22,7 +22,7 @@ const updateVaultPerformance = async () => {
         const principalResult = await client.query(`SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`, [vaultId]);
         const principalCapital = parseFloat(principalResult.rows[0].total);
 
-        const tradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1 AND status = \'OPEN\'', [vaultId]);
+        const tradesResult = await client.query(`SELECT * FROM vault_trades WHERE vault_id = $1 AND status = 'OPEN'`, [vaultId]);
         const openTrades = tradesResult.rows;
         
         const realizedPnlResult = await client.query(`SELECT COALESCE(SUM(pnl_usd), 0) as total FROM vault_trades WHERE vault_id = $1 AND status = 'CLOSED'`, [vaultId]);
@@ -30,10 +30,15 @@ const updateVaultPerformance = async () => {
 
         let unrealizedPnl = 0;
         
+        // ==============================================================================
+        // --- FINAL BUG FIX: Define priceMap in the outer scope ---
+        // This ensures priceMap is always available, even with zero open trades.
+        // ==============================================================================
+        const priceMap = new Map();
+
         if (openTrades.length > 0) {
           const assetsResult = await client.query('SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', [vaultId]);
           const vaultAssetDetails = assetsResult.rows;
-          const priceMap = new Map();
 
           priceMap.set('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'.toLowerCase(), 1.0);
 
@@ -83,12 +88,6 @@ const updateVaultPerformance = async () => {
         const netAssetValue = principalCapital + totalPnl;
         const pnlPercentage = (principalCapital > 0) ? (totalPnl / principalCapital) * 100 : 0;
         
-        // ==============================================================================
-        // --- FINAL UPGRADE: Save the price snapshot to the database ---
-        // 1. Add asset_prices_snapshot to the INSERT statement.
-        // 2. Add the priceMap as the final parameter.
-        // 3. Update the ON CONFLICT clause to also update the snapshot.
-        // ==============================================================================
         await client.query(
           `INSERT INTO vault_performance_history (vault_id, record_date, pnl_percentage, total_value_locked, asset_prices_snapshot) 
            VALUES ($1, NOW(), $2, $3, $4)
