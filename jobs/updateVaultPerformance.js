@@ -111,14 +111,14 @@ const updateVaultPerformance = async () => {
         // --- End of INDEX LOGIC ---
 
         // We still save the raw NAV to the history table for auditing and other purposes.
-        await client.query(
-          `INSERT INTO vault_performance_history (vault_id, record_date, total_value_locked, asset_prices_snapshot) 
-           VALUES ($1, NOW(), $2, $3)
-           ON CONFLICT (vault_id, record_date) DO UPDATE SET 
-             total_value_locked = EXCLUDED.total_value_locked,
-             asset_prices_snapshot = EXCLUDED.asset_prices_snapshot`,
-          [vaultId, currentNav, JSON.stringify(Object.fromEntries(priceMap))]
-        );
+       await client.query(
+  `INSERT INTO vault_performance_history (vault_id, record_date, total_value_locked, asset_prices_snapshot) 
+   VALUES ($1, NOW(), $2, $3)
+   ON CONFLICT (vault_id, record_date) DO UPDATE SET 
+     total_value_locked = EXCLUDED.total_value_locked,
+     asset_prices_snapshot = EXCLUDED.asset_prices_snapshot`,
+  [vaultId, currentNav, JSON.stringify(Object.fromEntries(priceMap))]
+);
         
         await client.query('COMMIT');
         console.log(`✅ Successfully saved hourly data for Vault ID: ${vaultId}. NAV: $${currentNav.toFixed(2)}, Index: ${newIndexValue.toFixed(2)}`);
