@@ -3,8 +3,8 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+const moment = require('moment');
 
-// This map is now only used for the individual asset lines
 const KNOWN_ASSETS_TO_TRACK = ['BTC', 'ETH', 'SOL'];
 const KNOWN_ADDRESSES = {
   '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 'BTC',
@@ -15,12 +15,10 @@ const SYMBOL_TO_ADDRESS = Object.fromEntries(Object.entries(KNOWN_ADDRESSES).map
 
 router.get('/:vaultId', async (req, res) => {
   const { vaultId } = req.params;
-  const days = parseInt(req.query.days, 10) || 30;
+  const days = parseInt(req.query.days, 10) || 365;
 
   try {
-    // --- THE FIX: Query our two clean data sources in parallel ---
     const [indexHistoryResult, assetHistoryResult] = await Promise.all([
-      // 1. Get the pure performance index from our NEW table
       pool.query(
         `SELECT record_date, index_value
          FROM vault_performance_index 
@@ -28,9 +26,8 @@ router.get('/:vaultId', async (req, res) => {
          ORDER BY record_date ASC`,
         [vaultId]
       ),
-      // 2. Get the raw NAV and price snapshots for individual asset lines
       pool.query(
-        `SELECT record_date, total_value_locked, asset_prices_snapshot
+        `SELECT record_date, asset_prices_snapshot
          FROM vault_performance_history 
          WHERE vault_id = $1 AND record_date >= NOW() - INTERVAL '${days} days'
          ORDER BY record_date ASC`,
@@ -38,9 +35,6 @@ router.get('/:vaultId', async (req, res) => {
       )
     ]);
 
-        console.log(`[API DEBUG] marketData query for Vault ${vaultId} returned ${indexHistoryResult.rows.length} index rows.`);
-
-    // A chart needs at least 2 points to draw a line.
     if (indexHistoryResult.rows.length < 2) {
       return res.json({ vaultPerformance: [], assetPerformance: {} });
     }
@@ -52,20 +46,24 @@ router.get('/:vaultId', async (req, res) => {
     const baseIndexValue = parseFloat(indexHistory[0].index_value);
     const vaultPerformance = indexHistory.map(point => ({
       date: point.record_date,
-      value: ((parseFloat(point.index_value) / baseIndexValue) - 1) * 100, // Normalize to start at 0%
+      value: ((parseFloat(point.index_value) / baseIndexValue) - 1) * 100,
     }));
 
     // --- Process Asset Performance ---
     const assetPerformance = {};
     if (assetHistory.length > 0) {
         const basePrices = {};
-        for (const symbol of KNOWN_ASSETS_TO_TRACK) {
-            const address = SYMBOL_TO_ADDRESS[symbol];
-            if (assetHistory[0].asset_prices_snapshot && assetHistory[0].asset_prices_snapshot[address]) {
-                basePrices[symbol] = parseFloat(assetHistory[0].asset_prices_snapshot[address]);
+        const firstValidSnapshot = assetHistory.find(p => p.asset_prices_snapshot);
+
+        if(firstValidSnapshot) {
+            for (const symbol of KNOWN_ASSETS_TO_TRACK) {
+                const address = SYMBOL_TO_ADDRESS[symbol];
+                if (firstValidSnapshot.asset_prices_snapshot[address]) {
+                    basePrices[symbol] = parseFloat(firstValidSnapshot.asset_prices_snapshot[address]);
+                }
             }
         }
-
+        
         for (const symbol of KNOWN_ASSETS_TO_TRACK) {
             assetPerformance[symbol] = [];
             const basePrice = basePrices[symbol];
@@ -93,7 +91,6 @@ router.get('/:vaultId', async (req, res) => {
 
   } catch (error) {
     console.error(`Error fetching market performance for Vault ${vaultId}:`, error);
-    
     res.status(500).json({ error: 'Failed to fetch market performance data.' });
   }
 });
