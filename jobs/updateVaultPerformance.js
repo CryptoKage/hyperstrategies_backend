@@ -1,17 +1,19 @@
-// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/updateVaultPerformance.js
+// /jobs/updateVaultPerformance.js
 
 const pool = require('../db');
-const fetch = require('node-fetch');
-const { getAlchemyClient, resolveNetworkByName } = require('../services/alchemy');
+const { getPrices } = require('../utils/priceOracle'); // <-- 1. IMPORT our new Price Oracle
 
-const HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info";
+const STOP_LOSS_PERCENTAGE = -7.1; // The -7.1% threshold
 
 const updateVaultPerformance = async () => {
-  console.log('📈 Starting hourly vault performance update job (Hybrid Oracle)...');
+  console.log('📈 Starting hourly vault performance update job...');
   const client = await pool.connect();
   try {
     const { rows: activeVaults } = await client.query("SELECT vault_id FROM vaults WHERE status = 'active'");
-    if (activeVaults.length === 0) return;
+    if (activeVaults.length === 0) {
+      console.log("No active vaults to process.");
+      return;
+    }
 
     for (const vault of activeVaults) {
       const vaultId = vault.vault_id;
@@ -19,67 +21,85 @@ const updateVaultPerformance = async () => {
       
       await client.query('BEGIN');
       try {
+        // --- Fetch all necessary data upfront ---
+        const assetsResult = await client.query('SELECT symbol, contract_address, chain, coingecko_id FROM vault_assets WHERE vault_id = $1', [vaultId]);
+        const vaultAssetDetails = assetsResult.rows;
+
+        const tradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1 AND status = \'OPEN\'', [vaultId]);
+        let openTrades = tradesResult.rows;
+
+        // --- Get live prices using our new centralized oracle ---
+        const priceMap = await getPrices(vaultAssetDetails);
+
+        // --- TSL LOGIC: Check for and process stop losses ---
+        const tradesToClose = [];
+        for (const trade of openTrades) {
+          const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
+          if (!assetDetail || !assetDetail.contract_address) continue;
+
+          const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
+          if (typeof currentPrice !== 'number') {
+            console.warn(`[TSL] Skipping stop-loss check for ${trade.asset_symbol} due to missing price.`);
+            continue;
+          }
+
+          const entryPrice = parseFloat(trade.entry_price);
+          const initialValue = parseFloat(trade.quantity) * entryPrice;
+          const currentValue = parseFloat(trade.quantity) * currentPrice;
+          
+          let pnl;
+          if (trade.direction === 'LONG') {
+            pnl = currentValue - initialValue;
+          } else { // SHORT
+            pnl = initialValue - currentValue;
+          }
+
+          const pnlPercentage = (initialValue > 0) ? (pnl / initialValue) * 100 : 0;
+
+          if (pnlPercentage <= STOP_LOSS_PERCENTAGE) {
+            console.log(`🚨 STOP LOSS TRIGGERED for trade #${trade.trade_id} (${trade.asset_symbol}). P&L: ${pnlPercentage.toFixed(2)}%`);
+            tradesToClose.push({
+              trade_id: trade.trade_id,
+              exit_price: currentPrice,
+              pnl_usd: pnl,
+            });
+          }
+        }
+
+        // --- TSL LOGIC: Batch-update the closed trades in the database ---
+        if (tradesToClose.length > 0) {
+          for (const closedTrade of tradesToClose) {
+            await client.query(
+              `UPDATE vault_trades 
+               SET status = 'CLOSED', exit_price = $1, pnl_usd = $2, trade_closed_at = NOW()
+               WHERE trade_id = $3`,
+              [closedTrade.exit_price, closedTrade.pnl_usd, closedTrade.trade_id]
+            );
+          }
+          // Filter out the trades we just closed so they aren't included in unrealized P&L
+          const closedTradeIds = new Set(tradesToClose.map(t => t.trade_id));
+          openTrades = openTrades.filter(t => !closedTradeIds.has(t.trade_id));
+        }
+        // --- End of TSL LOGIC ---
+
+        // --- Recalculate P&L and NAV with remaining open trades ---
         const principalResult = await client.query(`SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`, [vaultId]);
         const principalCapital = parseFloat(principalResult.rows[0].total);
 
-        const tradesResult = await client.query(`SELECT * FROM vault_trades WHERE vault_id = $1 AND status = 'OPEN'`, [vaultId]);
-        const openTrades = tradesResult.rows;
-        
         const realizedPnlResult = await client.query(`SELECT COALESCE(SUM(pnl_usd), 0) as total FROM vault_trades WHERE vault_id = $1 AND status = 'CLOSED'`, [vaultId]);
         const realizedPnl = parseFloat(realizedPnlResult.rows[0].total);
 
         let unrealizedPnl = 0;
-        
-        // ==============================================================================
-        // --- FINAL BUG FIX: Define priceMap in the outer scope ---
-        // This ensures priceMap is always available, even with zero open trades.
-        // ==============================================================================
-        const priceMap = new Map();
-
-        if (openTrades.length > 0) {
-          const assetsResult = await client.query('SELECT symbol, contract_address, chain FROM vault_assets WHERE vault_id = $1', [vaultId]);
-          const vaultAssetDetails = assetsResult.rows;
-
-          priceMap.set('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'.toLowerCase(), 1.0);
-
-          const assetsToFetch = vaultAssetDetails.filter(a => a.symbol.toUpperCase() !== 'USDC');
-          if (assetsToFetch.length > 0) {
-            console.log(`[Oracle] Querying Hyperliquid for symbols: ${assetsToFetch.map(a => a.symbol).join(', ')}...`);
-            try {
-              const response = await fetch(HYPERLIQUID_API_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ type: "allMids" }),
-              });
-              if (!response.ok) throw new Error(`Hyperliquid API error: ${response.statusText}`);
-              const mids = await response.json();
-              
-              for (const asset of assetsToFetch) {
-                const priceStr = mids[asset.symbol.toUpperCase()];
-                if (priceStr) {
-                  priceMap.set(asset.contract_address.toLowerCase(), parseFloat(priceStr));
-                }
-              }
-            } catch (err) {
-              console.error('[Oracle] Hyperliquid fetch failed:', err.message);
-            }
-          }
-          
-          console.log('[Oracle] Final Price Map:', Object.fromEntries(priceMap));
-
-          for (const trade of openTrades) {
-            const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
-            if (assetDetail && assetDetail.contract_address) {
-              const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
-              if (typeof currentPrice === 'number') {
-                const entryPrice = parseFloat(trade.entry_price);
-                const quantity = parseFloat(trade.quantity);
-                unrealizedPnl += (trade.direction === 'LONG') 
-                  ? (currentPrice - entryPrice) * quantity 
-                  : (entryPrice - currentPrice) * quantity;
-              } else {
-                console.warn(`[PNL Calc] Final price for ${assetDetail.symbol} is missing. Skipping trade.`);
-              }
+        for (const trade of openTrades) {
+          const assetDetail = vaultAssetDetails.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
+          if (assetDetail && assetDetail.contract_address) {
+            const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
+            if (typeof currentPrice === 'number') {
+              const entryPrice = parseFloat(trade.entry_price);
+              const quantity = parseFloat(trade.quantity);
+              unrealizedPnl += (trade.direction === 'LONG') 
+                ? (currentPrice - entryPrice) * quantity 
+                : (entryPrice - currentPrice) * quantity;
             }
           }
         }
@@ -103,7 +123,7 @@ const updateVaultPerformance = async () => {
       
       } catch (innerError) {
         await client.query('ROLLBACK');
-        console.error(`❌ FAILED to process Vault ID: ${vaultId}. Rolling back. Error:`, innerError.message);
+        console.error(`❌ FAILED to process Vault ID: ${vaultId}. Rolling back. Error:`, innerError.message, innerError.stack);
       }
     }
   } catch (error) {

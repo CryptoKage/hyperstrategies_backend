@@ -1,103 +1,128 @@
+// /routes/vaultDetails.js
+
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
-const fetch = require('node-fetch');
-const { resolveNetworkByName } = require('../services/alchemy');
+const { getPrices } = require('../utils/priceOracle'); // <-- 1. Use our new centralized oracle
 
-const HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info";
-
+// This endpoint is now the single source of truth for the vault detail page.
 router.get('/:vaultId', authenticateToken, async (req, res) => {
   const { vaultId } = req.params;
   const userId = req.user.id;
   const client = await pool.connect();
 
   try {
-    const vaultInfoResult = await client.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]);
+    // --- Step 1: Fetch all necessary data in parallel ---
+    const [
+      vaultInfoResult,
+      assetBreakdownResult,
+      openTradesResult,
+      userLedgerResult,
+      vaultLedgerStatsResult
+    ] = await Promise.all([
+      client.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
+      client.query('SELECT symbol, contract_address, chain, coingecko_id FROM vault_assets WHERE vault_id = $1', [vaultId]),
+      client.query('SELECT * FROM vault_trades WHERE vault_id = $1 AND status = \'OPEN\'', [vaultId]),
+      // Get all ledger entries for this user in this vault
+      client.query(`SELECT * FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 ORDER BY created_at ASC`, [userId, vaultId]),
+      // Get the total principal deposited into the vault across ALL users
+      client.query(`SELECT COALESCE(SUM(amount), 0) as total_principal FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`, [vaultId])
+    ]);
+
     if (vaultInfoResult.rows.length === 0) {
-      client.release();
       return res.status(404).json({ error: 'Vault not found.' });
     }
 
-    const [
-      performanceHistoryResult,
-      assetBreakdownResult,
-      tradesResult,
-      vaultLedgerStatsResult,
-      userLedgerResult
-    ] = await Promise.all([
-      client.query(`SELECT record_date, pnl_percentage, total_value_locked, asset_prices_snapshot FROM vault_performance_history WHERE vault_id = $1 ORDER BY record_date DESC LIMIT 30`, [vaultId]),
-      client.query('SELECT symbol, contract_address, chain, weight, coingecko_id FROM vault_assets WHERE vault_id = $1', [vaultId]),
-      client.query('SELECT * FROM vault_trades WHERE vault_id = $1', [vaultId]),
-      client.query(`SELECT COALESCE(SUM(CASE WHEN entry_type = 'DEPOSIT' THEN amount ELSE 0 END), 0) as total_principal FROM vault_ledger_entries WHERE vault_id = $1`, [vaultId]),
-      client.query(`SELECT * FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 ORDER BY created_at DESC`, [userId, vaultId])
-    ]);
-
-    const allTrades = tradesResult.rows;
-    const openTrades = allTrades.filter(t => t.status === 'OPEN');
-    const priceMap = new Map();
-    
+    const vaultInfo = vaultInfoResult.rows[0];
     const vaultAssets = assetBreakdownResult.rows;
-    priceMap.set('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'.toLowerCase(), 1.0);
-    const assetsToFetch = vaultAssets.filter(a => a.symbol.toUpperCase() !== 'USDC');
-    if (assetsToFetch.length > 0) {
-        try {
-            const response = await fetch(HYPERLIQUID_API_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: "allMids" }) });
-            if (response.ok) {
-                const mids = await response.json();
-                for (const asset of assetsToFetch) {
-                    const priceStr = mids[asset.symbol.toUpperCase()];
-                    if (priceStr) priceMap.set(asset.contract_address.toLowerCase(), parseFloat(priceStr));
-                }
-            }
-        } catch (err) { console.error('[VaultDetails] Hyperliquid fetch failed:', err.message); }
-    }
-    
+    const openTrades = openTradesResult.rows;
+    const userLedgerEntries = userLedgerResult.rows;
+    const vaultTotalPrincipal = parseFloat(vaultLedgerStatsResult.rows[0].total_principal);
+
+    // --- Step 2: Get live prices using our robust oracle ---
+    const priceMap = await getPrices(vaultAssets);
+    const assetBreakdownWithPrices = vaultAssets.map(asset => ({
+      ...asset,
+      livePrice: priceMap.get(asset.contract_address.toLowerCase()) || null,
+    }));
+
+    // --- Step 3: Calculate the user's detailed, real-time position ---
     let userPosition = null;
-    const userLedger = userLedgerResult.rows;
-    const userTotalCapital = userLedger.reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
+    if (userLedgerEntries.length > 0) {
+      // Calculate user's principal and realized PNL from their ledger
+      const userPrincipal = userLedgerEntries
+        .filter(e => e.entry_type === 'DEPOSIT')
+        .reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
+      
+      const realizedPnl = userLedgerEntries
+        .filter(e => e.entry_type === 'PNL_DISTRIBUTION')
+        .reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
 
-    if (userTotalCapital > 0) {
-        const userPrincipal = userLedger.filter(e => e.entry_type === 'DEPOSIT').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-        const userRealizedPnl = userLedger.filter(e => e.entry_type === 'PNL_DISTRIBUTION').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-        const vaultTotalPrincipal = parseFloat(vaultLedgerStatsResult.rows[0].total_principal);
-        const userOwnershipPct = (vaultTotalPrincipal > 0) ? (userPrincipal / vaultTotalPrincipal) : 0;
-        let userUnrealizedPnl = 0;
-        const userPnlByAsset = {};
-        for (const trade of openTrades) {
-            const assetDetail = vaultAssets.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
-            if (assetDetail && assetDetail.contract_address) {
-                const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
-                if (typeof currentPrice === 'number') {
-                    const entryPrice = parseFloat(trade.entry_price);
-                    const quantity = parseFloat(trade.quantity);
-                    const tradePnl = (trade.direction === 'LONG') ? (currentPrice - entryPrice) * quantity : (entryPrice - currentPrice) * quantity;
-                    const userShareOfPnl = tradePnl * userOwnershipPct;
-                    userUnrealizedPnl += userShareOfPnl;
-                    if (!userPnlByAsset[assetDetail.symbol]) userPnlByAsset[assetDetail.symbol] = 0;
-                    userPnlByAsset[assetDetail.symbol] += userShareOfPnl;
-                }
-            }
+      // Calculate user's share of the vault's total unrealized PNL
+      let totalUnrealizedPnl = 0;
+      for (const trade of openTrades) {
+        const assetDetail = vaultAssets.find(a => a.symbol.trim().toUpperCase() === trade.asset_symbol.trim().toUpperCase());
+        if (assetDetail && assetDetail.contract_address) {
+          const currentPrice = priceMap.get(assetDetail.contract_address.toLowerCase());
+          if (typeof currentPrice === 'number') {
+            const entryPrice = parseFloat(trade.entry_price);
+            const quantity = parseFloat(trade.quantity);
+            totalUnrealizedPnl += (trade.direction === 'LONG') 
+              ? (currentPrice - entryPrice) * quantity 
+              : (entryPrice - currentPrice) * quantity;
+          }
         }
-        userPosition = { totalCapital: userTotalCapital, totalPnl: userRealizedPnl + userUnrealizedPnl, pnlByAsset: userPnlByAsset };
-    }
-    
-    const userCapitalInTransit = userLedger.filter(e => e.status === 'PENDING_SWEEP').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-    const userPendingWithdrawals = userLedger.filter(e => e.status.startsWith('PENDING_') || e.status.startsWith('SWEEP_')).reduce((sum, entry) => sum - parseFloat(entry.amount), 0);
+      }
 
+      // User's ownership percentage of the vault's capital
+      const userOwnershipPct = (vaultTotalPrincipal > 0) ? (userPrincipal / vaultTotalPrincipal) : 0;
+      const unrealizedPnl = totalUnrealizedPnl * userOwnershipPct;
+
+      userPosition = {
+        totalCapital: userPrincipal + realizedPnl + unrealizedPnl,
+        principal: userPrincipal,
+        realizedPnl: realizedPnl,
+        unrealizedPnl: unrealizedPnl,
+      };
+    }
+
+    // --- Step 4: Generate the user's historical performance for the chart ---
+    let runningBalance = 0;
+    const userPerformanceHistory = userLedgerEntries.map(entry => {
+      runningBalance += parseFloat(entry.amount);
+      return {
+        date: entry.created_at,
+        balance: runningBalance,
+      };
+    });
+
+    // --- Step 5: Calculate stats for capital in transit ---
+    const capitalInTransit = userLedgerEntries
+      .filter(e => e.status === 'PENDING_SWEEP')
+      .reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
+      
+    const pendingWithdrawals = userLedgerEntries
+      .filter(e => e.entry_type === 'WITHDRAWAL_REQUEST' && e.status.startsWith('PENDING_'))
+      .reduce((sum, entry) => sum + Math.abs(parseFloat(entry.amount)), 0);
+
+    // --- Step 6: Assemble the final, clean payload for the frontend ---
     const responsePayload = {
-      vaultInfo: vaultInfoResult.rows[0],
-      performanceHistory: performanceHistoryResult.rows,
-      assetBreakdown: vaultAssets.map(asset => ({...asset, livePrice: priceMap.get(asset.contract_address.toLowerCase()) || null })),
+      vaultInfo,
+      assetBreakdown: assetBreakdownWithPrices,
       userPosition,
-      userLedger,
-      vaultStats: { capitalInTransit: userCapitalInTransit, pendingWithdrawals: userPendingWithdrawals },
+      userLedger: userLedgerEntries.reverse(), // Show most recent first in the table
+      userPerformanceHistory,
+      vaultStats: {
+        capitalInTransit,
+        pendingWithdrawals,
+      },
     };
     
     res.json(responsePayload);
 
   } catch (error) {
-    console.error(`Error fetching details for Vault ${vaultId}:`, error);
+    console.error(`Error fetching details for Vault ${vaultId}:`, error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch vault details.' });
   } finally {
     if (client) client.release();
