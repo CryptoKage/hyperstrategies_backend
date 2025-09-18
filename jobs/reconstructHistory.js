@@ -9,59 +9,54 @@ const moment = require('moment');
 const VAULT_ID = 1;
 const BASE_INDEX_VALUE = 1000.0;
 
-// --- THE FIX: Define "Genesis" events here ---
-// Add any known, unrecorded performance points to this array.
-// The script will calculate the dollar amount based on the capital at that time.
-const GENESIS_EVENTS = [
+// --- PRE-SEED HISTORICAL PNL HERE ---
+// This is for known P&L events that are not in the database correctly.
+// We calculate the dollar amount and give it a precise timestamp.
+const firstDepositAmount = 1372.24; // The capital base for the first PNL
+const firstPnlAmount = firstDepositAmount * 0.0579; // 5.79% gain = $79.45
+
+const PRE_SEED_EVENTS = [
     {
-        event_date: '2025-07-16',
-        performance_percent: 5.79, // A 5.79% gain
-        event_type: 'GENESIS_PNL'
+        event_date: '2025-07-16 23:59:59', // Timed at the END of the day to ensure it's after the deposit
+        amount: firstPnlAmount,
+        event_type: 'PNL_DISTRIBUTION'
     }
-    // Add more here if needed, e.g., { event_date: '2025-07-20', performance_percent: -2.1, ... }
 ];
 // ==============================================================================
 
 const runReconstruction = async () => {
-    console.log(`--- 🛠️ Starting GENESIS Historical Reconstruction for Vault #${VAULT_ID} ---`);
+    console.log(`--- 🛠️ Starting FINAL PRE-SEEDED Reconstruction for Vault #${VAULT_ID} ---`);
     const client = await pool.connect();
 
     try {
         await client.query('BEGIN');
 
-        // --- Step 1: Gather all REAL historical events ---
+        // --- Step 1: Gather all events ---
         const capitalEvents = (await client.query(`SELECT created_at as event_date, amount, entry_type as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')`, [VAULT_ID])).rows;
         const pnlEvents = (await client.query(`SELECT created_at as event_date, SUM(amount) as amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'PNL_DISTRIBUTION' GROUP BY created_at`, [VAULT_ID])).rows;
         const tradeEvents = (await client.query(`SELECT trade_closed_at as event_date, pnl_usd as amount, 'REALIZED_PNL_TRADE' as event_type FROM vault_trades WHERE vault_id = $1 AND status = 'CLOSED' AND pnl_usd IS NOT NULL`, [VAULT_ID])).rows;
         
-        // Combine ALL events (real and genesis) into a single timeline and sort
-        const timeline = [...capitalEvents, ...pnlEvents, ...tradeEvents, ...GENESIS_EVENTS]
+        // Combine ALL events (real and pre-seeded) into a single timeline and sort
+        const timeline = [...capitalEvents, ...pnlEvents, ...tradeEvents, ...PRE_SEED_EVENTS]
             .sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
 
         if (timeline.length === 0) throw new Error('No historical events found.');
 
-        // --- Step 2: Process the complete timeline ---
-        console.log(`\nStep 2: Processing ${timeline.length} total events...`);
+        // --- Step 2: Process the final timeline ---
+        console.log(`\nStep 2: Processing ${timeline.length} total financial events...`);
         let currentCapital = 0;
         let currentIndexValue = BASE_INDEX_VALUE;
 
-        const startDate = moment(timeline[0].event_date).subtract(1, 'day');
-        await saveIndexPoint(client, startDate.toDate(), currentIndexValue);
+        // Save the initial starting point based on your known start date
+        await saveIndexPoint(client, moment('2025-07-06').toDate(), currentIndexValue);
 
         for (const event of timeline) {
             const eventDate = moment(event.event_date);
-            let eventAmount = parseFloat(event.amount);
+            const eventAmount = parseFloat(event.amount);
 
             if (event.event_type === 'DEPOSIT' || event.event_type === 'WITHDRAWAL_REQUEST') {
                 currentCapital += eventAmount;
-            } else { // PNL_DISTRIBUTION, REALIZED_PNL_TRADE, or GENESIS_PNL
-                
-                // If it's a genesis event, calculate the dollar amount now
-                if (event.event_type === 'GENESIS_PNL') {
-                    eventAmount = currentCapital * (event.performance_percent / 100);
-                    console.log(`- ${eventDate.format('YYYY-MM-DD')}: Injecting GENESIS PNL event of ${event.performance_percent}% ($${eventAmount.toFixed(2)})`);
-                }
-
+            } else { // PNL_DISTRIBUTION or REALIZED_PNL_TRADE
                 if (currentCapital > 0) {
                     const performancePercent = eventAmount / currentCapital;
                     currentIndexValue = currentIndexValue * (1 + performancePercent);
@@ -72,17 +67,8 @@ const runReconstruction = async () => {
             await saveIndexPoint(client, eventDate.toDate(), currentIndexValue);
         }
 
-        // Fill in from the last event until today
-        const lastEventDate = moment(timeline[timeline.length - 1].event_date);
-        const daysUntilToday = moment().diff(lastEventDate, 'days');
-        for (let i = 1; i <= daysUntilToday; i++) {
-            const intermediateDate = lastEventDate.clone().add(i, 'days');
-            await saveIndexPoint(client, intermediateDate.toDate(), currentIndexValue);
-        }
-
-
         await client.query('COMMIT');
-        console.log(`\n--- ✅ GENESIS Reconstruction Complete! Final Index: ${currentIndexValue.toFixed(2)} ---`);
+        console.log(`\n--- ✅ FINAL Reconstruction Complete! Final Index: ${currentIndexValue.toFixed(2)} ---`);
 
     } catch (error) {
         await client.query('ROLLBACK');
