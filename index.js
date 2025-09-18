@@ -27,6 +27,7 @@ const withdrawRoutes = require('./routes/withdraw');
 const vaultsRoutes = require('./routes/vaults');
 const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
+const marketDataRoutes = require('./routes/marketData');
 require('./passport-setup');
 
 // --- Job & Utility Imports ---
@@ -93,7 +94,7 @@ app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
 app.use('/api/pnl', pnlRoutes);
-
+app.use('/api/market-data', marketDataRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
