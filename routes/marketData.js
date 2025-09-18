@@ -38,6 +38,8 @@ router.get('/:vaultId', async (req, res) => {
       )
     ]);
 
+        console.log(`[API DEBUG] marketData query for Vault ${vaultId} returned ${indexHistoryResult.rows.length} index rows.`);
+
     // A chart needs at least 2 points to draw a line.
     if (indexHistoryResult.rows.length < 2) {
       return res.json({ vaultPerformance: [], assetPerformance: {} });
@@ -91,6 +93,7 @@ router.get('/:vaultId', async (req, res) => {
 
   } catch (error) {
     console.error(`Error fetching market performance for Vault ${vaultId}:`, error);
+    
     res.status(500).json({ error: 'Failed to fetch market performance data.' });
   }
 });
