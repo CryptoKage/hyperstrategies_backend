@@ -35,6 +35,11 @@ const run = async () => {
         await scanBlockForDeposits(latestBlock);
         break;
       }
+
+          case 'reconstructHistory':
+        const { runReconstruction } = require('./jobs/reconstructHistory');
+        await runReconstruction();
+        break;
         
       case 'processWithdrawals':
         const { processWithdrawals } = require('./jobs/queueProcessor');
