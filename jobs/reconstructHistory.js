@@ -30,10 +30,10 @@ const runReconstruction = async () => {
 
         // Event Source 2: OLD P&L System (Manual Distributions)
         const manualPnlEventsResult = await client.query(
-            `SELECT created_at as event_date, amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries 
-             WHERE vault_id = $1 AND entry_type = 'VAULT_PNL_DISTRIBUTION'`,
-            [VAULT_ID]
-        );
+    `SELECT created_at as event_date, amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries 
+     WHERE vault_id = $1 AND entry_type = 'PNL_DISTRIBUTION'`, // <-- THE ONLY CHANGE IS HERE
+    [VAULT_ID]
+);
         console.log(`- Found ${manualPnlEventsResult.rows.length} manual PNL distribution events.`);
 
         // Event Source 3: NEW P&L System (Closed Trades)
