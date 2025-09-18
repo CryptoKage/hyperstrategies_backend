@@ -4,50 +4,57 @@ const pool = require('../db');
 const moment = require('moment');
 
 // ==============================================================================
-// --- CONFIGURATION: EDIT THIS VALUE BEFORE RUNNING ---
+// --- CONFIGURATION ---
 // ==============================================================================
 const VAULT_ID = 1;
 const BASE_INDEX_VALUE = 1000.0;
 // ==============================================================================
 
 const runReconstruction = async () => {
-    console.log(`--- 🛠️ Starting TRUE Historical Reconstruction for Vault #${VAULT_ID} ---`);
+    console.log(`--- 🛠️ Starting UNIFIED Historical Reconstruction for Vault #${VAULT_ID} ---`);
     const client = await pool.connect();
 
     try {
-        await client.query('BEGIN'); // Start a single large transaction.
+        await client.query('BEGIN');
 
-        // --- Step 1: Gather All Financial "Events" ---
+        // --- Step 1: Gather ALL Historical Financial Events from ALL Sources ---
         console.log('Step 1: Gathering all historical financial events...');
         
-        // Get all deposits and withdrawals to track capital changes
+        // Event Source 1: Capital movements (Deposits/Withdrawals)
         const capitalEventsResult = await client.query(
             `SELECT created_at as event_date, amount, entry_type as event_type FROM vault_ledger_entries 
-             WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')
-             ORDER BY created_at ASC`,
+             WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')`,
             [VAULT_ID]
         );
-        console.log(`- Found ${capitalEventsResult.rows.length} capital events (deposits/withdrawals).`);
+        console.log(`- Found ${capitalEventsResult.rows.length} capital events.`);
 
-        // Get all closed trades to track realized P&L
-        const tradeEventsResult = await client.query(
-            `SELECT trade_closed_at as event_date, pnl_usd as amount, 'REALIZED_PNL' as event_type FROM vault_trades 
-             WHERE vault_id = $1 AND status = 'CLOSED' AND pnl_usd IS NOT NULL
-             ORDER BY trade_closed_at ASC`,
+        // Event Source 2: OLD P&L System (Manual Distributions)
+        const manualPnlEventsResult = await client.query(
+            `SELECT created_at as event_date, amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries 
+             WHERE vault_id = $1 AND entry_type = 'VAULT_PNL_DISTRIBUTION'`,
             [VAULT_ID]
         );
-        console.log(`- Found ${tradeEventsResult.rows.length} realized P&L events (closed trades).`);
+        console.log(`- Found ${manualPnlEventsResult.rows.length} manual PNL distribution events.`);
+
+        // Event Source 3: NEW P&L System (Closed Trades)
+        const tradePnlEventsResult = await client.query(
+            `SELECT trade_closed_at as event_date, pnl_usd as amount, 'REALIZED_PNL_TRADE' as event_type FROM vault_trades 
+             WHERE vault_id = $1 AND status = 'CLOSED' AND pnl_usd IS NOT NULL`,
+            [VAULT_ID]
+        );
+        console.log(`- Found ${tradePnlEventsResult.rows.length} realized PNL events from closed trades.`);
         
-        // Combine all events into a single timeline and sort chronologically
-        const timeline = [...capitalEventsResult.rows, ...tradeEventsResult.rows]
-            .sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
+        // Combine all events into a single, unified timeline and sort chronologically
+        const timeline = [
+            ...capitalEventsResult.rows, 
+            ...manualPnlEventsResult.rows, 
+            ...tradePnlEventsResult.rows
+        ].sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
 
-        if (timeline.length === 0) {
-            throw new Error('No historical events found for this vault. Cannot run reconstruction.');
-        }
+        if (timeline.length === 0) throw new Error('No historical events found.');
 
-        // --- Step 2: Process the Event Timeline ---
-        console.log('\nStep 2: Processing event timeline to calculate historical performance...');
+        // --- Step 2: Process the Unified Timeline ---
+        console.log(`\nStep 2: Processing ${timeline.length} total events to calculate historical performance...`);
         let currentCapital = 0;
         let currentIndexValue = BASE_INDEX_VALUE;
         let lastDate = moment(timeline[0].event_date).subtract(1, 'day');
@@ -63,18 +70,22 @@ const runReconstruction = async () => {
                 await saveIndexPoint(client, intermediateDate.toDate(), currentIndexValue);
             }
 
+            // Process the event based on its type
             if (event.event_type === 'DEPOSIT') {
                 currentCapital += eventAmount;
-                console.log(`- ${eventDate.format('YYYY-MM-DD')}: Deposit of $${eventAmount.toFixed(2)}. Capital is now $${currentCapital.toFixed(2)}.`);
+                console.log(`- ${eventDate.format('YYYY-MM-DD')}: Deposit of $${eventAmount.toFixed(2)}. Capital base is now $${currentCapital.toFixed(2)}.`);
             } else if (event.event_type === 'WITHDRAWAL_REQUEST') {
-                currentCapital += eventAmount; // Amount is negative, so this subtracts
-                console.log(`- ${eventDate.format('YYYY-MM-DD')}: Withdrawal of $${eventAmount.toFixed(2)}. Capital is now $${currentCapital.toFixed(2)}.`);
-            } else if (event.event_type === 'REALIZED_PNL') {
+                currentCapital += eventAmount; // Amount is negative
+                console.log(`- ${eventDate.format('YYYY-MM-DD')}: Withdrawal of $${eventAmount.toFixed(2)}. Capital base is now $${currentCapital.toFixed(2)}.`);
+            } else if (event.event_type === 'PNL_DISTRIBUTION' || event.event_type === 'REALIZED_PNL_TRADE') {
                 if (currentCapital > 0) {
                     const performancePercent = eventAmount / currentCapital;
                     currentIndexValue = currentIndexValue * (1 + performancePercent);
-                    console.log(`- ${eventDate.format('YYYY-MM-DD')}: Realized P&L of $${eventAmount.toFixed(2)} on capital of $${currentCapital.toFixed(2)}. Performance: ${(performancePercent * 100).toFixed(4)}%. New Index: ${currentIndexValue.toFixed(2)}.`);
-                    currentCapital += eventAmount; // P&L also increases the capital base
+                    console.log(`- ${eventDate.format('YYYY-MM-DD')}: PNL of $${eventAmount.toFixed(2)} on capital of $${currentCapital.toFixed(2)}. Perf: ${(performancePercent * 100).toFixed(4)}%. New Index: ${currentIndexValue.toFixed(2)}.`);
+                    // The P&L itself also increases the capital base for the next calculation
+                    currentCapital += eventAmount; 
+                } else {
+                    console.log(`- ${eventDate.format('YYYY-MM-DD')}: PNL event of $${eventAmount.toFixed(2)} occurred with zero capital base. Index unchanged.`);
                 }
             }
             
@@ -83,7 +94,7 @@ const runReconstruction = async () => {
         }
 
         await client.query('COMMIT');
-        console.log(`\n--- ✅ Reconstruction Complete! Processed ${timeline.length} events. ---`);
+        console.log(`\n--- ✅ UNIFIED Reconstruction Complete! ---`);
 
     } catch (error) {
         await client.query('ROLLBACK');
@@ -94,7 +105,6 @@ const runReconstruction = async () => {
 };
 
 async function saveIndexPoint(client, date, indexValue) {
-    // We only save one point per day for the historical chart.
     const recordDate = moment.utc(date).startOf('day').toDate();
     await client.query(
         `INSERT INTO vault_performance_index (vault_id, record_date, index_value) 
