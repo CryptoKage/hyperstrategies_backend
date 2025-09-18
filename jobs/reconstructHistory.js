@@ -2,73 +2,73 @@
 
 const pool = require('../db');
 const moment = require('moment');
+const { CoinGeckoClient } = require('coingecko-api-v3');
 
-// ==============================================================================
-// --- CONFIGURATION ---
-// ==============================================================================
+const cgClient = new CoinGeckoClient({ timeout: 15000, autoRetry: true });
+
 const VAULT_ID = 1;
 const BASE_INDEX_VALUE = 1000.0;
-
-// --- PRE-SEED HISTORICAL PNL HERE ---
-// This is for known P&L events that are not in the database correctly.
-// We calculate the dollar amount and give it a precise timestamp.
-const firstDepositAmount = 1372.24; // The capital base for the first PNL
-const firstPnlAmount = firstDepositAmount * 0.0579; // 5.79% gain = $79.45
-
-const PRE_SEED_EVENTS = [
-    {
-        event_date: '2025-07-16 23:59:59', // Timed at the END of the day to ensure it's after the deposit
-        amount: firstPnlAmount,
-        event_type: 'PNL_DISTRIBUTION'
-    }
+const ASSETS_TO_TRACK = [
+    { symbol: 'BTC', coingeckoId: 'bitcoin', address: '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599' },
+    { symbol: 'ETH', coingeckoId: 'ethereum', address: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' },
+    { symbol: 'SOL', coingeckoId: 'solana', address: '0xd31a59c85ae9d8edefec411e448fd2e703a42e99' },
 ];
-// ==============================================================================
 
 const runReconstruction = async () => {
-    console.log(`--- 🛠️ Starting FINAL PRE-SEEDED Reconstruction for Vault #${VAULT_ID} ---`);
+    console.log(`--- 🛠️ Starting DEFINITIVE Historical Reconstruction for Vault #${VAULT_ID} ---`);
     const client = await pool.connect();
 
     try {
         await client.query('BEGIN');
 
-        // --- Step 1: Gather all events ---
+        // Step 1: Gather all data sources
         const capitalEvents = (await client.query(`SELECT created_at as event_date, amount, entry_type as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')`, [VAULT_ID])).rows;
         const pnlEvents = (await client.query(`SELECT created_at as event_date, SUM(amount) as amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'PNL_DISTRIBUTION' GROUP BY created_at`, [VAULT_ID])).rows;
-        const tradeEvents = (await client.query(`SELECT trade_closed_at as event_date, pnl_usd as amount, 'REALIZED_PNL_TRADE' as event_type FROM vault_trades WHERE vault_id = $1 AND status = 'CLOSED' AND pnl_usd IS NOT NULL`, [VAULT_ID])).rows;
+        const timeline = [...capitalEvents, ...pnlEvents].sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
         
-        // Combine ALL events (real and pre-seeded) into a single timeline and sort
-        const timeline = [...capitalEvents, ...pnlEvents, ...tradeEvents, ...PRE_SEED_EVENTS]
-            .sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
-
         if (timeline.length === 0) throw new Error('No historical events found.');
-
-        // --- Step 2: Process the final timeline ---
-        console.log(`\nStep 2: Processing ${timeline.length} total financial events...`);
+        
+        const startDate = moment(timeline[0].event_date);
+        
+        const priceHistories = {};
+        await Promise.all(ASSETS_TO_TRACK.map(async (asset) => {
+            const response = await cgClient.coinIdMarketChartRange({ id: asset.coingeckoId, vs_currency: 'usd', from: startDate.unix(), to: moment().unix() });
+            priceHistories[asset.symbol] = response.prices.map(([timestamp, price]) => ({ timestamp, price }));
+            console.log(`- Fetched ${priceHistories[asset.symbol].length} daily price points for ${asset.symbol}.`);
+        }));
+        
+        // Step 2: Process the timeline day-by-day
+        console.log('\nStep 2: Processing historical timeline day-by-day...');
         let currentCapital = 0;
         let currentIndexValue = BASE_INDEX_VALUE;
 
-        // Save the initial starting point based on your known start date
-        await saveIndexPoint(client, moment('2025-07-06').toDate(), currentIndexValue);
+        // Save the starting point
+        await saveDailySnapshot(client, startDate.clone().subtract(1, 'day'), currentCapital, currentIndexValue, priceHistories);
 
-        for (const event of timeline) {
-            const eventDate = moment(event.event_date);
-            const eventAmount = parseFloat(event.amount);
+        const daysToSimulate = moment().diff(startDate, 'days');
 
-            if (event.event_type === 'DEPOSIT' || event.event_type === 'WITHDRAWAL_REQUEST') {
-                currentCapital += eventAmount;
-            } else { // PNL_DISTRIBUTION or REALIZED_PNL_TRADE
-                if (currentCapital > 0) {
-                    const performancePercent = eventAmount / currentCapital;
-                    currentIndexValue = currentIndexValue * (1 + performancePercent);
+        for (let i = 0; i <= daysToSimulate; i++) {
+            const currentDay = startDate.clone().add(i, 'days');
+            const eventsOnThisDay = timeline.filter(e => moment(e.event_date).isSame(currentDay, 'day'));
+            
+            for (const event of eventsOnThisDay) {
+                const eventAmount = parseFloat(event.amount);
+                if (event.event_type === 'DEPOSIT' || event.event_type === 'WITHDRAWAL_REQUEST') {
+                    currentCapital += eventAmount;
+                } else { // PNL_DISTRIBUTION
+                    if (currentCapital > 0) {
+                        const performancePercent = eventAmount / currentCapital;
+                        currentIndexValue = currentIndexValue * (1 + performancePercent);
+                    }
+                    currentCapital += eventAmount;
                 }
-                currentCapital += eventAmount;
             }
             
-            await saveIndexPoint(client, eventDate.toDate(), currentIndexValue);
+            await saveDailySnapshot(client, currentDay, currentCapital, currentIndexValue, priceHistories);
         }
 
         await client.query('COMMIT');
-        console.log(`\n--- ✅ FINAL Reconstruction Complete! Final Index: ${currentIndexValue.toFixed(2)} ---`);
+        console.log(`\n--- ✅ DEFINITIVE Reconstruction Complete! ---`);
 
     } catch (error) {
         await client.query('ROLLBACK');
@@ -78,14 +78,40 @@ const runReconstruction = async () => {
     }
 };
 
-async function saveIndexPoint(client, date, indexValue) {
+async function saveDailySnapshot(client, date, nav, indexValue, priceHistories) {
     const recordDate = moment.utc(date).startOf('day').toDate();
+    
+    // THE FIX: Build a complete price snapshot for every day
+    const priceSnapshot = {};
+    for (const asset of ASSETS_TO_TRACK) {
+        const priceData = findPriceForDate(priceHistories[asset.symbol], date);
+        if (priceData) {
+            priceSnapshot[asset.address] = priceData.price;
+        }
+    }
+
     await client.query(
-        `INSERT INTO vault_performance_index (vault_id, record_date, index_value) 
-         VALUES ($1, $2, $3)
-         ON CONFLICT (vault_id, record_date) DO UPDATE SET index_value = EXCLUDED.index_value`,
+        `INSERT INTO vault_performance_history (vault_id, record_date, total_value_locked, asset_prices_snapshot) VALUES ($1, $2, $3, $4) ON CONFLICT (vault_id, record_date) DO UPDATE SET total_value_locked = EXCLUDED.total_value_locked, asset_prices_snapshot = EXCLUDED.asset_prices_snapshot`,
+        [VAULT_ID, recordDate, nav, priceSnapshot]
+    );
+    await client.query(
+        `INSERT INTO vault_performance_index (vault_id, record_date, index_value) VALUES ($1, $2, $3) ON CONFLICT (vault_id, record_date) DO UPDATE SET index_value = EXCLUDED.index_value`,
         [VAULT_ID, recordDate, indexValue]
     );
+}
+
+function findPriceForDate(priceHistory, targetDate) {
+    if (!priceHistory || priceHistory.length === 0) return null;
+    const targetTimestamp = targetDate.endOf('day').valueOf();
+    let closest = null;
+    for (const point of priceHistory) {
+        if (point.timestamp <= targetTimestamp) {
+            closest = point;
+        } else {
+            break;
+        }
+    }
+    return closest;
 }
 
 module.exports = { runReconstruction };
