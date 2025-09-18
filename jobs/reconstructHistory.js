@@ -1,117 +1,89 @@
 // /jobs/reconstructHistory.js
 
 const pool = require('../db');
-const { CoinGeckoClient } = require('coingecko-api-v3');
 const moment = require('moment');
 
-const cgClient = new CoinGeckoClient({ timeout: 15000, autoRetry: true });
-
 // ==============================================================================
-// --- CONFIGURATION: EDIT THESE VALUES BEFORE RUNNING ---
+// --- CONFIGURATION: EDIT THIS VALUE BEFORE RUNNING ---
 // ==============================================================================
 const VAULT_ID = 1;
-const START_DATE = '2025-08-15'; // Set this to the date of the very first deposit or trade.
 const BASE_INDEX_VALUE = 1000.0;
-// Define the assets that were part of the vault's history.
-const ASSETS_TO_TRACK = [
-    { symbol: 'BTC', coingeckoId: 'bitcoin' },
-    { symbol: 'ETH', coingeckoId: 'ethereum' },
-    { symbol: 'SOL', coingeckoId: 'solana' },
-];
 // ==============================================================================
 
-
 const runReconstruction = async () => {
-    console.log(`--- 🛠️ Starting Historical Reconstruction for Vault #${VAULT_ID} ---`);
+    console.log(`--- 🛠️ Starting TRUE Historical Reconstruction for Vault #${VAULT_ID} ---`);
     const client = await pool.connect();
 
     try {
-        // --- STEP 1: GATHER ALL RAW DATA ---
-        console.log('Step 1: Gathering all necessary data...');
-
-        // Get the total principal deposited BEFORE our simulation starts.
-        const initialCapitalResult = await client.query(
-            `SELECT COALESCE(SUM(amount), 0) as total FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT' AND created_at < $2`,
-            [VAULT_ID, START_DATE]
-        );
-        const initialCapital = parseFloat(initialCapitalResult.rows[0].total);
-        console.log(`- Initial Capital before ${START_DATE}: $${initialCapital.toFixed(2)}`);
-
-        // Get EVERY trade, open or closed, for the vault.
-        const allTradesResult = await client.query('SELECT * FROM vault_trades WHERE vault_id = $1 ORDER BY trade_opened_at ASC', [VAULT_ID]);
-        const allTrades = allTradesResult.rows;
-        console.log(`- Found ${allTrades.length} total trades to process.`);
-
-        // Get the complete daily price history for all assets from CoinGecko.
-        const priceHistories = {};
-        await Promise.all(ASSETS_TO_TRACK.map(async (asset) => {
-            const response = await cgClient.coinIdMarketChartRange({
-                id: asset.coingeckoId,
-                vs_currency: 'usd',
-                from: moment(START_DATE).unix(),
-                to: moment().unix(),
-            });
-            priceHistories[asset.symbol] = response.prices.map(([timestamp, price]) => ({ timestamp, price }));
-            console.log(`- Fetched ${priceHistories[asset.symbol].length} daily price points for ${asset.symbol}.`);
-        }));
-
-        // --- STEP 2: RUN THE DAY-BY-DAY SIMULATION ---
-        console.log('\nStep 2: Starting day-by-day historical simulation...');
         await client.query('BEGIN'); // Start a single large transaction.
 
-        const daysToSimulate = moment().diff(moment(START_DATE), 'days');
-        for (let i = 0; i <= daysToSimulate; i++) {
-            const currentDay = moment.utc(START_DATE).add(i, 'days');
+        // --- Step 1: Gather All Financial "Events" ---
+        console.log('Step 1: Gathering all historical financial events...');
+        
+        // Get all deposits and withdrawals to track capital changes
+        const capitalEventsResult = await client.query(
+            `SELECT created_at as event_date, amount, entry_type as event_type FROM vault_ledger_entries 
+             WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')
+             ORDER BY created_at ASC`,
+            [VAULT_ID]
+        );
+        console.log(`- Found ${capitalEventsResult.rows.length} capital events (deposits/withdrawals).`);
 
-            // Find all trades that were closed on or before this day.
-            const realizedTrades = allTrades.filter(t => t.status === 'CLOSED' && moment(t.trade_closed_at).isSameOrBefore(currentDay, 'day'));
-            const realizedPnl = realizedTrades.reduce((sum, trade) => sum + parseFloat(trade.pnl_usd), 0);
+        // Get all closed trades to track realized P&L
+        const tradeEventsResult = await client.query(
+            `SELECT trade_closed_at as event_date, pnl_usd as amount, 'REALIZED_PNL' as event_type FROM vault_trades 
+             WHERE vault_id = $1 AND status = 'CLOSED' AND pnl_usd IS NOT NULL
+             ORDER BY trade_closed_at ASC`,
+            [VAULT_ID]
+        );
+        console.log(`- Found ${tradeEventsResult.rows.length} realized P&L events (closed trades).`);
+        
+        // Combine all events into a single timeline and sort chronologically
+        const timeline = [...capitalEventsResult.rows, ...tradeEventsResult.rows]
+            .sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
 
-            // Find all trades that were open at any point during this day.
-            const openOnThisDayTrades = allTrades.filter(t => 
-                moment(t.trade_opened_at).isSameOrBefore(currentDay, 'day') &&
-                (t.status === 'OPEN' || moment(t.trade_closed_at).isAfter(currentDay, 'day'))
-            );
+        if (timeline.length === 0) {
+            throw new Error('No historical events found for this vault. Cannot run reconstruction.');
+        }
 
-            let unrealizedPnl = 0;
-            const priceSnapshot = {};
-            for (const trade of openOnThisDayTrades) {
-                const priceHistory = priceHistories[trade.asset_symbol];
-                const historicalPriceData = findPriceForDate(priceHistory, currentDay);
-                if (historicalPriceData) {
-                    const historicalPrice = historicalPriceData.price;
-                    priceSnapshot[trade.asset_symbol] = historicalPrice; // For our history table
-                    
-                    const entryPrice = parseFloat(trade.entry_price);
-                    const quantity = parseFloat(trade.quantity);
-                    unrealizedPnl += (trade.direction === 'LONG')
-                        ? (historicalPrice - entryPrice) * quantity
-                        : (entryPrice - historicalPrice) * quantity;
+        // --- Step 2: Process the Event Timeline ---
+        console.log('\nStep 2: Processing event timeline to calculate historical performance...');
+        let currentCapital = 0;
+        let currentIndexValue = BASE_INDEX_VALUE;
+        let lastDate = moment(timeline[0].event_date).subtract(1, 'day');
+
+        for (const event of timeline) {
+            const eventDate = moment(event.event_date);
+            const eventAmount = parseFloat(event.amount);
+
+            // Fill in any gaps between events with the last known index value
+            const daysSinceLastEvent = eventDate.diff(lastDate, 'days');
+            for (let i = 1; i < daysSinceLastEvent; i++) {
+                const intermediateDate = lastDate.clone().add(i, 'days');
+                await saveIndexPoint(client, intermediateDate.toDate(), currentIndexValue);
+            }
+
+            if (event.event_type === 'DEPOSIT') {
+                currentCapital += eventAmount;
+                console.log(`- ${eventDate.format('YYYY-MM-DD')}: Deposit of $${eventAmount.toFixed(2)}. Capital is now $${currentCapital.toFixed(2)}.`);
+            } else if (event.event_type === 'WITHDRAWAL_REQUEST') {
+                currentCapital += eventAmount; // Amount is negative, so this subtracts
+                console.log(`- ${eventDate.format('YYYY-MM-DD')}: Withdrawal of $${eventAmount.toFixed(2)}. Capital is now $${currentCapital.toFixed(2)}.`);
+            } else if (event.event_type === 'REALIZED_PNL') {
+                if (currentCapital > 0) {
+                    const performancePercent = eventAmount / currentCapital;
+                    currentIndexValue = currentIndexValue * (1 + performancePercent);
+                    console.log(`- ${eventDate.format('YYYY-MM-DD')}: Realized P&L of $${eventAmount.toFixed(2)} on capital of $${currentCapital.toFixed(2)}. Performance: ${(performancePercent * 100).toFixed(4)}%. New Index: ${currentIndexValue.toFixed(2)}.`);
+                    currentCapital += eventAmount; // P&L also increases the capital base
                 }
             }
             
-            // Calculate the total value and the performance index for this day.
-            const currentNav = initialCapital + realizedPnl + unrealizedPnl;
-            const performanceIndex = (initialCapital > 0) ? BASE_INDEX_VALUE * (currentNav / initialCapital) : BASE_INDEX_VALUE;
-
-            // --- STEP 3: SAVE THE CALCULATED DATA FOR THIS DAY ---
-            await client.query(
-                `INSERT INTO vault_performance_history (vault_id, record_date, total_value_locked, asset_prices_snapshot) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-                [VAULT_ID, currentDay.toDate(), currentNav, priceSnapshot]
-            );
-            await client.query(
-                `INSERT INTO vault_performance_index (vault_id, record_date, index_value) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-                [VAULT_ID, currentDay.toDate(), performanceIndex]
-            );
-
-            if (i % 30 === 0) { // Log progress
-                console.log(`- Simulated up to ${currentDay.format('YYYY-MM-DD')}. NAV: $${currentNav.toFixed(2)}, Index: ${performanceIndex.toFixed(2)}`);
-            }
+            await saveIndexPoint(client, eventDate.toDate(), currentIndexValue);
+            lastDate = eventDate;
         }
 
-        await client.query('COMMIT'); // Commit all the daily records at once.
-        console.log(`\n--- ✅ Reconstruction Complete! ---`);
-        console.log(`Successfully simulated and stored ${daysToSimulate + 1} days of history.`);
+        await client.query('COMMIT');
+        console.log(`\n--- ✅ Reconstruction Complete! Processed ${timeline.length} events. ---`);
 
     } catch (error) {
         await client.query('ROLLBACK');
@@ -121,20 +93,15 @@ const runReconstruction = async () => {
     }
 };
 
-// Helper function to find the closest price for a given day from the historical data.
-function findPriceForDate(priceHistory, targetDate) {
-    if (!priceHistory || priceHistory.length === 0) return null;
-    // We want the price at the END of the target day for our calculation.
-    const targetTimestamp = targetDate.endOf('day').valueOf();
-    let closest = null;
-    for (const point of priceHistory) {
-        if (point.timestamp <= targetTimestamp) {
-            closest = point;
-        } else {
-            break; // Stop once we pass the target date
-        }
-    }
-    return closest;
+async function saveIndexPoint(client, date, indexValue) {
+    // We only save one point per day for the historical chart.
+    const recordDate = moment.utc(date).startOf('day').toDate();
+    await client.query(
+        `INSERT INTO vault_performance_index (vault_id, record_date, index_value) 
+         VALUES ($1, $2, $3)
+         ON CONFLICT (vault_id, record_date) DO UPDATE SET index_value = EXCLUDED.index_value`,
+        [VAULT_ID, recordDate, indexValue]
+    );
 }
 
 module.exports = { runReconstruction };
