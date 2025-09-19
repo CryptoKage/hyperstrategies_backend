@@ -21,7 +21,6 @@ const runReconstruction = async () => {
     try {
         await client.query('BEGIN');
 
-        // Step 1: Gather all data sources
         const capitalEvents = (await client.query(`SELECT created_at as event_date, amount, entry_type as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')`, [VAULT_ID])).rows;
         const pnlEvents = (await client.query(`SELECT created_at as event_date, SUM(amount) as amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'PNL_DISTRIBUTION' GROUP BY created_at`, [VAULT_ID])).rows;
         const timeline = [...capitalEvents, ...pnlEvents].sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
@@ -34,15 +33,11 @@ const runReconstruction = async () => {
         await Promise.all(ASSETS_TO_TRACK.map(async (asset) => {
             const response = await cgClient.coinIdMarketChartRange({ id: asset.coingeckoId, vs_currency: 'usd', from: startDate.unix(), to: moment().unix() });
             priceHistories[asset.symbol] = response.prices.map(([timestamp, price]) => ({ timestamp, price }));
-            console.log(`- Fetched ${priceHistories[asset.symbol].length} daily price points for ${asset.symbol}.`);
         }));
         
-        // Step 2: Process the timeline day-by-day
-        console.log('\nStep 2: Processing historical timeline day-by-day...');
         let currentCapital = 0;
         let currentIndexValue = BASE_INDEX_VALUE;
 
-        // Save the starting point
         await saveDailySnapshot(client, startDate.clone().subtract(1, 'day'), currentCapital, currentIndexValue, priceHistories);
 
         const daysToSimulate = moment().diff(startDate, 'days');
@@ -55,15 +50,13 @@ const runReconstruction = async () => {
                 const eventAmount = parseFloat(event.amount);
                 if (event.event_type === 'DEPOSIT' || event.event_type === 'WITHDRAWAL_REQUEST') {
                     currentCapital += eventAmount;
-                } else { // PNL_DISTRIBUTION
+                } else {
                     if (currentCapital > 0) {
-                        const performancePercent = eventAmount / currentCapital;
-                        currentIndexValue = currentIndexValue * (1 + performancePercent);
+                        currentIndexValue *= (1 + (eventAmount / currentCapital));
                     }
                     currentCapital += eventAmount;
                 }
             }
-            
             await saveDailySnapshot(client, currentDay, currentCapital, currentIndexValue, priceHistories);
         }
 
@@ -80,24 +73,15 @@ const runReconstruction = async () => {
 
 async function saveDailySnapshot(client, date, nav, indexValue, priceHistories) {
     const recordDate = moment.utc(date).startOf('day').toDate();
-    
-    // THE FIX: Build a complete price snapshot for every day
     const priceSnapshot = {};
     for (const asset of ASSETS_TO_TRACK) {
         const priceData = findPriceForDate(priceHistories[asset.symbol], date);
         if (priceData) {
-            priceSnapshot[asset.address] = priceData.price;
+            priceSnapshot[asset.address.toLowerCase()] = priceData.price; // THE FIX: Use the correct address
         }
     }
-
-    await client.query(
-        `INSERT INTO vault_performance_history (vault_id, record_date, total_value_locked, asset_prices_snapshot) VALUES ($1, $2, $3, $4) ON CONFLICT (vault_id, record_date) DO UPDATE SET total_value_locked = EXCLUDED.total_value_locked, asset_prices_snapshot = EXCLUDED.asset_prices_snapshot`,
-        [VAULT_ID, recordDate, nav, priceSnapshot]
-    );
-    await client.query(
-        `INSERT INTO vault_performance_index (vault_id, record_date, index_value) VALUES ($1, $2, $3) ON CONFLICT (vault_id, record_date) DO UPDATE SET index_value = EXCLUDED.index_value`,
-        [VAULT_ID, recordDate, indexValue]
-    );
+    await client.query(`INSERT INTO vault_performance_history (vault_id, record_date, total_value_locked, asset_prices_snapshot) VALUES ($1, $2, $3, $4) ON CONFLICT (vault_id, record_date) DO UPDATE SET total_value_locked = EXCLUDED.total_value_locked, asset_prices_snapshot = EXCLUDED.asset_prices_snapshot`, [VAULT_ID, recordDate, nav, priceSnapshot]);
+    await client.query(`INSERT INTO vault_performance_index (vault_id, record_date, index_value) VALUES ($1, $2, $3) ON CONFLICT (vault_id, record_date) DO UPDATE SET index_value = EXCLUDED.index_value`, [VAULT_ID, recordDate, indexValue]);
 }
 
 function findPriceForDate(priceHistory, targetDate) {
@@ -105,11 +89,7 @@ function findPriceForDate(priceHistory, targetDate) {
     const targetTimestamp = targetDate.endOf('day').valueOf();
     let closest = null;
     for (const point of priceHistory) {
-        if (point.timestamp <= targetTimestamp) {
-            closest = point;
-        } else {
-            break;
-        }
+        if (point.timestamp <= targetTimestamp) { closest = point; } else { break; }
     }
     return closest;
 }
