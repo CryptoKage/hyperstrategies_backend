@@ -119,27 +119,28 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
 
         const xpForAmount = investmentAmountBigNum.div(ethers.utils.parseUnits('10', tokenDecimals)).toNumber();
-        
-        // Award the deposit bonus to the current user
-        await awardXp({
-          userId: userId,
-          xpAmount: xpForAmount,
-          type: 'DEPOSIT_BONUS',
-          description: `Earned ${xpForAmount.toFixed(2)} XP for depositing in Vault ${vaultId}.`,
-        }, dbClient);
+    
+    // Award the deposit bonus
+    await awardXp({
+      userId: userId,
+      xpAmount: xpForAmount,
+      type: 'DEPOSIT_BONUS',
+      descriptionKey: 'xp_history.deposit_bonus', // <-- Use a key
+      descriptionVars: { amount: xpForAmount.toFixed(2), vaultId: vaultId } // <-- Pass variables
+    }, dbClient);
 
-        // Check for and award the referral bonus
-        const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
-        if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
-          const referrerId = theUser.referred_by_user_id;
-          await awardXp({
-            userId: referrerId,
-            xpAmount: xpForAmount,
-            type: 'REFERRAL_BONUS',
-            description: `Earned ${xpForAmount.toFixed(2)} XP from your referral (${theUser.username}) making their first deposit.`,
-          }, dbClient);
-        }
-
+    // Check for and award the referral bonus
+    const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
+    if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
+      const referrerId = theUser.referred_by_user_id;
+      await awardXp({
+        userId: referrerId,
+        xpAmount: xpForAmount,
+        type: 'REFERRAL_BONUS',
+        descriptionKey: 'xp_history.referral_bonus', // <-- Use a key
+        descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username } // <-- Pass variables
+      }, dbClient);
+    }
         await dbClient.query('COMMIT');
         res.status(200).json({ message: 'Allocation successful!' });
     } catch (err) {
