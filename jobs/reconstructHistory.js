@@ -21,8 +21,10 @@ const runReconstruction = async () => {
     try {
         await client.query('BEGIN');
 
+        // Step 1: Gather all data sources
         const capitalEvents = (await client.query(`SELECT created_at as event_date, amount, entry_type as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type IN ('DEPOSIT', 'WITHDRAWAL_REQUEST')`, [VAULT_ID])).rows;
         const pnlEvents = (await client.query(`SELECT created_at as event_date, SUM(amount) as amount, 'PNL_DISTRIBUTION' as event_type FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'PNL_DISTRIBUTION' GROUP BY created_at`, [VAULT_ID])).rows;
+        const allTrades = (await client.query('SELECT * FROM vault_trades WHERE vault_id = $1', [VAULT_ID])).rows;
         const timeline = [...capitalEvents, ...pnlEvents].sort((a, b) => moment(a.event_date).valueOf() - moment(b.event_date).valueOf());
         
         if (timeline.length === 0) throw new Error('No historical events found.');
@@ -35,10 +37,11 @@ const runReconstruction = async () => {
             priceHistories[asset.symbol] = response.prices.map(([timestamp, price]) => ({ timestamp, price }));
         }));
         
+        // Step 2: Process the timeline day-by-day until today
+        console.log('\nStep 2: Simulating history day-by-day...');
         let currentCapital = 0;
         let currentIndexValue = BASE_INDEX_VALUE;
-
-        await saveDailySnapshot(client, startDate.clone().subtract(1, 'day'), currentCapital, currentIndexValue, priceHistories);
+        let lastRealizedPnl = 0;
 
         const daysToSimulate = moment().diff(startDate, 'days');
 
@@ -50,14 +53,39 @@ const runReconstruction = async () => {
                 const eventAmount = parseFloat(event.amount);
                 if (event.event_type === 'DEPOSIT' || event.event_type === 'WITHDRAWAL_REQUEST') {
                     currentCapital += eventAmount;
-                } else {
+                } else { // PNL_DISTRIBUTION
                     if (currentCapital > 0) {
-                        currentIndexValue *= (1 + (eventAmount / currentCapital));
+                        const performancePercent = eventAmount / currentCapital;
+                        currentIndexValue *= (1 + performancePercent);
                     }
                     currentCapital += eventAmount;
                 }
             }
-            await saveDailySnapshot(client, currentDay, currentCapital, currentIndexValue, priceHistories);
+
+            // --- THE FIX: Bridge the gap with UNREALIZED P&L ---
+            const openOnThisDayTrades = allTrades.filter(t => moment(t.trade_opened_at).isSameOrBefore(currentDay, 'day') && t.status === 'OPEN');
+            let unrealizedPnlForDay = 0;
+            for (const trade of openOnThisDayTrades) {
+                const priceHistory = priceHistories[trade.asset_symbol.replace('W','')]; // Handle WBTC/WETH
+                const priceData = findPriceForDate(priceHistory, currentDay);
+                if (priceData) {
+                    const historicalPrice = priceData.price;
+                    const entryPrice = parseFloat(trade.entry_price);
+                    const quantity = parseFloat(trade.quantity);
+                    unrealizedPnlForDay += (trade.direction === 'LONG') ? (historicalPrice - entryPrice) * quantity : (entryPrice - historicalPrice) * quantity;
+                }
+            }
+
+            // We need the NAV from the last REALIZED state to calculate the performance of unrealized changes
+            const realizedCapital = currentCapital - lastRealizedPnl;
+            const lastNav = realizedCapital + lastRealizedPnl;
+            const currentNav = realizedCapital + lastRealizedPnl + unrealizedPnlForDay;
+            
+            const dailyPerformance = (lastNav > 0) ? (currentNav / lastNav) - 1 : 0;
+            const finalIndexForDay = currentIndexValue * (1 + dailyPerformance);
+
+            // Save the complete snapshot for this day
+            await saveDailySnapshot(client, currentDay, currentNav, finalIndexForDay, priceHistories);
         }
 
         await client.query('COMMIT');
