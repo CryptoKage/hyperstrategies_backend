@@ -9,45 +9,43 @@ const BASE_INDEX_VALUE = 1000.0;
 
 /**
  * @route   GET /api/performance/:vaultId/snapshot
- * @desc    Get a snapshot of the vault's average historical performance.
+ * @desc    Get a snapshot of the vault's average historical performance based on its realized P&L index.
  * @access  Public
  */
 router.get('/:vaultId/snapshot', async (req, res) => {
     const { vaultId } = req.params;
 
     try {
-        // 1. Get the first and last performance index records to find the start date and total performance.
+        // This single, efficient query gets the very first and very last data points for the vault.
         const performanceDataResult = await pool.query(
-            ` (SELECT record_date, index_value FROM vault_performance_index WHERE vault_id = $1 ORDER BY record_date ASC LIMIT 1)
-              UNION ALL
-              (SELECT record_date, index_value FROM vault_performance_index WHERE vault_id = $1 ORDER BY record_date DESC LIMIT 1)`,
+            `
+            (SELECT record_date, index_value FROM vault_performance_index WHERE vault_id = $1 ORDER BY record_date ASC LIMIT 1)
+            UNION ALL
+            (SELECT record_date, index_value FROM vault_performance_index WHERE vault_id = $1 ORDER BY record_date DESC LIMIT 1)
+            `,
             [vaultId]
         );
 
+        // A vault needs at least two distinct data points (a start and an end) to have a performance history.
         if (performanceDataResult.rows.length < 2) {
-            // Not enough data to calculate performance
-            return res.json({
-                daily: 0,
-                weekly: 0,
-                monthly: 0,
-                total: 0
-            });
+            return res.json({ daily: 0, weekly: 0, monthly: 0, total: 0 });
         }
 
         const firstRecord = performanceDataResult.rows[0];
         const lastRecord = performanceDataResult.rows[1];
 
         const startDate = moment(firstRecord.record_date);
-        const endDate = moment(lastRecord.record_date);
         const lastIndexValue = parseFloat(lastRecord.index_value);
 
-        // 2. Calculate the total performance and duration.
+        // 1. Calculate the total overall performance percentage.
         const totalPerformancePercent = (lastIndexValue / BASE_INDEX_VALUE - 1) * 100;
-        const totalDaysActive = endDate.diff(startDate, 'days');
+        
+        // 2. Calculate the number of days the vault has been active.
+        const totalDaysActive = moment().diff(startDate, 'days');
 
         if (totalDaysActive <= 0) {
-            // Avoid division by zero if all events are on the same day.
-            return res.json({ daily: 0, weekly: 0, monthly: 0, total: totalPerformancePercent });
+            // Avoid division by zero if the vault is less than a day old.
+            return res.json({ daily: 0, weekly: 0, monthly: 0, total: parseFloat(totalPerformancePercent.toFixed(2)) });
         }
 
         // 3. Calculate the average daily return.
@@ -55,7 +53,7 @@ router.get('/:vaultId/snapshot', async (req, res) => {
 
         // 4. Extrapolate to weekly and monthly averages.
         const averageWeeklyReturn = averageDailyReturn * 7;
-        const averageMonthlyReturn = averageDailyReturn * 30.4375; // Average days in a month
+        const averageMonthlyReturn = averageDailyReturn * 30.4375; // Average days in a month.
 
         res.json({
             daily: parseFloat(averageDailyReturn.toFixed(4)),
