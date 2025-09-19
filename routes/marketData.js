@@ -3,7 +3,6 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
-const moment = require('moment');
 
 const KNOWN_ASSETS_TO_TRACK = ['BTC', 'ETH', 'SOL'];
 const KNOWN_ADDRESSES = {
@@ -49,40 +48,52 @@ router.get('/:vaultId', async (req, res) => {
       value: ((parseFloat(point.index_value) / baseIndexValue) - 1) * 100,
     }));
 
-    // --- Process Asset Performance ---
+    // =========================================================================
+    // --- YOUR NEW, SUPERIOR LOGIC FOR ASSET PERFORMANCE ---
+    // =========================================================================
     const assetPerformance = {};
     if (assetHistory.length > 0) {
-        const basePrices = {};
-        const firstValidSnapshot = assetHistory.find(p => p.asset_prices_snapshot);
+      for (const symbol of KNOWN_ASSETS_TO_TRACK) {
+        const address = SYMBOL_TO_ADDRESS[symbol];
+        let basePrice = null;
+        assetPerformance[symbol] = [];
 
-        if(firstValidSnapshot) {
-            for (const symbol of KNOWN_ASSETS_TO_TRACK) {
-                const address = SYMBOL_TO_ADDRESS[symbol];
-                if (firstValidSnapshot.asset_prices_snapshot[address]) {
-                    basePrices[symbol] = parseFloat(firstValidSnapshot.asset_prices_snapshot[address]);
-                }
-            }
+        for (const point of assetHistory) {
+          if (!point.asset_prices_snapshot) {
+            continue;
+          }
+          
+          // Ensure snapshot is a valid object
+          const snapshot = typeof point.asset_prices_snapshot === 'string'
+              ? JSON.parse(point.asset_prices_snapshot)
+              : point.asset_prices_snapshot;
+
+          if (!snapshot || snapshot[address] === undefined || snapshot[address] === null) {
+            continue;
+          }
+
+          const currentPrice = parseFloat(snapshot[address]);
+          if (Number.isNaN(currentPrice)) {
+            continue;
+          }
+
+          // Dynamically set the baseline for this asset
+          if (basePrice === null && currentPrice > 0) {
+            basePrice = currentPrice;
+          }
+
+          if (basePrice && basePrice > 0) {
+            assetPerformance[symbol].push({
+              date: point.record_date,
+              value: ((currentPrice / basePrice) - 1) * 100,
+            });
+          }
         }
-        
-        for (const symbol of KNOWN_ASSETS_TO_TRACK) {
-            assetPerformance[symbol] = [];
-            const basePrice = basePrices[symbol];
-            if (basePrice > 0) {
-                assetHistory.forEach(point => {
-                    if (point.asset_prices_snapshot) {
-                        const address = SYMBOL_TO_ADDRESS[symbol];
-                        const currentPrice = parseFloat(point.asset_prices_snapshot[address]);
-                        if (!isNaN(currentPrice)) {
-                            assetPerformance[symbol].push({
-                                date: point.record_date,
-                                value: ((currentPrice / basePrice) - 1) * 100,
-                            });
-                        }
-                    }
-                });
-            }
-        }
+      }
     }
+    // =========================================================================
+    // --- END OF YOUR NEW LOGIC ---
+    // =========================================================================
     
     res.json({
       vaultPerformance,
