@@ -17,7 +17,7 @@ router.get('/:vaultId', async (req, res) => {
   const days = parseInt(req.query.days, 10) || 365;
 
   try {
-    const [indexHistoryResult, assetHistoryResult] = await Promise.all([
+  const [indexHistoryResult, assetHistoryResult] = await Promise.all([
       pool.query(
         `SELECT record_date, index_value
          FROM vault_performance_index 
@@ -33,6 +33,7 @@ router.get('/:vaultId', async (req, res) => {
         [vaultId]
       )
     ]);
+
 
     if (indexHistoryResult.rows.length < 2) {
       return res.json({ vaultPerformance: [], assetPerformance: {} });
