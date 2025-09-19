@@ -6,20 +6,14 @@ const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const { getPrices } = require('../utils/priceOracle');
 
-// This endpoint is now admin-aware.
 router.get('/:vaultId', authenticateToken, async (req, res) => {
   const { vaultId } = req.params;
   
-  // --- ADMIN VIEW AS LOGIC ---
-  // Default to the authenticated user's ID.
-  let targetUserId = req.user.id; 
-  // If the requester is an admin AND they provide a userId query parameter,
-  // we override the targetUserId to "view as" that user.
+  let targetUserId = req.user.id;
   if (req.user.isAdmin && req.query.userId) {
     targetUserId = req.query.userId;
     console.log(`[Admin View] Admin ${req.user.id} is viewing vault ${vaultId} as user ${targetUserId}`);
   }
-  // --- END OF LOGIC ---
 
   const client = await pool.connect();
 
@@ -28,7 +22,6 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       vaultInfoResult,
       assetBreakdownResult,
       openTradesResult,
-      // --- THE FIX: Use targetUserId to fetch the correct user's data ---
       userLedgerResult,
       vaultLedgerStatsResult
     ] = await Promise.all([
@@ -38,17 +31,18 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       client.query(`SELECT * FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 ORDER BY created_at ASC`, [targetUserId, vaultId]),
       client.query(`SELECT COALESCE(SUM(amount), 0) as total_principal FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type = 'DEPOSIT'`, [vaultId])
     ]);
-    // --- END OF FIX ---
 
-    // ... (The rest of the file's logic for calculating userPosition, etc., remains exactly the same)
-    if (vaultInfoResult.rows.length === 0) { /* ... error handling ... */ }
+    if (vaultInfoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Vault not found' });
+    }
     const vaultInfo = vaultInfoResult.rows[0];
     const vaultAssets = assetBreakdownResult.rows;
     const openTrades = openTradesResult.rows;
     const userLedgerEntries = userLedgerResult.rows;
     const vaultTotalPrincipal = parseFloat(vaultLedgerStatsResult.rows[0].total_principal);
     const priceMap = await getPrices(vaultAssets);
-    const assetBreakdownWithPrices = vaultAssets.map(asset => ({...asset, livePrice: priceMap.get(asset.contract_address.toLowerCase()) || null,}));
+    const assetBreakdownWithPrices = vaultAssets.map(asset => ({...asset, livePrice: priceMap.get(asset.contract_address?.toLowerCase()) || null}));
+    
     let userPosition = null;
     if (userLedgerEntries.length > 0) {
       const userPrincipal = userLedgerEntries.filter(e => e.entry_type === 'DEPOSIT').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
@@ -66,13 +60,50 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       }
       const userOwnershipPct = (vaultTotalPrincipal > 0) ? (userPrincipal / vaultTotalPrincipal) : 0;
       const unrealizedPnl = totalUnrealizedPnl * userOwnershipPct;
-      userPosition = { totalCapital: userPrincipal + realizedPnl + unrealizedPnl, principal: userPrincipal, realizedPnl: realizedPnl, unrealizedPnl: unrealizedPnl, };
+      userPosition = { totalCapital: userPrincipal + realizedPnl + unrealizedPnl, principal: userPrincipal, realizedPnl: realizedPnl, unrealizedPnl: unrealizedPnl };
     }
+
     let runningBalance = 0;
-    const userPerformanceHistory = userLedgerEntries.map(entry => { runningBalance += parseFloat(entry.amount); return { date: entry.created_at, balance: runningBalance, }; });
+    const userPerformanceHistory = userLedgerEntries.map(entry => { runningBalance += parseFloat(entry.amount); return { date: entry.created_at, balance: runningBalance }; });
     const capitalInTransit = userLedgerEntries.filter(e => e.status === 'PENDING_SWEEP').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
     const pendingWithdrawals = userLedgerEntries.filter(e => e.entry_type === 'WITHDRAWAL_REQUEST' && e.status.startsWith('PENDING_')).reduce((sum, entry) => sum + Math.abs(parseFloat(entry.amount)), 0);
-    const responsePayload = { vaultInfo, assetBreakdown: assetBreakdownWithPrices, userPosition, userLedger: userLedgerEntries.reverse(), userPerformanceHistory, vaultStats: { capitalInTransit, pendingWithdrawals, }, };
+
+    // =============================================================
+    // --- FINAL ADDITION: Calculate a projected index value ---
+    // =============================================================
+    let projectedIndexValue = null;
+    // We only calculate a projection if the user has an active position
+    if (userPosition) {
+        const lastIndexResult = await client.query('SELECT index_value FROM vault_performance_index WHERE vault_id = $1 ORDER BY record_date DESC LIMIT 1', [vaultId]);
+
+        if (lastIndexResult.rows.length > 0) {
+            const lastIndex = parseFloat(lastIndexResult.rows[0].index_value);
+            // The capital base for this calculation is the user's total settled capital (before unrealized P&L)
+            const settledCapital = userPosition.principal + userPosition.realizedPnl;
+            if (settledCapital > 0) {
+                // The performance impact is the unrealized P&L relative to their settled capital
+                const unrealizedPerf = userPosition.unrealizedPnl / settledCapital;
+                projectedIndexValue = lastIndex * (1 + unrealizedPerf);
+            } else {
+                // If there's no settled capital, the projection is just the last known index
+                projectedIndexValue = lastIndex;
+            }
+        }
+    }
+    // =============================================================
+    // --- END OF ADDITION ---
+    // =============================================================
+
+    const responsePayload = {
+      vaultInfo,
+      assetBreakdown: assetBreakdownWithPrices,
+      userPosition,
+      userLedger: userLedgerEntries.reverse(),
+      userPerformanceHistory,
+      vaultStats: { capitalInTransit, pendingWithdrawals },
+      projectedIndexValue, // Add the new value to the payload
+    };
+    
     res.json(responsePayload);
 
   } catch (error) {
