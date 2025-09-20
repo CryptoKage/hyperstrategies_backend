@@ -7,19 +7,17 @@ const { blockEmitter } = require('../utils/alchemyWebsocketProvider');
 
 const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
-// Helper function for the retry mechanism
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function scanBlockForDeposits(blockNumber, retries = 3) {
     const hexBlockNumber = `0x${blockNumber.toString(16)}`;
-    const client = await pool.connect();
+    let client; // Define client in the outer scope
     
     try {
-        // Your efficient user address mapping (this is good, we keep it)
+        client = await pool.connect(); // Assign the connection to the client
         const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
-        if (users.length === 0) {
-            return; // No users to check for, exit early
-        }
+        if (users.length === 0) return;
+        
         const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
         const transfers = await alchemy.core.getAssetTransfers({
@@ -50,22 +48,20 @@ async function scanBlockForDeposits(blockNumber, retries = 3) {
             }
         }
     } catch (error) {
-        // --- THIS IS THE NEW, RESILIENT ERROR HANDLING ---
         const isPastHeadError = error.code === 'SERVER_ERROR' && error.message && error.message.includes('toBlock is past head');
         if (isPastHeadError && retries > 0) {
             console.warn(`[Deposits] Block #${blockNumber} not yet available on node. Retrying in 2 seconds... (${retries} retries left)`);
             await sleep(2000);
-            if (client) client.release(); // Release the current connection before retrying
-            await scanBlockForDeposits(blockNumber, retries - 1); // Retry the function
-            return; // Exit here to prevent the finally block from running twice
+            // We don't release the client here, we let the recursive call handle its own connection.
+            // But we must exit the current function's execution path.
+            await scanBlockForDeposits(blockNumber, retries - 1);
+            return; // --- THE FIX: Exit immediately after the retry to prevent double release ---
         } else {
             console.error(`❌ Major error in scanBlockForDeposits for block #${blockNumber}:`, error.message);
         }
-        // --- END OF NEW LOGIC ---
     } finally {
-        // This ensures the client is always released if it hasn't been already.
-        if (client && !client.released) {
-            client.release();
+        if (client) {
+            client.release(); // This will now only be called once per successful connection.
         }
     }
 }
@@ -74,8 +70,10 @@ let isSubscribed = false;
 function subscribeToNewBlocks() {
   if (isSubscribed) return;
   blockEmitter.on('newBlock', (blockNumber) => {
-    // We don't use await here, let it run in the background
-    scanBlockForDeposits(blockNumber);
+    scanBlockForDeposits(blockNumber).catch(err => {
+        // Add a top-level catch here to ensure an unhandled error in the async chain doesn't crash the server
+        console.error(`[CRITICAL] Unhandled error in scanBlockForDeposits event chain for block #${blockNumber}:`, err);
+    });
   });
   isSubscribed = true;
   console.log('👂 Deposit scanner is now subscribed to new block events.');
