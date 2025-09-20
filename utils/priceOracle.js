@@ -3,78 +3,71 @@
 const fetch = require('node-fetch');
 
 const HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info";
-// Note: The free CoinGecko API has rate limits. For production, consider a paid plan if usage is high.
 const COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/token_price/ethereum?contract_addresses=";
 
-/**
- * Fetches live prices for a list of vault assets from multiple sources.
- * @param {Array<Object>} assets - An array of asset objects from the vault_assets table.
- *                                 Each object must have { symbol, contract_address, coingecko_id }.
- * @returns {Promise<Map<string, number>>} A promise that resolves to a map of lowercase contract_address -> price.
- */
+// --- THE CACHING LOGIC ---
+let priceCache = new Map();
+let lastCacheTime = 0;
+const CACHE_DURATION_MS = 3 * 60 * 1000; // 3 minutes
+// --- END OF CACHING LOGIC ---
+
 async function getPrices(assets) {
-  const priceMap = new Map();
+    const now = Date.now();
 
-  // Always price USDC at $1.0
-  const usdcAddress = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
-  priceMap.set(usdcAddress, 1.0);
-
-  const assetsToFetch = assets.filter(a => a.contract_address.toLowerCase() !== usdcAddress);
-  if (assetsToFetch.length === 0) {
-    return priceMap;
-  }
-
-  // --- 1. Primary Source: Hyperliquid ---
-  const symbolsToFetchHyperliquid = assetsToFetch.map(a => a.symbol.toUpperCase());
-  console.log(`[PriceOracle] Attempting to fetch ${symbolsToFetchHyperliquid.length} prices from Hyperliquid...`);
-  try {
-    const response = await fetch(HYPERLIQUID_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: "allMids" }),
-    });
-    if (response.ok) {
-      const mids = await response.json();
-      for (const asset of assetsToFetch) {
-        const priceStr = mids[asset.symbol.toUpperCase()];
-        if (priceStr) {
-          priceMap.set(asset.contract_address.toLowerCase(), parseFloat(priceStr));
-        }
-      }
+    // --- THE FIX: Check the cache first ---
+    if (now - lastCacheTime < CACHE_DURATION_MS && priceCache.size > 0) {
+        console.log('[PriceOracle] Returning fast, cached prices.');
+        return priceCache;
     }
-  } catch (err) {
-    console.warn('[PriceOracle] Hyperliquid API fetch failed:', err.message);
-  }
+    // --- END OF FIX ---
 
-  // --- 2. Fallback Source: CoinGecko ---
-  const assetsMissingPrice = assetsToFetch.filter(a => !priceMap.has(a.contract_address.toLowerCase()));
-  if (assetsMissingPrice.length > 0) {
-    const coingeckoContracts = assetsMissingPrice
-      .filter(a => a.coingecko_id) // Only fetch those with a coingecko_id
-      .map(a => a.contract_address)
-      .join(',');
+    console.log('[PriceOracle] Cache is stale or empty. Fetching fresh prices...');
+    const newPriceMap = new Map();
+    newPriceMap.set('0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', 1.0); // USDC
 
-    if (coingeckoContracts) {
-      console.log(`[PriceOracle] Attempting to fetch ${assetsMissingPrice.length} missing prices from CoinGecko...`);
-      try {
-        const response = await fetch(`${COINGECKO_API_URL}${coingeckoContracts}&vs_currencies=usd`);
+    const assetsToFetch = assets.filter(a => a.contract_address?.toLowerCase() !== '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48');
+
+    // 1. Primary Source: Hyperliquid
+    try {
+        const response = await fetch(HYPERLIQUID_API_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: "allMids" }) });
         if (response.ok) {
-          const cgPrices = await response.json();
-          for (const asset of assetsMissingPrice) {
-            const priceData = cgPrices[asset.contract_address.toLowerCase()];
-            if (priceData && priceData.usd) {
-              priceMap.set(asset.contract_address.toLowerCase(), priceData.usd);
+            const mids = await response.json();
+            for (const asset of assetsToFetch) {
+                if (asset.contract_address) {
+                    const priceStr = mids[asset.symbol.toUpperCase()];
+                    if (priceStr) {
+                        newPriceMap.set(asset.contract_address.toLowerCase(), parseFloat(priceStr));
+                    }
+                }
             }
-          }
         }
-      } catch (err) {
-        console.warn('[PriceOracle] CoinGecko API fetch failed:', err.message);
-      }
-    }
-  }
+    } catch (err) { console.warn('[PriceOracle] Hyperliquid fetch failed:', err.message); }
 
-  console.log(`[PriceOracle] Final resolved prices:`, Object.fromEntries(priceMap));
-  return priceMap;
+    // 2. Fallback Source: CoinGecko
+    const assetsMissingPrice = assetsToFetch.filter(a => a.contract_address && !newPriceMap.has(a.contract_address.toLowerCase()));
+    if (assetsMissingPrice.length > 0) {
+        const coingeckoContracts = assetsMissingPrice.map(a => a.contract_address).join(',');
+        try {
+            const response = await fetch(`${COINGECKO_API_URL}${coingeckoContracts}&vs_currencies=usd`);
+            if (response.ok) {
+                const cgPrices = await response.json();
+                for (const asset of assetsMissingPrice) {
+                    const priceData = cgPrices[asset.contract_address.toLowerCase()];
+                    if (priceData && priceData.usd) {
+                        newPriceMap.set(asset.contract_address.toLowerCase(), priceData.usd);
+                    }
+                }
+            }
+        } catch (err) { console.warn('[PriceOracle] CoinGecko fetch failed:', err.message); }
+    }
+
+    // --- THE FIX: Update the cache ---
+    priceCache = newPriceMap;
+    lastCacheTime = now;
+    // --- END OF FIX ---
+    
+    console.log('[PriceOracle] Fresh prices fetched and cache updated.');
+    return priceCache;
 }
 
 module.exports = { getPrices };
