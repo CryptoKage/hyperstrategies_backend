@@ -29,6 +29,7 @@ const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
 const marketDataRoutes = require('./routes/marketData');
 const performanceRoutes = require('./routes/performance');
+const systemRoutes = require('./routes/system');
 require('./passport-setup');
 
 // --- Job & Utility Imports ---
@@ -97,6 +98,7 @@ app.use('/api/vault-details', vaultDetailsRoutes);
 app.use('/api/pnl', pnlRoutes);
 app.use('/api/market-data', marketDataRoutes);
 app.use('/api/performance', performanceRoutes);
+app.use('/api/system', systemRoutes);
 
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
