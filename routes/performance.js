@@ -27,14 +27,16 @@ router.get('/:vaultId/snapshot', async (req, res) => {
         const lastIndexValue = parseFloat(lastRecord.index_value);
         const totalPerformancePercent = (lastIndexValue / BASE_INDEX_VALUE - 1) * 100;
         
-        // --- THE FIX: Use high-precision hour difference ---
-        const totalHoursActive = moment().diff(startDate, 'hours');
-        const totalDaysActive = totalHoursActive / 24.0;
-        // --- END OF FIX ---
+        // --- THE FIX: Use high-precision minutes and handle the "new vault" case ---
+        const totalMinutesActive = moment().diff(startDate, 'minutes');
+        const totalDaysActive = totalMinutesActive / 1440.0; // 1440 minutes in a day
 
-        if (totalDaysActive <= 0) {
-            return res.json({ daily: 0, weekly: 0, monthly: 0, total: parseFloat(totalPerformancePercent.toFixed(2)) });
+        if (totalDaysActive < 1) {
+            // If the vault is less than a day old, all averages are just the total performance so far.
+            const totalReturn = parseFloat(totalPerformancePercent.toFixed(2));
+            return res.json({ daily: totalReturn, weekly: totalReturn, monthly: totalReturn, total: totalReturn });
         }
+        // --- END OF FIX ---
 
         const averageDailyReturn = totalPerformancePercent / totalDaysActive;
         res.json({
@@ -68,14 +70,15 @@ router.get('/:vaultId/user-snapshot', authenticateToken, async (req, res) => {
         const totalPnl = userHistory.filter(e => e.entry_type.includes('PNL')).reduce((sum, e) => sum + parseFloat(e.amount), 0);
         const totalPerformancePercent = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
         
-        // --- THE FIX: Use high-precision hour difference ---
-        const totalHoursActive = moment().diff(moment(firstDepositDate), 'hours');
-        const totalDaysActive = totalHoursActive / 24.0;
-        // --- END OF FIX ---
-
-        if (totalDaysActive <= 0) {
-            return res.json({ daily: 0, weekly: 0, monthly: 0, total: totalPerformancePercent });
+        // --- THE FIX: Use high-precision minutes and handle the "new user" case ---
+        const totalMinutesActive = moment().diff(moment(firstDepositDate), 'minutes');
+        const totalDaysActive = totalMinutesActive / 1440.0;
+        
+        if (totalDaysActive < 1) {
+            const totalReturn = parseFloat(totalPerformancePercent.toFixed(2));
+            return res.json({ daily: totalReturn, weekly: totalReturn, monthly: totalReturn, total: totalReturn });
         }
+        // --- END OF FIX ---
 
         const averageDailyReturn = totalPerformancePercent / totalDaysActive;
         res.json({
