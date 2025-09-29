@@ -8,7 +8,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 
 const BASE_INDEX_VALUE = 1000.0;
 
-// This route for the VAULT's overall performance is now corrected.
+// This route for the VAULT's overall performance is now definitively correct.
 router.get('/:vaultId/snapshot', async (req, res) => {
     const { vaultId } = req.params;
     try {
@@ -23,20 +23,21 @@ router.get('/:vaultId/snapshot', async (req, res) => {
         }
         const firstRecord = performanceDataResult.rows[0];
         const lastRecord = performanceDataResult.rows[1];
+
         const startDate = moment(firstRecord.record_date);
+        const endDate = moment(lastRecord.record_date); // <-- We use the date of the last record
         const lastIndexValue = parseFloat(lastRecord.index_value);
         const totalPerformancePercent = (lastIndexValue / BASE_INDEX_VALUE - 1) * 100;
         
-        // --- THE FIX: Use high-precision minutes and handle the "new vault" case ---
-        const totalMinutesActive = moment().diff(startDate, 'minutes');
-        const totalDaysActive = totalMinutesActive / 1440.0; // 1440 minutes in a day
-
-        if (totalDaysActive < 1) {
-            // If the vault is less than a day old, all averages are just the total performance so far.
-            const totalReturn = parseFloat(totalPerformancePercent.toFixed(2));
-            return res.json({ daily: totalReturn, weekly: totalReturn, monthly: totalReturn, total: totalReturn });
-        }
+        // --- THE DEFINITIVE FIX: Calculate duration based on the actual data window ---
+        const totalMillisecondsActive = endDate.diff(startDate, 'milliseconds');
+        const totalDaysActive = totalMillisecondsActive / (1000 * 60 * 60 * 24);
         // --- END OF FIX ---
+
+        if (totalDaysActive <= 0) {
+            // This handles cases where all performance happens within a single day.
+            return res.json({ daily: totalPerformancePercent, weekly: totalPerformancePercent, monthly: totalPerformancePercent, total: totalPerformancePercent });
+        }
 
         const averageDailyReturn = totalPerformancePercent / totalDaysActive;
         res.json({
@@ -51,7 +52,7 @@ router.get('/:vaultId/snapshot', async (req, res) => {
     }
 });
 
-// This route for the USER's performance is also now corrected.
+// This route for the USER's performance is also now definitively correct.
 router.get('/:vaultId/user-snapshot', authenticateToken, async (req, res) => {
     const { vaultId } = req.params;
     const { id: userId } = req.user;
@@ -70,15 +71,15 @@ router.get('/:vaultId/user-snapshot', authenticateToken, async (req, res) => {
         const totalPnl = userHistory.filter(e => e.entry_type.includes('PNL')).reduce((sum, e) => sum + parseFloat(e.amount), 0);
         const totalPerformancePercent = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
         
-        // --- THE FIX: Use high-precision minutes and handle the "new user" case ---
-        const totalMinutesActive = moment().diff(moment(firstDepositDate), 'minutes');
-        const totalDaysActive = totalMinutesActive / 1440.0;
-        
-        if (totalDaysActive < 1) {
-            const totalReturn = parseFloat(totalPerformancePercent.toFixed(2));
-            return res.json({ daily: totalReturn, weekly: totalReturn, monthly: totalReturn, total: totalReturn });
-        }
+        // --- THE DEFINITIVE FIX: Calculate duration based on the user's personal activity window ---
+        const lastEventDate = userHistory[userHistory.length - 1].created_at;
+        const totalMillisecondsActive = moment(lastEventDate).diff(moment(firstDepositDate), 'milliseconds');
+        const totalDaysActive = totalMillisecondsActive / (1000 * 60 * 60 * 24);
         // --- END OF FIX ---
+
+        if (totalDaysActive <= 0) {
+            return res.json({ daily: totalPerformancePercent, weekly: totalPerformancePercent, monthly: totalPerformancePercent, total: totalPerformancePercent });
+        }
 
         const averageDailyReturn = totalPerformancePercent / totalDaysActive;
         res.json({
