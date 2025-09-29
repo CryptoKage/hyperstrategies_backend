@@ -8,7 +8,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 
 const BASE_INDEX_VALUE = 1000.0;
 
-// This route for the VAULT's overall performance is correct and unchanged.
+// This route for the VAULT's overall performance is now corrected.
 router.get('/:vaultId/snapshot', async (req, res) => {
     const { vaultId } = req.params;
     try {
@@ -26,12 +26,17 @@ router.get('/:vaultId/snapshot', async (req, res) => {
         const startDate = moment(firstRecord.record_date);
         const lastIndexValue = parseFloat(lastRecord.index_value);
         const totalPerformancePercent = (lastIndexValue / BASE_INDEX_VALUE - 1) * 100;
-        const totalDaysActive = moment().diff(startDate, 'days');
-        if (totalDaysActive <= 0) {
-            return res.json({ daily: totalPerformancePercent, weekly: totalPerformancePercent * 7, monthly: totalPerformancePercent * 30.4, total: totalPerformancePercent });
-        }
-        const averageDailyReturn = totalPerformancePercent / totalDaysActive;
+        
+        // --- THE FIX: Use high-precision hour difference ---
+        const totalHoursActive = moment().diff(startDate, 'hours');
+        const totalDaysActive = totalHoursActive / 24.0;
+        // --- END OF FIX ---
 
+        if (totalDaysActive <= 0) {
+            return res.json({ daily: 0, weekly: 0, monthly: 0, total: parseFloat(totalPerformancePercent.toFixed(2)) });
+        }
+
+        const averageDailyReturn = totalPerformancePercent / totalDaysActive;
         res.json({
             daily: averageDailyReturn,
             weekly: averageDailyReturn * 7,
@@ -44,42 +49,32 @@ router.get('/:vaultId/snapshot', async (req, res) => {
     }
 });
 
-// --- THIS ROUTE CONTAINS THE FINAL FIX ---
+// This route for the USER's performance is also now corrected.
 router.get('/:vaultId/user-snapshot', authenticateToken, async (req, res) => {
     const { vaultId } = req.params;
     const { id: userId } = req.user;
     try {
-        const userLedgerResult = await pool.query(
-            `SELECT amount, entry_type, created_at FROM vault_ledger_entries 
-             WHERE user_id = $1 AND vault_id = $2 
-             ORDER BY created_at ASC`,
-            [userId, vaultId]
-        );
+        const userLedgerResult = await pool.query(`SELECT amount, entry_type, created_at FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 ORDER BY created_at ASC`, [userId, vaultId]);
         const userHistory = userLedgerResult.rows;
         if (userHistory.length === 0) {
             return res.json({ daily: 0, weekly: 0, monthly: 0, total: 0 });
         }
-        
         const firstDepositDate = userHistory.find(e => e.entry_type === 'DEPOSIT')?.created_at;
         if (!firstDepositDate) {
             return res.json({ daily: 0, weekly: 0, monthly: 0, total: 0 });
         }
 
-        const totalPrincipal = userHistory
-            .filter(e => e.entry_type === 'DEPOSIT')
-            .reduce((sum, e) => sum + parseFloat(e.amount), 0);
-
-        // --- THE FIX: Use a flexible filter to include ALL PNL types ---
-        const totalPnl = userHistory
-            .filter(e => e.entry_type.includes('PNL'))
-            .reduce((sum, e) => sum + parseFloat(e.amount), 0);
+        const totalPrincipal = userHistory.filter(e => e.entry_type === 'DEPOSIT').reduce((sum, e) => sum + parseFloat(e.amount), 0);
+        const totalPnl = userHistory.filter(e => e.entry_type.includes('PNL')).reduce((sum, e) => sum + parseFloat(e.amount), 0);
+        const totalPerformancePercent = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
+        
+        // --- THE FIX: Use high-precision hour difference ---
+        const totalHoursActive = moment().diff(moment(firstDepositDate), 'hours');
+        const totalDaysActive = totalHoursActive / 24.0;
         // --- END OF FIX ---
 
-        const totalPerformancePercent = (totalPrincipal > 0) ? (totalPnl / totalPrincipal) * 100 : 0;
-        const totalDaysActive = moment().diff(moment(firstDepositDate), 'days');
-
         if (totalDaysActive <= 0) {
-            return res.json({ daily: 0, weekly: 0, monthly: 0, total: parseFloat(totalPerformancePercent) });
+            return res.json({ daily: 0, weekly: 0, monthly: 0, total: totalPerformancePercent });
         }
 
         const averageDailyReturn = totalPerformancePercent / totalDaysActive;
