@@ -14,7 +14,7 @@ router.use(authenticateToken);
 
 router.get('/callback', async (req, res) => {
   const { code, state } = req.query;
-  const { code_verifier } = req.session; // We will use session storage
+    const code_verifier = req.session.x_code_verifier;
   const { id: userId } = req.user;
 
   // 1. Validate that we received a code and have a verifier
