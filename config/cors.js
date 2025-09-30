@@ -1,7 +1,8 @@
 // /config/cors.js
 
 const allowedOrigins = [
-  process.env.FRONTEND_URL,
+  process.env.FRONTEND_URL, // e.g., https://www.hyper-strategies.com
+  process.env.BACKEND_URL,  // <-- THE DEFINITIVE FIX: Allow the backend to talk to itself
 ];
 
 if (process.env.NODE_ENV !== 'production') {
@@ -10,31 +11,18 @@ if (process.env.NODE_ENV !== 'production') {
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // --- THIS IS THE DEFINITIVE DIAGNOSTIC LOG ---
-    // We will log every single origin that comes into the server.
-    console.log(`[CORS DEBUG] Request received from Origin: ${origin}`);
-    // --- END OF LOG ---
+    // Log for any future debugging
+    console.log(`[CORS DEBUG] Request from Origin: ${origin}`);
 
+    // Allow requests with no origin (server-to-server, mobile apps, etc.)
     if (!origin) {
       return callback(null, true);
     }
 
-    const whitelist = [
-      ...allowedOrigins,
-      new RegExp(`\\.vercel\\.app$`) 
-    ];
-
-    const isAllowed = whitelist.some(allowedOrigin => {
-        if (allowedOrigin instanceof RegExp) {
-            return allowedOrigin.test(origin);
-        }
-        return allowedOrigin === origin;
-    });
-
-    if (isAllowed) {
+    // Check if the origin is in our list or is a Vercel preview URL
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
-      // The error is happening here. The log above will tell us why.
       callback(new Error('The CORS policy for this site does not allow access from the specified Origin.'));
     }
   },
