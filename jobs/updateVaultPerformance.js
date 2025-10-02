@@ -7,7 +7,8 @@ const updateVaultPerformance = async () => {
     console.log('📈 Starting hourly UNREALIZED P&L update job (Final Version)...');
     const client = await pool.connect();
     try {
-        for (const vault of (await client.query("SELECT vault_id FROM vaults WHERE status = 'active'")).rows) {
+        const query = "SELECT vault_id FROM vaults WHERE status = 'active' AND vault_type IN ('DISCRETIONARY', 'RESERVE')";
+for (const vault of (await client.query(query)).rows) {
             const vaultId = vault.vault_id;
             const now = new Date();
             await client.query('BEGIN');

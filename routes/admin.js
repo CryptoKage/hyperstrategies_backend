@@ -1039,4 +1039,102 @@ router.post('/withdrawals/:activityId/finalize', async (req, res) => {
   }
 });
 
+router.get('/transfers/pending', async (req, res) => {
+    try {
+        const { rows: pendingTransfers } = await pool.query(`
+            SELECT 
+                t.transfer_id,
+                t.user_id,
+                u.username,
+                t.from_vault_id,
+                vf.name as from_vault_name,
+                t.to_vault_id,
+                vt.name as to_vault_name,
+                t.amount,
+                t.status,
+                t.requested_at
+            FROM vault_transfers t
+            JOIN users u ON t.user_id = u.user_id
+            JOIN vaults vf ON t.from_vault_id = vf.vault_id
+            JOIN vaults vt ON t.to_vault_id = vt.vault_id
+            WHERE t.status NOT IN ('COMPLETED', 'FAILED')
+            ORDER BY t.requested_at ASC;
+        `);
+        res.status(200).json(pendingTransfers);
+    } catch (error) {
+        console.error('Error fetching pending transfers:', error);
+        res.status(500).json({ error: 'Failed to fetch pending transfers.' });
+    }
+});
+
+
+// --- Endpoint for an admin to process and complete a transfer ---
+router.post('/transfers/:transferId/complete', async (req, res) => {
+    const { transferId } = req.params;
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. Fetch the transfer request and lock the row to prevent race conditions
+        const transferResult = await client.query(
+            "SELECT * FROM vault_transfers WHERE transfer_id = $1 AND status = 'PENDING_UNWIND' FOR UPDATE",
+            [transferId]
+        );
+
+        if (transferResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Pending transfer request not found or it is not in the correct state to be processed.' });
+        }
+        const transfer = transferResult.rows[0];
+        const { user_id, from_vault_id, to_vault_id, amount } = transfer;
+
+        // 2. Find the corresponding 'TRANSFER_FUNDS_HELD' ledger entry
+        const heldFundsResult = await client.query(
+            `SELECT entry_id FROM vault_ledger_entries 
+             WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'TRANSFER_FUNDS_HELD' AND amount = $3`,
+            [user_id, from_vault_id, -amount]
+        );
+
+        if (heldFundsResult.rows.length === 0) {
+            throw new Error(`CRITICAL: Could not find the corresponding 'TRANSFER_FUNDS_HELD' ledger entry for transfer ${transferId}. Manual intervention required.`);
+        }
+        const entryToUpdateId = heldFundsResult.rows[0].entry_id;
+
+        // 3. Perform the final accounting: convert the 'HELD' entry to 'OUT' and create the 'IN' entry
+        
+        // a) Finalize the debit from the source vault
+        await client.query(
+            "UPDATE vault_ledger_entries SET entry_type = 'VAULT_TRANSFER_OUT' WHERE entry_id = $1",
+            [entryToUpdateId]
+        );
+        
+        // b) Create the credit in the destination vault
+        await client.query(
+            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status)
+             VALUES ($1, $2, 'VAULT_TRANSFER_IN', $3, 'ACTIVE')`,
+            [user_id, to_vault_id, amount]
+        );
+        
+        // 4. Mark the transfer request as completed
+        await client.query(
+            "UPDATE vault_transfers SET status = 'COMPLETED', completed_at = NOW() WHERE transfer_id = $1",
+            [transferId]
+        );
+
+        await client.query('COMMIT');
+        
+        // TODO: In the future, trigger a notification to the user that their transfer is complete.
+
+        res.status(200).json({ message: `Transfer ${transferId} has been successfully completed.` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`Error completing transfer ${transferId}:`, err);
+        res.status(500).json({ error: 'An error occurred while completing the transfer.' });
+    } finally {
+        client.release();
+    }
+});
+
 module.exports = router;

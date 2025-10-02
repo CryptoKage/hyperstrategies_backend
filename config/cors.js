@@ -1,37 +1,33 @@
 // /config/cors.js
 
-// This is the definitive list of URLs that are allowed to make requests to your backend.
+// --- 1. Define your core allowed domains in a clear, readable array ---
 const allowedOrigins = [
-  process.env.FRONTEND_URL, // Your main production URL, e.g., https://www.hyper-strategies.com
+  'http://localhost:3000',                  // Development frontend
+  'https://hyper-strategies.com',            // Main production domain (without www)
+  'https://www.hyper-strategies.com',        // Main production domain (with www)
+  'https://app.hyper-strategies.com'         // Future app subdomain
 ];
-
-// In development, we also allow requests from our local React server.
-if (process.env.NODE_ENV !== 'production') {
-  allowedOrigins.push('http://localhost:3000');
-}
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Log for any future debugging.
-    console.log(`[CORS DEBUG] Request from Origin: ${origin}`);
+    // Log for debugging
+    // console.log(`[CORS DEBUG] Request from Origin: ${origin}`);
 
-    // Allow requests with no origin (like server-to-server calls from Twitter or mobile apps).
+    // --- 2. Allow requests with no origin (like server-to-server or mobile apps) ---
     if (!origin) {
       return callback(null, true);
     }
 
-    // --- THIS IS THE DEFINITIVE FIX ---
-    // We check if the incoming origin is in our list of allowed frontend URLs,
-    // OR if it is a Vercel preview deployment.
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.endsWith('.vercel.app')) {
-      callback(null, true); // Allow the request.
+    // --- 3. Check against the explicit whitelist OR the Vercel preview pattern ---
+    // This logic is now cleaner and easier to manage.
+    if (allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+      callback(null, true); // Origin is allowed
     } else {
-      // If the origin is anything else, reject it.
+      // Origin is not in the list, reject it.
       callback(new Error('The CORS policy for this site does not allow access from the specified Origin.'));
     }
-    // --- END OF FIX ---
   },
-  credentials: true,
+  credentials: true, // This allows cookies and authorization headers to be sent
 };
 
 module.exports = { corsOptions };

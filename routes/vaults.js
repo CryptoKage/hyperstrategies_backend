@@ -267,4 +267,87 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
     }
 });
 
+router.post('/request-transfer', authenticateToken, async (req, res) => {
+    const { fromVaultId, toVaultId, amount } = req.body;
+    const userId = req.user.id;
+    const client = await pool.connect();
+
+    try {
+        const transferAmount = parseFloat(amount);
+
+        // --- 1. Validation ---
+        if (!fromVaultId || !toVaultId || !amount) {
+            return res.status(400).json({ error: 'Missing required fields: fromVaultId, toVaultId, amount.' });
+        }
+        if (fromVaultId === toVaultId) {
+            return res.status(400).json({ error: 'Source and destination vaults cannot be the same.' });
+        }
+        if (isNaN(transferAmount) || transferAmount <= 0) {
+            return res.status(400).json({ error: 'A valid, positive transfer amount is required.' });
+        }
+
+        await client.query('BEGIN');
+
+        // --- 2. Check User's Available Capital in Source Vault ---
+        // This is the most critical security check. We sum all ledger entries to get the settled balance.
+        const balanceResult = await client.query(
+            "SELECT COALESCE(SUM(amount), 0) as current_balance FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2", 
+            [userId, fromVaultId]
+        );
+        const currentBalance = parseFloat(balanceResult.rows[0].current_balance);
+
+        if (transferAmount > currentBalance) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Transfer amount exceeds your available capital in this vault.' });
+        }
+
+        // --- 3. Freeze the Funds & Create the Request ---
+        // This is an atomic operation: we debit the source vault and create the transfer record together.
+
+        // a) Create a 'TRANSFER_FUNDS_HELD' entry to immediately debit the source vault's balance.
+        await client.query(
+            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
+             VALUES ($1, $2, 'TRANSFER_FUNDS_HELD', $3, 'ACTIVE')`, // Status is 'ACTIVE' as it's an immediate accounting change
+            [userId, fromVaultId, -transferAmount]
+        );
+        
+        // b) Create the official transfer request record for the admin workflow.
+        const transferResult = await client.query(
+            `INSERT INTO vault_transfers (user_id, from_vault_id, to_vault_id, amount, status) 
+             VALUES ($1, $2, $3, $4, 'PENDING_UNWIND') RETURNING transfer_id`,
+            [userId, fromVaultId, toVaultId, transferAmount]
+        );
+
+        const newTransferId = transferResult.rows[0].transfer_id;
+
+        // --- 4. Log the user activity ---
+        const description = `Requested transfer of ${transferAmount.toFixed(2)} USDC from Vault ${fromVaultId} to Vault ${toVaultId}.`;
+        await client.query(
+           `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) 
+            VALUES ($1, 'VAULT_TRANSFER_REQUEST', $2, $3, 'USDC', 'PENDING')`, 
+           [userId, description, transferAmount]
+        );
+
+        await client.query('COMMIT');
+        
+        // TODO: In the future, trigger an admin notification here (e.g., email or Telegram message).
+
+        res.status(200).json({ 
+            message: 'Transfer request submitted successfully. It may take 3-48 hours to process.',
+            transferId: newTransferId 
+        });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        // Check for the unique constraint violation
+        if (err.code === '23505' && err.constraint === 'uq_one_pending_transfer_per_vault_pair') {
+            return res.status(409).json({ error: 'You already have a pending transfer for this vault. Please wait for it to complete.' });
+        }
+        console.error('Vault transfer request error:', err);
+        res.status(500).json({ error: 'An error occurred during the transfer request.' });
+    } finally {
+        client.release();
+    }
+});
+
 module.exports = router;
