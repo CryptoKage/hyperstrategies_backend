@@ -90,7 +90,7 @@ router.get('/', authenticateToken, async (req, res) => {
     const totalBonusPoints = parseFloat(bonusPointsResult.rows[0].total_bonus_points);
     const totalCapitalInVaults = userPositions.reduce((sum, pos) => sum + pos.tradable_capital, 0);
     const totalUnrealizedPnl = userPositions.reduce((sum, pos) => sum + pos.pnl, 0);
-    
+     const pendingTransfers = pendingTransfersResult.rows;
     const dashboardData = {
       username: userData.username,
       depositAddress: userData.eth_address,
