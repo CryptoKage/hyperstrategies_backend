@@ -1260,4 +1260,47 @@ router.get('/vault-users', async (req, res) => {
     }
 });
 
+router.get('/reports/pending-approval', async (req, res) => {
+    try {
+        const { rows } = await pool.query(`
+            SELECT r.report_id, r.user_id, u.username, r.title, r.report_date
+            FROM user_monthly_reports r
+            JOIN users u ON r.user_id = u.user_id
+            WHERE r.status = 'PENDING_APPROVAL'
+            ORDER BY r.created_at ASC;
+        `);
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error("Error fetching reports pending approval:", error);
+        res.status(500).json({ error: 'Failed to fetch reports for approval.' });
+    }
+});
+
+// --- Endpoint to APPROVE or REJECT a report ---
+router.post('/reports/:reportId/review', async (req, res) => {
+    const { reportId } = req.params;
+    const { newStatus } = req.body; // Expecting 'APPROVED' or 'DRAFT'
+    const adminUserId = req.user.id;
+
+    if (!newStatus || !['APPROVED', 'DRAFT'].includes(newStatus)) {
+        return res.status(400).json({ error: "Invalid status provided. Must be 'APPROVED' or 'DRAFT'." });
+    }
+
+    try {
+        const result = await pool.query(
+            "UPDATE user_monthly_reports SET status = $1, last_updated_by = $2 WHERE report_id = $3 AND status = 'PENDING_APPROVAL' RETURNING report_id",
+            [newStatus, adminUserId, reportId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Report not found or not in a pending state.' });
+        }
+
+        res.status(200).json({ message: `Report has been successfully set to '${newStatus}'.` });
+    } catch (error) {
+        console.error(`Error reviewing report ${reportId}:`, error);
+        res.status(500).json({ error: 'Failed to review report.' });
+    }
+});
+
 module.exports = router;
