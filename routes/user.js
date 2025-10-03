@@ -744,4 +744,47 @@ router.get('/presale-eligibility', authenticateToken, async (req, res) => {
   }
 });
 
+// Add these new routes inside routes/user.js
+
+// --- Endpoint to get a list of a user's PUBLISHED reports ---
+router.get('/reports/available', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const { rows } = await pool.query(
+            `SELECT report_id, title, report_date 
+             FROM user_monthly_reports 
+             WHERE user_id = $1 AND status = 'APPROVED'
+             ORDER BY report_date DESC`,
+            [userId]
+        );
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error(`Error fetching available reports for user ${userId}:`, error);
+        res.status(500).json({ error: 'Failed to fetch available reports.' });
+    }
+});
+
+// --- Endpoint to get the data for a SINGLE report ---
+router.get('/reports/:reportId', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    const { reportId } = req.params;
+    try {
+        const { rows } = await pool.query(
+            `SELECT report_id, title, report_date, report_data 
+             FROM user_monthly_reports 
+             WHERE report_id = $1 AND user_id = $2 AND status = 'APPROVED'`,
+            [reportId, userId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Report not found or you do not have permission to view it.' });
+        }
+
+        res.status(200).json(rows[0]);
+    } catch (error) {
+        console.error(`Error fetching report ${reportId} for user ${userId}:`, error);
+        res.status(500).json({ error: 'Failed to fetch report data.' });
+    }
+});
+
 module.exports = router;

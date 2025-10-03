@@ -1137,4 +1137,127 @@ router.post('/transfers/:transferId/complete', async (req, res) => {
     }
 });
 
+router.get('/reports/draft', async (req, res) => {
+    // Expecting query params like ?userId=...&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+    const { userId, startDate, endDate } = req.query;
+
+    if (!userId || !startDate || !endDate) {
+        return res.status(400).json({ error: 'userId, startDate, and endDate (YYYY-MM-DD) are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        const [
+            userResult, 
+            startingCapitalResult, 
+            periodLedgerResult, 
+            userVaultsResult
+        ] = await Promise.all([
+            // 1. Fetch user details
+            client.query('SELECT username FROM users WHERE user_id = $1', [userId]),
+            
+            // 2. Calculate the starting capital from BEFORE the start date
+            client.query(
+                `SELECT COALESCE(SUM(amount), 0) as starting_capital 
+                 FROM vault_ledger_entries 
+                 WHERE user_id = $1 AND created_at < $2;`, 
+                [userId, startDate]
+            ),
+            
+            // 3. Fetch all ledger entries for the user WITHIN the selected date range
+            client.query(
+                `SELECT entry_id, vault_id, entry_type, amount, fee_amount, created_at 
+                 FROM vault_ledger_entries 
+                 WHERE user_id = $1 AND created_at >= $2 AND created_at < $3 
+                 ORDER BY created_at ASC;`, 
+                [userId, startDate, endDate]
+            ),
+            
+            // 4. Fetch the distinct vaults the user has ever interacted with
+            client.query(
+                `SELECT DISTINCT v.vault_id, v.name as vault_name, v.vault_type 
+                 FROM vaults v 
+                 JOIN vault_ledger_entries vle ON v.vault_id = vle.vault_id 
+                 WHERE vle.user_id = $1;`, 
+                [userId]
+            )
+        ]);
+
+        if (userResult.rows.length === 0) {
+            // Must release client before returning
+            client.release();
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        
+        const draftData = {
+            userInfo: userResult.rows[0],
+            userVaults: userVaultsResult.rows,
+            reportStartDate: startDate,
+            reportEndDate: endDate,
+            startingCapital: parseFloat(startingCapitalResult.rows[0].starting_capital),
+            periodTransactions: periodLedgerResult.rows.map(t => ({
+                ...t,
+                amount: parseFloat(t.amount),
+                fee_amount: parseFloat(t.fee_amount)
+            }))
+        };
+
+        res.status(200).json(draftData);
+
+    } catch (error) {
+        console.error('Error generating report draft:', error);
+        res.status(500).json({ error: 'Failed to generate report draft.' });
+    } finally {
+        // Ensure client is always released
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+router.post('/reports/publish', async (req, res) => {
+    const adminUserId = req.user.id; // From authenticateToken middleware
+    const { userId, month, reportData } = req.body;
+
+    if (!userId || !month || !reportData) {
+        return res.status(400).json({ error: 'userId, month, and reportData are required.' });
+    }
+
+    try {
+        // Use an UPSERT query: It will UPDATE the report if one for that user/month already exists,
+        // or INSERT a new one if it doesn't. This is perfect for saving drafts and publishing.
+        const upsertQuery = `
+            INSERT INTO user_monthly_reports (user_id, month, report_data, last_updated_by)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, month)
+            DO UPDATE SET
+                report_data = EXCLUDED.report_data,
+                last_updated_by = EXCLUDED.last_updated_by;
+        `;
+
+        await pool.query(upsertQuery, [userId, month, reportData, adminUserId]);
+
+        res.status(200).json({ message: 'Report has been successfully saved and published.' });
+
+    } catch (error) {
+        console.error('Error publishing report:', error);
+        res.status(500).json({ error: 'Failed to publish report.' });
+    }
+});
+
+router.get('/vault-users', async (req, res) => {
+    try {
+        const { rows } = await pool.query(`
+            SELECT DISTINCT u.user_id, u.username 
+            FROM users u 
+            JOIN vault_ledger_entries vle ON u.user_id = vle.user_id 
+            ORDER BY u.username ASC;
+        `);
+        res.json(rows);
+    } catch (error) {
+        console.error("Error fetching vault users:", error);
+        res.status(500).json({ error: 'Failed to fetch vault users.' });
+    }
+});
+
 module.exports = router;
