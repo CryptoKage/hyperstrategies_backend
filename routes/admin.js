@@ -1217,9 +1217,9 @@ router.get('/reports/draft', async (req, res) => {
 
 router.post('/reports/publish', async (req, res) => {
     const adminUserId = req.user.id; // From authenticateToken middleware
-    const { userId, month, reportData } = req.body;
+    const { userId, title, reportDate, reportData } = req.body;
 
-    if (!userId || !month || !reportData) {
+    if (!userId || !title || !reportDate || !reportData) { 
         return res.status(400).json({ error: 'userId, month, and reportData are required.' });
     }
 
@@ -1227,17 +1227,14 @@ router.post('/reports/publish', async (req, res) => {
         // Use an UPSERT query: It will UPDATE the report if one for that user/month already exists,
         // or INSERT a new one if it doesn't. This is perfect for saving drafts and publishing.
         const upsertQuery = `
-            INSERT INTO user_monthly_reports (user_id, month, report_data, last_updated_by)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id, month)
-            DO UPDATE SET
-                report_data = EXCLUDED.report_data,
-                last_updated_by = EXCLUDED.last_updated_by;
+           INSERT INTO user_monthly_reports (user_id, title, report_date, report_data, last_updated_by)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING report_id;
         `;
 
-        await pool.query(upsertQuery, [userId, month, reportData, adminUserId]);
+        const result = await client.query(insertQuery, [userId, title, reportDate, reportData, adminUserId]);
 
-        res.status(200).json({ message: 'Report has been successfully saved and published.' });
+    res.status(200).json({ message: 'Report has been successfully saved and published.' });
 
     } catch (error) {
         console.error('Error publishing report:', error);
