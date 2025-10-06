@@ -1300,4 +1300,138 @@ router.post('/reports/:reportId/review', async (req, res) => {
     }
 });
 
+router.post('/vaults/monthly-performance', async (req, res) => {
+    const adminUserId = req.user.id;
+    const { vaultId, month, pnlPercentage, notes } = req.body;
+
+    if (!vaultId || !month || pnlPercentage === undefined) {
+        return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and pnlPercentage are required.' });
+    }
+    const numericPnl = parseFloat(pnlPercentage);
+    if (isNaN(numericPnl)) {
+        return res.status(400).json({ error: 'pnlPercentage must be a valid number.' });
+    }
+
+    try {
+        // Use an UPSERT to allow admins to correct a previously entered value
+        const upsertQuery = `
+            INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (vault_id, month)
+            DO UPDATE SET
+                pnl_percentage = EXCLUDED.pnl_percentage,
+                notes = EXCLUDED.notes,
+                created_by = EXCLUDED.created_by,
+                created_at = NOW();
+        `;
+        
+        await pool.query(upsertQuery, [vaultId, month, numericPnl, notes, adminUserId]);
+
+        res.status(200).json({ message: `Performance for vault ${vaultId} for the month of ${month} has been successfully recorded.` });
+
+    } catch (error) {
+        console.error('Error logging monthly performance:', error);
+        res.status(500).json({ error: 'Failed to log monthly performance.' });
+    }
+});
+
+router.post('/vault-events', async (req, res) => {
+    const adminUserId = req.user.id;
+    const { vaultId, eventType, description, valueUsd, txHash } = req.body;
+
+    if (!vaultId || !eventType || !description) {
+        return res.status(400).json({ error: 'vaultId, eventType, and description are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        const insertQuery = `
+            INSERT INTO vault_events (vault_id, event_type, description, value_usd, related_tx_hash, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING event_id;
+        `;
+        
+        const result = await client.query(insertQuery, [vaultId, eventType, description, valueUsd || null, txHash || null, adminUserId]);
+
+        res.status(201).json({ 
+            message: 'Vault event successfully logged.',
+            eventId: result.rows[0].event_id 
+        });
+
+    } catch (error)
+    {
+        console.error('Error logging vault event:', error);
+        res.status(500).json({ error: 'Failed to log vault event.' });
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+router.get('/vaults/:vaultId/supporting-events', async (req, res) => {
+    const { vaultId } = req.params;
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+        return res.status(400).json({ error: 'startDate and endDate are required query parameters.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        // Query 1: Fetch all trades (both opened and closed) within the date range
+        const tradesQuery = `
+            SELECT 
+                trade_id AS id,
+                'TRADE' AS type,
+                asset_symbol,
+                direction,
+                status,
+                quantity,
+                entry_price,
+                exit_price,
+                pnl_usd,
+                trade_opened_at AS event_date
+            FROM vault_trades
+            WHERE vault_id = $1 AND trade_opened_at >= $2 AND trade_opened_at < $3;
+        `;
+
+        // Query 2: Fetch all generic vault events within the date range
+        const eventsQuery = `
+            SELECT
+                event_id AS id,
+                event_type AS type,
+                description,
+                value_usd,
+                event_date
+            FROM vault_events
+            WHERE vault_id = $1 AND event_date >= $2 AND event_date < $3;
+        `;
+
+        const [tradesResult, eventsResult] = await Promise.all([
+            client.query(tradesQuery, [vaultId, startDate, endDate]),
+            client.query(eventsQuery, [vaultId, startDate, endDate])
+        ]);
+
+        // Combine the results from both queries into a single array
+        const combinedEvents = [
+            ...tradesResult.rows,
+            ...eventsResult.rows
+        ];
+
+        // Sort the combined array chronologically by the event date
+        combinedEvents.sort((a, b) => new Date(a.event_date) - new Date(b.event_date));
+
+        res.status(200).json(combinedEvents);
+
+    } catch (error) {
+        console.error('Error fetching supporting events:', error);
+        res.status(500).json({ error: 'Failed to fetch supporting events.' });
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
 module.exports = router;
