@@ -1138,7 +1138,6 @@ router.post('/transfers/:transferId/complete', async (req, res) => {
 });
 
 router.get('/reports/draft', async (req, res) => {
-    // Expecting query params like ?userId=...&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
     const { userId, startDate, endDate } = req.query;
 
     if (!userId || !startDate || !endDate) {
@@ -1151,16 +1150,18 @@ router.get('/reports/draft', async (req, res) => {
             userResult, 
             startingCapitalResult, 
             periodLedgerResult, 
-            userVaultsResult
+            userVaultsResult, 
+            monthlyPerfResult
         ] = await Promise.all([
             // 1. Fetch user details
             client.query('SELECT username FROM users WHERE user_id = $1', [userId]),
             
-            // 2. Calculate the starting capital from BEFORE the start date
+            // 2. Calculate starting capital FOR EACH VAULT from BEFORE the start date
             client.query(
-                `SELECT COALESCE(SUM(amount), 0) as starting_capital 
+                `SELECT vault_id, COALESCE(SUM(amount), 0) as capital 
                  FROM vault_ledger_entries 
-                 WHERE user_id = $1 AND created_at < $2;`, 
+                 WHERE user_id = $1 AND created_at < $2 
+                 GROUP BY vault_id;`, 
                 [userId, startDate]
             ),
             
@@ -1180,26 +1181,57 @@ router.get('/reports/draft', async (req, res) => {
                  JOIN vault_ledger_entries vle ON v.vault_id = vle.vault_id 
                  WHERE vle.user_id = $1;`, 
                 [userId]
+            ),
+            
+            // 5. Fetch the pre-logged monthly performance for all relevant vaults
+            client.query(
+                `SELECT vault_id, pnl_percentage FROM vault_monthly_performance WHERE month = $1;`, 
+                [startDate]
             )
         ]);
 
         if (userResult.rows.length === 0) {
-            // Must release client before returning
             client.release();
             return res.status(404).json({ error: 'User not found.' });
         }
         
+        // Process the results into easy-to-use Maps
+        const startingCapitalByVault = new Map(startingCapitalResult.rows.map(r => [r.vault_id, parseFloat(r.capital)]));
+        const monthlyPerfByVault = new Map(monthlyPerfResult.rows.map(r => [r.vault_id, parseFloat(r.pnl_percentage)]));
+
+        let periodTransactions = periodLedgerResult.rows.map(t => ({
+            ...t,
+            amount: parseFloat(t.amount),
+            fee_amount: parseFloat(t.fee_amount)
+        }));
+
+        // --- AUTO-GENERATE PNL ENTRIES ---
+        for (const [vaultId, startingCapital] of startingCapitalByVault.entries()) {
+            if (monthlyPerfByVault.has(vaultId) && startingCapital > 0) {
+                const pnlPercentage = monthlyPerfByVault.get(vaultId);
+                const pnlAmount = startingCapital * (pnlPercentage / 100.0);
+
+                // Inject a virtual transaction into the workbench list
+                periodTransactions.push({
+                    entry_id: `system-pnl-${vaultId}`,
+                    created_at: new Date(new Date(endDate) - 1).toISOString(), // Place it at the end of the period
+                    entry_type: 'SYSTEM_CALCULATED_PNL',
+                    amount: pnlAmount,
+                    fee_amount: 0,
+                    vault_id: vaultId
+                });
+            }
+        }
+        periodTransactions.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        // --- END OF AUTO-GENERATION ---
+
         const draftData = {
             userInfo: userResult.rows[0],
             userVaults: userVaultsResult.rows,
             reportStartDate: startDate,
             reportEndDate: endDate,
-            startingCapital: parseFloat(startingCapitalResult.rows[0].starting_capital),
-            periodTransactions: periodLedgerResult.rows.map(t => ({
-                ...t,
-                amount: parseFloat(t.amount),
-                fee_amount: parseFloat(t.fee_amount)
-            }))
+            startingCapital: Array.from(startingCapitalByVault.values()).reduce((sum, cap) => sum + cap, 0),
+            periodTransactions // This now includes the auto-calculated PNL
         };
 
         res.status(200).json(draftData);
@@ -1208,7 +1240,6 @@ router.get('/reports/draft', async (req, res) => {
         console.error('Error generating report draft:', error);
         res.status(500).json({ error: 'Failed to generate report draft.' });
     } finally {
-        // Ensure client is always released
         if (client) {
             client.release();
         }
@@ -1374,52 +1405,71 @@ router.get('/vaults/:vaultId/supporting-events', async (req, res) => {
     const { startDate, endDate } = req.query;
 
     if (!startDate || !endDate) {
-        return res.status(400).json({ error: 'startDate and endDate are required query parameters.' });
+        return res.status(400).json({ error: 'startDate and endDate are required.' });
     }
 
     const client = await pool.connect();
     try {
-        // Query 1: Fetch all trades (both opened and closed) within the date range
+        // Query 1: Fetch DEPOSITS into this vault during the period
+        const depositsQuery = `
+            SELECT 
+                vle.entry_id AS id,
+                'DEPOSIT' as type,
+                vle.created_at AS event_date,
+                u.username,
+                (vle.amount + vle.fee_amount) as total_deposit_amount, -- The full 100%
+                vle.amount as tradable_capital,
+                vle.fee_amount
+            FROM vault_ledger_entries vle
+            JOIN users u ON vle.user_id = u.user_id
+            WHERE vle.vault_id = $1 
+              AND vle.entry_type = 'DEPOSIT'
+              AND vle.created_at >= $2 AND vle.created_at < $3;
+        `;
+
+        // Query 2: Fetch TRADES opened during the period
         const tradesQuery = `
             SELECT 
                 trade_id AS id,
                 'TRADE' AS type,
+                trade_opened_at AS event_date,
                 asset_symbol,
                 direction,
                 status,
                 quantity,
                 entry_price,
                 exit_price,
-                pnl_usd,
-                trade_opened_at AS event_date
+                pnl_usd
             FROM vault_trades
             WHERE vault_id = $1 AND trade_opened_at >= $2 AND trade_opened_at < $3;
         `;
 
-        // Query 2: Fetch all generic vault events within the date range
+        // Query 3: Fetch generic VAULT EVENTS during the period
         const eventsQuery = `
             SELECT
                 event_id AS id,
                 event_type AS type,
+                event_date,
                 description,
-                value_usd,
-                event_date
+                value_usd
             FROM vault_events
             WHERE vault_id = $1 AND event_date >= $2 AND event_date < $3;
         `;
 
-        const [tradesResult, eventsResult] = await Promise.all([
+        const [depositsResult, tradesResult, eventsResult] = await Promise.all([
+            client.query(depositsQuery, [vaultId, startDate, endDate]),
             client.query(tradesQuery, [vaultId, startDate, endDate]),
             client.query(eventsQuery, [vaultId, startDate, endDate])
         ]);
 
-        // Combine the results from both queries into a single array
+        // Combine all three sources into a single array
         const combinedEvents = [
+            ...depositsResult.rows,
             ...tradesResult.rows,
             ...eventsResult.rows
         ];
 
-        // Sort the combined array chronologically by the event date
+        // Sort the final array chronologically
         combinedEvents.sort((a, b) => new Date(a.event_date) - new Date(b.event_date));
 
         res.status(200).json(combinedEvents);
