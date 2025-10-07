@@ -136,13 +136,14 @@ router.post(
       const newUserId = newlyCreatedUser.user_id;
 
       if (xpToAward > 0) {
-        await awardXp({
-          userId: newUserId,
-          xpAmount: xpToAward,
-          type: 'SIGNUP_BONUS',
-          description: `Earned ${xpToAward} XP as an Early Adopter bonus!`,
-        }, client);
-      }
+  await awardXp({
+    userId: newUserId,
+    xpAmount: xpToAward,
+    type: 'SIGNUP_BONUS',
+    descriptionKey: 'xp_history.signup_bonus', 
+    descriptionVars: { amount: xpToAward }      
+  }, client);
+}
      
       if (referralCode) {
             const syndicateResult = await client.query(
@@ -456,7 +457,7 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
     res.cookie('token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
+      sameSite: 'lax',
       maxAge: 8 * 60 * 60 * 1000
     });
     
