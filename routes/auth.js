@@ -16,6 +16,13 @@ const { TIER_DATA } = require('../utils/tierUtils');
 const { sendEmail } = require('../utils/msGraphMailer');
 const { awardXp } = require('../utils/xpEngine');
 
+const cookieOptions = {
+  httpOnly: true,
+  secure: (process.env.COOKIE_SECURE || '').toLowerCase() === 'true' || process.env.NODE_ENV === 'production',
+  sameSite: process.env.COOKIE_SAMESITE || 'lax',
+  domain: process.env.COOKIE_DOMAIN || (process.env.NODE_ENV === 'production' ? '.hyper-strategies.com' : undefined),
+  maxAge: 8 * 60 * 60 * 1000 // 8 hours
+};
 
 function generateReferralCode() {
   return 'HS-' + crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
@@ -217,13 +224,8 @@ router.post(
       };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
-      res.cookie('token', token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax', // Use 'lax' for cross-domain compatibility
-        maxAge: 8 * 60 * 60 * 1000,
-        domain: '.hyper-strategies.com' // Set the root domain
-      });
+      res.cookie('token', token, cookieOptions);
+      
 
       // --- THE FINAL FIX ---
       // Send ONE response that includes the user object for the frontend context.
@@ -253,6 +255,8 @@ router.get('/google', (req, res, next) => {
 });
 
 // NEW /google/callback route to read the 'state' and apply the referral
+// Replace the entire GET /google/callback route in auth.js
+
 router.get('/google/callback',
   passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login', session: false }),
   async (req, res) => {
@@ -305,18 +309,11 @@ router.get('/google/callback',
        const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
 
-      // Set the token in a cookie before redirecting
-      res.cookie('token', token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        maxAge: 8 * 60 * 60 * 1000,
-        domain: '.hyper-strategies.com'
-      });
+      // --- THE FIX: Use the centralized cookieOptions object ---
+      res.cookie('token', token, cookieOptions);
       
       await client.query('COMMIT');
       
-      // Redirect to a success page WITHOUT the token in the URL
       res.redirect(`${frontend}/oauth-success`);
 
     } catch (err) {
@@ -455,15 +452,8 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
     
      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 8 * 60 * 60 * 1000
-    });
-    
-    // Just send back the user payload, which is useful for the frontend context
-    res.status(200).json({ user: payload.user });
+     res.cookie('token', token, cookieOptions);
+  res.status(200).json({ user: payload.user });
 
   } catch (err) {
     console.error('[Token Refresh Error]', err);
@@ -472,13 +462,13 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
 });
 
 router.post('/logout', (req, res) => {
-  // Tell the browser to clear the 'token' cookie
-  res.clearCookie('token', {
-    domain: '.hyper-strategies.com', // MUST match the domain used when setting the cookie
-    path: '/' // MUST match the path
+  // --- THE FIX: Use the full options to ensure the cookie is cleared correctly ---
+  res.clearCookie('token', { 
+    domain: cookieOptions.domain, 
+    path: '/',
+    secure: cookieOptions.secure,
+    sameSite: cookieOptions.sameSite
   });
   
   res.status(200).json({ message: 'Logout successful' });
 });
-
-module.exports = router;
