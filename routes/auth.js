@@ -247,6 +247,10 @@ router.get('/google', (req, res, next) => {
   const state = referralCode 
     ? Buffer.from(JSON.stringify({ referralCode })).toString('base64')
     : undefined;
+    res.clearCookie('token', {
+    ...cookieOptions,
+    maxAge: undefined,
+  });
   const authenticator = passport.authenticate('google', { 
     scope: ['profile', 'email'],
     state: state,
