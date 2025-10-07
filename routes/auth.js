@@ -242,7 +242,7 @@ router.post(
 // --- FIX STARTS HERE: REPLACING THE GOOGLE OAUTH ROUTES ---
 
 // NEW /google route to capture referral code and pass it via 'state'
-outer.get('/google', (req, res, next) => {
+router.get('/google', (req, res, next) => {
   const referralCode = req.query.ref;
   const state = referralCode 
     ? Buffer.from(JSON.stringify({ referralCode })).toString('base64')
