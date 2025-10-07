@@ -201,7 +201,7 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials.' });
       }
 
- const currentTierInfo = TIER_DATA.find(t => t.tier === user.account_tier) || TIER_DATA[0];
+      const currentTierInfo = TIER_DATA.find(t => t.tier === user.account_tier) || TIER_DATA[0];
       const nextTierInfo = TIER_DATA.find(t => t.tier === user.account_tier + 1);
 
       const payload = { 
@@ -212,23 +212,22 @@ router.post(
           account_tier: user.account_tier,
           xp: parseFloat(user.xp),
           currentTierXp: currentTierInfo.xpRequired, 
-          nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : parseFloat(user.xp) 
+          nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : null 
         } 
       };
-          const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
       res.cookie('token', token, {
-        httpOnly: true, // Prevents client-side JS from accessing the cookie
-        secure: process.env.NODE_ENV === 'production', // Only send over HTTPS in production
-        sameSite: 'strict', // Mitigates CSRF attacks
-        maxAge: 8 * 60 * 60 * 1000, // 8 hours in milliseconds, matches JWT expiry
-        domain: '.hyper-strategies.com'
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax', // Use 'lax' for cross-domain compatibility
+        maxAge: 8 * 60 * 60 * 1000,
+        domain: '.hyper-strategies.com' // Set the root domain
       });
 
-      // Send a success response without the token in the body
-      res.status(200).json({ message: 'Login successful' });
-      
-
+      // --- THE FINAL FIX ---
+      // Send ONE response that includes the user object for the frontend context.
+      res.status(200).json({ message: 'Login successful', user: payload.user });
 
     } catch (err) {
       console.error('[Login Error]', err);
