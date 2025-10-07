@@ -470,4 +470,14 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
   }
 });
 
+router.post('/logout', (req, res) => {
+  // Tell the browser to clear the 'token' cookie
+  res.clearCookie('token', {
+    domain: '.hyper-strategies.com', // MUST match the domain used when setting the cookie
+    path: '/' // MUST match the path
+  });
+  
+  res.status(200).json({ message: 'Logout successful' });
+});
+
 module.exports = router;
