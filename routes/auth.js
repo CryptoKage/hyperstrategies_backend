@@ -242,22 +242,32 @@ router.post(
 // --- FIX STARTS HERE: REPLACING THE GOOGLE OAUTH ROUTES ---
 
 // NEW /google route to capture referral code and pass it via 'state'
-router.get('/google', (req, res, next) => {
+outer.get('/google', (req, res, next) => {
   const referralCode = req.query.ref;
   const state = referralCode 
     ? Buffer.from(JSON.stringify({ referralCode })).toString('base64')
     : undefined;
-    res.clearCookie('token', {
-    ...cookieOptions,
-    maxAge: undefined,
-  });
-  const authenticator = passport.authenticate('google', { 
-    scope: ['profile', 'email'],
-    state: state,
-    prompt: 'select_account'
-  });
-  authenticator(req, res, next);
-});
+
+  // --- THIS IS THE FIX ---
+  // Before starting a new authentication flow, we must destroy any existing session.
+  req.logout(function(err) {
+    if (err) { return next(err); }
+    req.session.destroy((err) => {
+      if (err) {
+        console.error("Session destruction failed:", err);
+        return next(err);
+      }
+      // Now that the old session is gone, we can safely start the new one.
+      const authenticator = passport.authenticate('google', { 
+        scope: ['profile', 'email'],
+        state: state,
+        prompt: 'select_account' // Keep this, it's good UX
+      });
+      authenticator(req, res, next);
+    });
+    });
+    });
+    
 
 // NEW /google/callback route to read the 'state' and apply the referral
 // Replace the entire GET /google/callback route in auth.js
