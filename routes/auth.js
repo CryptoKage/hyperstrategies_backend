@@ -310,7 +310,8 @@ router.get('/google/callback',
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'strict',
-        maxAge: 8 * 60 * 60 * 1000
+        maxAge: 8 * 60 * 60 * 1000,
+        domain: '.hyper-strategies.com'
       });
       
       await client.query('COMMIT');
