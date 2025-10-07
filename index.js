@@ -100,7 +100,7 @@ app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
 app.use('/api/pnl', pnlRoutes);
 app.use('/api/market-data', marketDataRoutes);
-app.use('/api/performance', performanceRoutes);
+//app.use('/api/performance', performanceRoutes);
 app.use('/api/system', systemRoutes);
 
 app.listen(PORT, async () => {
