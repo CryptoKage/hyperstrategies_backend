@@ -99,7 +99,7 @@ app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
 app.use('/api/pnl', pnlRoutes);
-app.use('/api/market-data', marketDataRoutes);
+//app.use('/api/market-data', marketDataRoutes);
 //app.use('/api/performance', performanceRoutes);
 app.use('/api/system', systemRoutes);
 
