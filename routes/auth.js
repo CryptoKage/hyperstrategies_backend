@@ -462,12 +462,12 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
 });
 
 router.post('/logout', (req, res) => {
-  // --- THE FIX: Use the full options to ensure the cookie is cleared correctly ---
   res.clearCookie('token', { 
     domain: cookieOptions.domain, 
     path: '/',
     secure: cookieOptions.secure,
-    sameSite: cookieOptions.sameSite
+    sameSite: cookieOptions.sameSite,
+    httpOnly: cookieOptions.httpOnly
   });
   
   res.status(200).json({ message: 'Logout successful' });
