@@ -221,7 +221,8 @@ router.post(
         httpOnly: true, // Prevents client-side JS from accessing the cookie
         secure: process.env.NODE_ENV === 'production', // Only send over HTTPS in production
         sameSite: 'strict', // Mitigates CSRF attacks
-        maxAge: 8 * 60 * 60 * 1000 // 8 hours in milliseconds, matches JWT expiry
+        maxAge: 8 * 60 * 60 * 1000, // 8 hours in milliseconds, matches JWT expiry
+        domain: '.hyper-strategies.com'
       });
 
       // Send a success response without the token in the body
