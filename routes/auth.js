@@ -249,7 +249,8 @@ router.get('/google', (req, res, next) => {
     : undefined;
   const authenticator = passport.authenticate('google', { 
     scope: ['profile', 'email'],
-    state: state
+    state: state,
+    prompt: 'select_account'
   });
   authenticator(req, res, next);
 });
