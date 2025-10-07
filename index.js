@@ -10,6 +10,7 @@ const session = require('express-session');
 const passport = require('passport');
 const ethers = require('ethers');
 const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
 
 // --- Route Imports ---
 const { corsOptions } = require('./config/cors');
@@ -52,6 +53,7 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 
 // --- Middleware ---
+app.use(cookieParser());
 app.use(cors(corsOptions));
 app.use(helmet());
 
@@ -80,6 +82,7 @@ app.use(session({
 
 app.use(passport.initialize());
 app.use(passport.session());
+
 
 // --- API Routes ---
 app.use('/api/auth', authRoutes);

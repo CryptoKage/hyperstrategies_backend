@@ -214,9 +214,19 @@ router.post(
           nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : parseFloat(user.xp) 
         } 
       };
-      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+          const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
-      res.json({ token });
+      res.cookie('token', token, {
+        httpOnly: true, // Prevents client-side JS from accessing the cookie
+        secure: process.env.NODE_ENV === 'production', // Only send over HTTPS in production
+        sameSite: 'strict', // Mitigates CSRF attacks
+        maxAge: 8 * 60 * 60 * 1000 // 8 hours in milliseconds, matches JWT expiry
+      });
+
+      // Send a success response without the token in the body
+      res.status(200).json({ message: 'Login successful' });
+      
+
 
     } catch (err) {
       console.error('[Login Error]', err);
@@ -291,11 +301,21 @@ router.get('/google/callback',
           nextTierXp: nextTierInfo ? nextTierInfo.xpRequired : parseFloat(googleUser.xp) 
         } 
       };
-      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
+
+      // Set the token in a cookie before redirecting
+      res.cookie('token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: 8 * 60 * 60 * 1000
+      });
       
       await client.query('COMMIT');
-      res.redirect(`${frontend}/oauth-success?token=${token}`);
+      
+      // Redirect to a success page WITHOUT the token in the URL
+      res.redirect(`${frontend}/oauth-success`);
 
     } catch (err) {
       await client.query('ROLLBACK');
@@ -431,8 +451,17 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
       } 
     };
     
-    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
-    res.json({ token });
+     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 8 * 60 * 60 * 1000
+    });
+    
+    // Just send back the user payload, which is useful for the frontend context
+    res.status(200).json({ user: payload.user });
 
   } catch (err) {
     console.error('[Token Refresh Error]', err);
