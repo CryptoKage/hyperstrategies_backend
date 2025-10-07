@@ -474,7 +474,6 @@ router.post('/logout', (req, res) => {
     sameSite: cookieOptions.sameSite,
     httpOnly: cookieOptions.httpOnly
   });
-  
   res.status(200).json({ message: 'Logout successful' });
 });
 
