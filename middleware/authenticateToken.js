@@ -1,19 +1,26 @@
-// server/middleware/authenticateToken.js
+// middleware/authenticateToken.js
 const jwt = require('jsonwebtoken');
 
 function authenticateToken(req, res, next) {
-  // Get token from the Authorization header (e.g., 'Bearer TOKEN')
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  // 1. Get the token from the cookie parser
+  const token = req.cookies.token;
 
-  if (token == null) return res.sendStatus(401); // No token, unauthorized
+  // 2. If no token exists, the user is unauthorized
+  if (token == null) {
+    return res.sendStatus(401); // Unauthorized
+  }
 
+  // 3. Verify the token is valid
   jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
-    if (err) return res.sendStatus(403); // Token is no longer valid
+    if (err) {
+      // If the token is expired or invalid, clear the bad cookie and send Forbidden
+      res.clearCookie('token');
+      return res.sendStatus(403); // Forbidden
+    }
     
-    // The payload contains the user object we put in it during login
-    req.user = payload.user; 
-    next(); // Proceed to the route's handler
+    // 4. If the token is valid, attach the user payload to the request and continue
+    req.user = payload.user;
+    next();
   });
 }
 
