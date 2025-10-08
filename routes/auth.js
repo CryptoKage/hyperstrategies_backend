@@ -238,60 +238,32 @@ router.post(
   }
 );
 
-
-// --- FIX STARTS HERE: REPLACING THE GOOGLE OAUTH ROUTES ---
-
-// NEW /google route to capture referral code and pass it via 'state'
-// Replace the entire GET /google route in auth.js
-
 router.get('/google', (req, res, next) => {
-
-    req.logout(function(err) {
-    if (err) { 
-      console.error('req.logout FAILED:', err);
-      return next(err); 
-    }
-    console.log('req.logout() completed successfully.');
-
-    req.session.destroy((err) => {
-      if (err) {
-        console.error("Session destruction FAILED:", err);
-        return next(err);
-      }
-      console.log('req.session.destroy() completed successfully. Starting Google auth.');
-
   const referralCode = req.query.ref;
   const state = referralCode 
     ? Buffer.from(JSON.stringify({ referralCode })).toString('base64')
     : undefined;
 
-  // Before starting a new authentication flow, we must destroy any existing session.
+  // Destroy any existing session before starting the new authentication flow.
   req.logout(function(err) {
-    if (err) { return next(err); }
+    if (err) { 
+      console.error('req.logout FAILED:', err);
+      return next(err); 
+    }
     
-    req.session.destroy((err) => {
-      if (err) {
-        console.error("Session destruction failed:", err);
-        return next(err);
-      }
-      
-      // Now that the old session is gone, we can safely start the new one.
-      const authenticator = passport.authenticate('google', { 
-        scope: ['profile', 'email'],
-        state: state,
-        prompt: 'select_account' // This forces the account chooser
-      });
-      
-      authenticator(req, res, next);
+    // Passport's logout is enough, no need for req.session.destroy() which caused issues.
+    console.log('req.logout() successful. Now starting Google authentication.');
+    
+    const authenticator = passport.authenticate('google', { 
+      scope: ['profile', 'email'],
+      state: state,
+      prompt: 'select_account'
     });
+    
+    authenticator(req, res, next);
   });
 });
- });
-  });
-  
 
-// NEW /google/callback route to read the 'state' and apply the referral
-// Replace the entire GET /google/callback route in auth.js
 
 router.get('/google/callback',
   passport.authenticate('google', { failureRedirect: process.env.FRONTEND_URL || 'https://www.hyper-strategies.com/login', session: false }),
