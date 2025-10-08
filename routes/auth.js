@@ -245,6 +245,21 @@ router.post(
 // Replace the entire GET /google route in auth.js
 
 router.get('/google', (req, res, next) => {
+
+    req.logout(function(err) {
+    if (err) { 
+      console.error('req.logout FAILED:', err);
+      return next(err); 
+    }
+    console.log('req.logout() completed successfully.');
+
+    req.session.destroy((err) => {
+      if (err) {
+        console.error("Session destruction FAILED:", err);
+        return next(err);
+      }
+      console.log('req.session.destroy() completed successfully. Starting Google auth.');
+
   const referralCode = req.query.ref;
   const state = referralCode 
     ? Buffer.from(JSON.stringify({ referralCode })).toString('base64')
@@ -271,6 +286,9 @@ router.get('/google', (req, res, next) => {
     });
   });
 });
+ });
+  });
+  
 
 // NEW /google/callback route to read the 'state' and apply the referral
 // Replace the entire GET /google/callback route in auth.js
