@@ -1484,4 +1484,166 @@ router.get('/vaults/:vaultId/supporting-events', async (req, res) => {
     }
 });
 
+// 1. ADD a new protocol to the pipeline (defaults to 'SEEDING' status)
+router.post('/farming-protocols', async (req, res) => {
+    const adminUserId = req.user.id;
+    const { vaultId, name, chain, description, hasToken } = req.body;
+
+    if (!vaultId || !name || !chain) {
+        return res.status(400).json({ error: 'vaultId, name, and chain are required.' });
+    }
+
+    try {
+        const insertQuery = `
+            INSERT INTO farming_protocols (vault_id, name, chain, description, has_token)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING protocol_id;
+        `;
+        const result = await pool.query(insertQuery, [vaultId, name, chain, description || null, hasToken || false]);
+        res.status(201).json({ 
+            message: 'New protocol added to pipeline in SEEDING state.',
+            protocolId: result.rows[0].protocol_id 
+        });
+    } catch (error) {
+        console.error('Error adding new farming protocol:', error);
+        res.status(500).json({ error: 'Failed to add new protocol.' });
+    }
+});
+
+
+// 2. UPDATE the status of a protocol (e.g., move from 'SEEDING' to 'FARMING')
+router.patch('/farming-protocols/:protocolId/status', async (req, res) => {
+    const { protocolId } = req.params;
+    const { newStatus } = req.body;
+
+    if (!newStatus || !['SEEDING', 'FARMING', 'REAPED'].includes(newStatus)) {
+        return res.status(400).json({ error: "Invalid status provided. Must be 'SEEDING', 'FARMING', or 'REAPED'." });
+    }
+
+    try {
+        let query;
+        let queryParams = [newStatus, protocolId];
+
+        // If we are moving to 'FARMING', set the start date
+        if (newStatus === 'FARMING') {
+            query = "UPDATE farming_protocols SET status = $1, date_farming_started = NOW() WHERE protocol_id = $2 RETURNING protocol_id;";
+        } else {
+            query = "UPDATE farming_protocols SET status = $1 WHERE protocol_id = $2 RETURNING protocol_id;";
+        }
+
+        const result = await pool.query(query, queryParams);
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Protocol not found.' });
+        }
+
+        res.status(200).json({ message: `Protocol status successfully updated to ${newStatus}.` });
+    } catch (error) {
+        console.error(`Error updating status for protocol ${protocolId}:`, error);
+        res.status(500).json({ error: 'Failed to update protocol status.' });
+    }
+});
+
+
+// 3. REAP rewards and distribute PNL
+router.post('/farming-protocols/:protocolId/reap', async (req, res) => {
+    const { protocolId } = req.params;
+    const { realizedUsdValue } = req.body;
+    const adminUserId = req.user.id;
+    
+    const numericValue = parseFloat(realizedUsdValue);
+    if (isNaN(numericValue) || numericValue <= 0) {
+        return res.status(400).json({ error: 'A valid, positive realizedUsdValue is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Step 1: Fetch protocol info, especially the vault_id
+        const protocolResult = await client.query('SELECT vault_id, name FROM farming_protocols WHERE protocol_id = $1 FOR UPDATE', [protocolId]);
+        if (protocolResult.rows.length === 0) {
+            throw new Error('Farming protocol not found.');
+        }
+        const { vault_id, name: protocolName } = protocolResult.rows[0];
+
+        // Step 2: Update the protocol to mark it as reaped
+        await client.query(
+            `UPDATE farming_protocols 
+             SET has_rewards = TRUE, rewards_realized_usd = $1, date_reaped = NOW() 
+             WHERE protocol_id = $2;`,
+            [numericValue, protocolId]
+        );
+
+        // Step 3: Get the vault's total capital base for PNL calculation
+        const capitalResult = await client.query(
+            `SELECT COALESCE(SUM(amount), 0) as total_capital 
+             FROM vault_ledger_entries 
+             WHERE vault_id = $1;`,
+            [vault_id]
+        );
+        const totalCapital = parseFloat(capitalResult.rows[0].total_capital);
+        if (totalCapital <= 0) {
+            throw new Error('Vault has zero capital, cannot distribute PNL.');
+        }
+
+        // Step 4: Calculate the PNL percentage and distribute it using your existing logic
+        const pnlPercentage = (numericValue / totalCapital) * 100;
+        
+        const participantsResult = await client.query(
+            `SELECT user_id, COALESCE(SUM(amount), 0) as principal 
+             FROM vault_ledger_entries 
+             WHERE vault_id = $1 
+             GROUP BY user_id HAVING COALESCE(SUM(amount), 0) > 0;`,
+            [vault_id]
+        );
+        const participants = participantsResult.rows;
+
+        for (const participant of participants) {
+            const principal = parseFloat(participant.principal);
+            const pnlAmount = principal * (pnlPercentage / 100.0);
+            if (Math.abs(pnlAmount) > 0.000001) {
+                await client.query(
+                    `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) 
+                     VALUES ($1, $2, 'PNL_DISTRIBUTION', $3);`,
+                    [participant.user_id, vault_id, pnlAmount]
+                );
+            }
+        }
+        
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Successfully reaped $${numericValue} from ${protocolName} and distributed ${pnlPercentage.toFixed(2)}% PNL to ${participants.length} users.` });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(`Error reaping rewards for protocol ${protocolId}:`, error);
+        res.status(500).json({ error: error.message || 'Failed to reap rewards.' });
+    } finally {
+        client.release();
+    }
+});
+
+router.get('/farming-protocols', async (req, res) => {
+    const { vaultId } = req.query;
+    if (!vaultId) {
+        return res.status(400).json({ error: 'vaultId query parameter is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(
+            `SELECT * FROM farming_protocols WHERE vault_id = $1 ORDER BY status, created_at DESC`,
+            [vaultId]
+        );
+        res.json(rows);
+    } catch (error) {
+        console.error('Error fetching farming protocols:', error);
+        res.status(500).json({ error: 'Failed to fetch farming protocols.' });
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
 module.exports = router;
