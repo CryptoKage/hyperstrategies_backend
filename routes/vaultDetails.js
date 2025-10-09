@@ -86,3 +86,5 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
+
+module.exports = router;
