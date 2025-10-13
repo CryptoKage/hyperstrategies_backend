@@ -115,6 +115,24 @@ router.post('/invest', authenticateToken, async (req, res) => {
         await dbClient.query(`INSERT INTO treasury_transactions (to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'), $1, $2)`, [feeToDistributeStr, totalDesc]);
         
         const allocationDescription = `Allocated ${amount} USDC to Vault ${vaultId}.`;
+
+const vaultTypeResult = await dbClient.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [vaultId]);
+if (vaultTypeResult.rows[0]?.vault_type === 'FARMING') {
+    const activeProtocolsResult = await dbClient.query(
+        "SELECT protocol_id FROM farming_protocols WHERE vault_id = $1 AND status = 'FARMING'",
+        [vaultId]
+    );
+
+    for (const protocol of activeProtocolsResult.rows) {
+        await dbClient.query(
+            `INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount)
+             VALUES ($1, $2, $3, 'CONTRIBUTION', $4)`,
+            [userId, vaultId, protocol.protocol_id, feeBreakdown.finalTradableAmount] // Use the tradable amount
+        );
+    }
+    console.log(`[Farming] Logged contribution for user ${userId} to ${activeProtocolsResult.rows.length} active protocols.`);
+}
+
         await dbClient.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_ALLOCATION', $2, $3, 'USDC', 'COMPLETED')`, [userId, allocationDescription, amount]);
 
 

@@ -1002,7 +1002,7 @@ router.post('/withdrawals/:activityId/finalize', async (req, res) => {
 
     // 1. Get the request, ensuring it has been confirmed by our verifier job
     const requestResult = await client.query(
-      `SELECT user_id, amount_primary 
+      `SELECT user_id, amount_primary, related_vault_id 
        FROM user_activity_log 
        WHERE activity_id = $1 AND status = 'SWEEP_CONFIRMED' FOR UPDATE`, // Lock the row
       [activityId]
@@ -1012,7 +1012,7 @@ router.post('/withdrawals/:activityId/finalize', async (req, res) => {
       throw new Error('Withdrawal request not found or not in the correct state for finalization.');
     }
     const request = requestResult.rows[0];
-    const { user_id, amount_primary } = request;
+    const { user_id, amount_primary, related_vault_id } = request;
     const amountToCredit = parseFloat(amount_primary);
 
     // 2. Perform the internal accounting: credit the user's main balance
@@ -1026,6 +1026,23 @@ router.post('/withdrawals/:activityId/finalize', async (req, res) => {
       "UPDATE user_activity_log SET status = 'COMPLETED' WHERE activity_id = $1",
       [activityId]
     );
+    
+    // --- 4. [NEW LOGIC] Handle Farming Ledger Withdrawal ---
+    const vaultTypeResult = await client.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [related_vault_id]);
+    if (vaultTypeResult.rows[0]?.vault_type === 'FARMING') {
+        // Find all protocols associated with this vault
+        const protocolsInVault = await client.query("SELECT protocol_id FROM farming_protocols WHERE vault_id = $1", [related_vault_id]);
+        
+        for (const protocol of protocolsInVault.rows) {
+            await client.query(
+                `INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount)
+                 VALUES ($1, $2, $3, 'WITHDRAWAL', $4)`,
+                [user_id, related_vault_id, protocol.protocol_id, amountToCredit]
+            );
+        }
+        console.log(`[Farming] Logged withdrawal of ${amountToCredit} for user ${user_id} from ${protocolsInVault.rows.length} protocols in vault ${related_vault_id}.`);
+    }
+    // --- END OF NEW LOGIC ---
 
     await client.query('COMMIT');
     res.status(200).json({ message: `Successfully finalized withdrawal. User ${user_id} has been credited with ${amountToCredit} USDC.` });
@@ -1246,30 +1263,137 @@ router.get('/reports/draft', async (req, res) => {
     }
 });
 
-router.post('/reports/publish', async (req, res) => {
-    const adminUserId = req.user.id; // From authenticateToken middleware
-    const { userId, title, reportDate, reportData } = req.body;
+// in routes/admin.js, replace the old /publish endpoint with this
+router.post('/reports/:reportId/publish', async (req, res) => {
+    const { reportId } = req.params;
+    const { reportData, newStatus } = req.body;
+    const adminUserId = req.user.id;
 
-    if (!userId || !title || !reportDate || !reportData) { 
-        return res.status(400).json({ error: 'userId, month, and reportData are required.' });
+    if (!reportData || !newStatus || !['DRAFT', 'APPROVED'].includes(newStatus)) {
+        return res.status(400).json({ error: 'reportData and a valid newStatus are required.' });
     }
 
     try {
-        // Use an UPSERT query: It will UPDATE the report if one for that user/month already exists,
-        // or INSERT a new one if it doesn't. This is perfect for saving drafts and publishing.
-        const upsertQuery = `
-           INSERT INTO user_monthly_reports (user_id, title, report_date, report_data, last_updated_by)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING report_id;
-        `;
+        const result = await pool.query(
+            `UPDATE user_monthly_reports 
+             SET report_data = $1, status = $2, last_updated_by = $3 
+             WHERE report_id = $4 RETURNING report_id;`,
+            [reportData, newStatus, adminUserId, reportId]
+        );
 
-        const result = await client.query(insertQuery, [userId, title, reportDate, reportData, adminUserId]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Report not found.' });
+        }
+        
+        res.status(200).json({ message: `Report successfully updated to status: ${newStatus}` });
 
-    res.status(200).json({ message: 'Report has been successfully saved and published.' });
+    } catch(error) {
+        console.error(`Error updating report ${reportId}:`, error);
+        res.status(500).json({ error: 'Failed to update report.' });
+    }
+});
 
-    } catch (error) {
-        console.error('Error publishing report:', error);
-        res.status(500).json({ error: 'Failed to publish report.' });
+// Add this new endpoint to routes/admin.js
+
+router.post('/reports/generate-monthly-drafts', async (req, res) => {
+    const adminUserId = req.user.id;
+    const { vaultId, month, pnlPercentage, notes } = req.body;
+
+    const numericPnl = parseFloat(pnlPercentage);
+    if (!vaultId || !month || isNaN(numericPnl)) {
+        return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and a numeric pnlPercentage are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // --- Step 1: Record the official monthly performance (your existing logic, now integrated here) ---
+        await client.query(
+            `INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (vault_id, month) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, notes = EXCLUDED.notes;`,
+            [vaultId, month, numericPnl, notes, adminUserId]
+        );
+
+        const startDate = new Date(month);
+        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
+
+        // --- Step 2: Find all users who were active in the vault at the start of the month ---
+        const participantsResult = await client.query(
+            `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
+             FROM vault_ledger_entries
+             WHERE vault_id = $1 AND created_at < $2
+             GROUP BY user_id
+             HAVING COALESCE(SUM(amount), 0) > 0;`,
+            [vaultId, startDate]
+        );
+        const participants = participantsResult.rows;
+
+        if (participants.length === 0) {
+            await client.query('COMMIT');
+            return res.status(200).json({ message: 'Monthly performance saved. No active participants found for this period to generate reports for.' });
+        }
+
+        let reportsGenerated = 0;
+        // --- Step 3: Loop through each participant and generate their individual report ---
+        for (const participant of participants) {
+            const userId = participant.user_id;
+            const startingCapital = parseFloat(participant.starting_capital);
+
+            // a) Calculate this user's PNL based on THEIR starting capital
+            const pnlAmount = startingCapital * (numericPnl / 100.0);
+
+            // b) Fetch this user's transactions during the period
+            const transactionsResult = await client.query(
+                `SELECT entry_type, amount, created_at FROM vault_ledger_entries 
+                 WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
+                [userId, vaultId, startDate, endDate]
+            );
+            const periodTransactions = transactionsResult.rows.map(tx => ({ ...tx, amount: parseFloat(tx.amount) }));
+
+            // c) Calculate period totals and ending capital
+            const periodDeposits = periodTransactions.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
+            const periodWithdrawals = periodTransactions.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
+            const endingCapital = startingCapital + pnlAmount + periodDeposits - periodWithdrawals;
+
+            // d) Assemble the final report_data JSON object
+            const reportData = {
+                title: `Performance Report for ${month}`,
+                startDate: startDate.toISOString().split('T')[0],
+                endDate: new Date(endDate - 1).toISOString().split('T')[0], // End of the month
+                openingRemarks: `Official Performance Report for ${new Date(month).toLocaleString('default', { month: 'long', year: 'year' })}.`,
+                closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
+                summary: {
+                    startingCapital,
+                    pnlAmount,
+                    pnlPercentage: numericPnl,
+                    periodDeposits,
+                    periodWithdrawals,
+                    endingCapital,
+                },
+                periodTransactions
+            };
+
+            // e) Upsert the draft report into the database
+            await client.query(
+                `INSERT INTO user_monthly_reports (user_id, report_date, report_data, status, title, last_updated_by)
+                 VALUES ($1, $2, $3, 'DRAFT', $4, $5)
+                 ON CONFLICT (user_id, report_date) DO UPDATE SET report_data = EXCLUDED.report_data, status = 'DRAFT', last_updated_by = EXCLUDED.last_updated_by;`,
+                [userId, month, reportData, reportData.title, adminUserId]
+            );
+            reportsGenerated++;
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Successfully saved monthly performance and generated ${reportsGenerated} draft reports.` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error generating monthly draft reports:', err);
+        res.status(500).json({ error: 'An error occurred during draft generation.' });
+    } finally {
+        client.release();
     }
 });
 
@@ -1289,18 +1413,22 @@ router.get('/vault-users', async (req, res) => {
 });
 
 router.get('/reports/pending-approval', async (req, res) => {
+    // NEW: Read the status from a query parameter, default to PENDING_APPROVAL
+    const status = req.query.status || 'PENDING_APPROVAL';
+
     try {
+        // Fetch the full report_data so the frontend doesn't need a second API call
         const { rows } = await pool.query(`
-            SELECT r.report_id, r.user_id, u.username, r.title, r.report_date
+            SELECT r.report_id, r.user_id, u.username, r.title, r.report_date, r.report_data
             FROM user_monthly_reports r
             JOIN users u ON r.user_id = u.user_id
-            WHERE r.status = 'PENDING_APPROVAL'
-            ORDER BY r.created_at ASC;
-        `);
+            WHERE r.status = $1
+            ORDER BY r.report_date DESC, u.username ASC;
+        `, [status]);
         res.status(200).json(rows);
     } catch (error) {
-        console.error("Error fetching reports pending approval:", error);
-        res.status(500).json({ error: 'Failed to fetch reports for approval.' });
+        console.error("Error fetching reports:", error);
+        res.status(500).json({ error: 'Failed to fetch reports.' });
     }
 });
 
@@ -1520,36 +1648,70 @@ router.patch('/farming-protocols/:protocolId/status', async (req, res) => {
         return res.status(400).json({ error: "Invalid status provided. Must be 'SEEDING', 'FARMING', or 'REAPED'." });
     }
 
+    const client = await pool.connect(); // Use a client for transactions
     try {
-        let query;
-        let queryParams = [newStatus, protocolId];
+        await client.query('BEGIN');
 
-        // If we are moving to 'FARMING', set the start date
+        // --- 1. Update the protocol status ---
+        const protocolUpdateResult = await client.query(
+            "UPDATE farming_protocols SET status = $1, date_farming_started = CASE WHEN $1 = 'FARMING' THEN NOW() ELSE date_farming_started END WHERE protocol_id = $2 RETURNING protocol_id, vault_id;",
+            [newStatus, protocolId]
+        );
+
+        if (protocolUpdateResult.rowCount === 0) {
+            throw new Error('Protocol not found.');
+        }
+
+        const { vault_id } = protocolUpdateResult.rows[0];
+
+        // --- 2. [NEW LOGIC] Backfill contributions if moving to FARMING ---
         if (newStatus === 'FARMING') {
-            query = "UPDATE farming_protocols SET status = $1, date_farming_started = NOW() WHERE protocol_id = $2 RETURNING protocol_id;";
-        } else {
-            query = "UPDATE farming_protocols SET status = $1 WHERE protocol_id = $2 RETURNING protocol_id;";
+            console.log(`[Farming Backfill] Protocol ${protocolId} moved to FARMING. Backfilling contributions for vault ${vault_id}.`);
+
+            // a) Get a list of all current investors and their total capital in this vault.
+            const investorsResult = await client.query(
+                `SELECT user_id, COALESCE(SUM(amount), 0) as total_capital
+                 FROM vault_ledger_entries
+                 WHERE vault_id = $1
+                 GROUP BY user_id
+                 HAVING COALESCE(SUM(amount), 0) > 0.000001;`, // Only include users with a positive balance
+                [vault_id]
+            );
+
+            const investors = investorsResult.rows;
+            if (investors.length > 0) {
+                // b) For each existing investor, create a baseline contribution record.
+                for (const investor of investors) {
+                    await client.query(
+                        `INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount, created_at)
+                         VALUES ($1, $2, $3, 'CONTRIBUTION', $4, NOW())`,
+                        [investor.user_id, vault_id, protocolId, investor.total_capital]
+                    );
+                }
+                console.log(`[Farming Backfill] Created baseline contributions for ${investors.length} existing investors.`);
+            }
         }
+        // --- END OF NEW LOGIC ---
 
-        const result = await pool.query(query, queryParams);
-
-        if (result.rowCount === 0) {
-            return res.status(404).json({ error: 'Protocol not found.' });
-        }
-
+        await client.query('COMMIT');
         res.status(200).json({ message: `Protocol status successfully updated to ${newStatus}.` });
+
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error(`Error updating status for protocol ${protocolId}:`, error);
         res.status(500).json({ error: 'Failed to update protocol status.' });
+    } finally {
+        client.release();
     }
 });
 
 
 // 3. REAP rewards and distribute PNL
+// in routes/admin.js
+
 router.post('/farming-protocols/:protocolId/reap', async (req, res) => {
     const { protocolId } = req.params;
     const { realizedUsdValue } = req.body;
-    const adminUserId = req.user.id;
     
     const numericValue = parseFloat(realizedUsdValue);
     if (isNaN(numericValue) || numericValue <= 0) {
@@ -1560,59 +1722,98 @@ router.post('/farming-protocols/:protocolId/reap', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Step 1: Fetch protocol info, especially the vault_id
-        const protocolResult = await client.query('SELECT vault_id, name FROM farming_protocols WHERE protocol_id = $1 FOR UPDATE', [protocolId]);
+        // --- Step 1: Fetch protocol info and lock the row ---
+        const protocolResult = await client.query(
+            "SELECT vault_id, name, date_farming_started FROM farming_protocols WHERE protocol_id = $1 AND status = 'FARMING' FOR UPDATE", 
+            [protocolId]
+        );
         if (protocolResult.rows.length === 0) {
-            throw new Error('Farming protocol not found.');
+            throw new Error('Farming protocol not found or not in FARMING status.');
         }
-        const { vault_id, name: protocolName } = protocolResult.rows[0];
+        const { vault_id, name: protocolName, date_farming_started } = protocolResult.rows[0];
+        const reapDate = new Date();
 
-        // Step 2: Update the protocol to mark it as reaped
+        // --- Step 2: Update the protocol to mark it as reaped ---
         await client.query(
             `UPDATE farming_protocols 
-             SET has_rewards = TRUE, rewards_realized_usd = $1, date_reaped = NOW() 
-             WHERE protocol_id = $2;`,
-            [numericValue, protocolId]
+             SET has_rewards = TRUE, rewards_realized_usd = COALESCE(rewards_realized_usd, 0) + $1, date_reaped = $2 
+             WHERE protocol_id = $3;`,
+            [numericValue, reapDate, protocolId]
+        );
+        // Note: You may want to change the status to 'REAPED' here or have a separate control for it.
+        // For now, we leave it in FARMING to support multiple airdrops as you described.
+
+        // --- Step 3: Calculate Time-Weighted Contributions ("Dollar-Seconds") ---
+        const contributions = await client.query(
+            `SELECT user_id, entry_type, amount, created_at 
+             FROM farming_contribution_ledger 
+             WHERE protocol_id = $1 AND created_at >= $2 AND created_at <= $3 
+             ORDER BY user_id, created_at ASC;`,
+            [protocolId, date_farming_started, reapDate]
         );
 
-        // Step 3: Get the vault's total capital base for PNL calculation
-        const capitalResult = await client.query(
-            `SELECT COALESCE(SUM(amount), 0) as total_capital 
-             FROM vault_ledger_entries 
-             WHERE vault_id = $1;`,
-            [vault_id]
-        );
-        const totalCapital = parseFloat(capitalResult.rows[0].total_capital);
-        if (totalCapital <= 0) {
-            throw new Error('Vault has zero capital, cannot distribute PNL.');
+        const userDollarSeconds = new Map();
+        let totalDollarSeconds = 0;
+
+        // Group contributions by user
+        const contributionsByUser = contributions.rows.reduce((acc, row) => {
+            if (!acc[row.user_id]) acc[row.user_id] = [];
+            acc[row.user_id].push(row);
+            return acc;
+        }, {});
+
+        for (const userId in contributionsByUser) {
+            const userEvents = contributionsByUser[userId];
+            let userTotalSeconds = 0;
+            let currentBalance = 0;
+            let lastEventTime = date_farming_started;
+
+            for (const event of userEvents) {
+                const eventTime = new Date(event.created_at);
+                const durationSeconds = (eventTime - lastEventTime) / 1000;
+                
+                userTotalSeconds += currentBalance * durationSeconds;
+
+                if (event.entry_type === 'CONTRIBUTION') {
+                    currentBalance += parseFloat(event.amount);
+                } else if (event.entry_type === 'WITHDRAWAL') {
+                    currentBalance -= parseFloat(event.amount);
+                }
+                lastEventTime = eventTime;
+            }
+
+            // Add the final period from the last event until the reapDate
+            const finalDurationSeconds = (reapDate - lastEventTime) / 1000;
+            userTotalSeconds += currentBalance * finalDurationSeconds;
+            
+            if (userTotalSeconds > 0) {
+                userDollarSeconds.set(userId, userTotalSeconds);
+                totalDollarSeconds += userTotalSeconds;
+            }
         }
 
-        // Step 4: Calculate the PNL percentage and distribute it using your existing logic
-        const pnlPercentage = (numericValue / totalCapital) * 100;
-        
-        const participantsResult = await client.query(
-            `SELECT user_id, COALESCE(SUM(amount), 0) as principal 
-             FROM vault_ledger_entries 
-             WHERE vault_id = $1 
-             GROUP BY user_id HAVING COALESCE(SUM(amount), 0) > 0;`,
-            [vault_id]
-        );
-        const participants = participantsResult.rows;
+        // --- Step 4: Distribute PNL ---
+        if (totalDollarSeconds <= 0) {
+            throw new Error('No user contributions found for this farming period. Cannot distribute PNL.');
+        }
 
-        for (const participant of participants) {
-            const principal = parseFloat(participant.principal);
-            const pnlAmount = principal * (pnlPercentage / 100.0);
-            if (Math.abs(pnlAmount) > 0.000001) {
+        let participantsCount = 0;
+        for (const [userId, dollarSeconds] of userDollarSeconds.entries()) {
+            const userShare = dollarSeconds / totalDollarSeconds;
+            const pnlAmount = numericValue * userShare;
+
+            if (pnlAmount > 0.000001) {
                 await client.query(
-                    `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount) 
-                     VALUES ($1, $2, 'PNL_DISTRIBUTION', $3);`,
-                    [participant.user_id, vault_id, pnlAmount]
+                    `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
+                     VALUES ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT');`,
+                    [userId, vault_id, pnlAmount]
                 );
+                participantsCount++;
             }
         }
         
         await client.query('COMMIT');
-        res.status(200).json({ message: `Successfully reaped $${numericValue} from ${protocolName} and distributed ${pnlPercentage.toFixed(2)}% PNL to ${participants.length} users.` });
+        res.status(200).json({ message: `Successfully reaped $${numericValue} from ${protocolName} and distributed time-weighted PNL to ${participantsCount} users.` });
 
     } catch (error) {
         await client.query('ROLLBACK');
@@ -1643,6 +1844,216 @@ router.get('/farming-protocols', async (req, res) => {
         if (client) {
             client.release();
         }
+    }
+});
+
+// This endpoint is hit when an admin clicks "Complete Transfer" in the UI.
+router.post('/transfers/:transferId/complete', async (req, res) => {
+    const { transferId } = req.params;
+    const adminUserId = req.user.id;
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. Fetch the transfer request and lock the row to prevent double-processing.
+        const transferResult = await client.query(
+            "SELECT * FROM vault_transfers WHERE transfer_id = $1 AND status = 'PENDING_UNWIND' FOR UPDATE",
+            [transferId]
+        );
+
+        if (transferResult.rows.length === 0) {
+            throw new Error('Pending transfer not found or already processed.');
+        }
+        const transfer = transferResult.rows[0];
+        const { user_id, to_vault_id, amount } = transfer;
+
+        // 2. Unfreeze the funds and finalize the accounting.
+        //    Instead of deleting the 'HELD' record, we create a 'TRANSFER_OUT' record to balance it,
+        //    creating a perfect, immutable audit trail.
+        await client.query(
+            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
+             VALUES ($1, $2, 'VAULT_TRANSFER_OUT', $3, 'SWEPT')`,
+            [user_id, transfer.from_vault_id, 0] // We can log a zero-amount entry just for the audit trail if needed, or adjust the logic.
+                                                // A better way is to update the 'HELD' status. Let's do that.
+        );
+
+        // --- CORRECTED LOGIC ---
+        // Let's update the status of the 'HELD' entry to 'PROCESSED'
+        // This is cleaner than creating a zero-amount entry.
+        await client.query(
+            `UPDATE vault_ledger_entries 
+             SET status = 'PROCESSED', entry_type = 'VAULT_TRANSFER_OUT'
+             WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'TRANSFER_FUNDS_HELD' AND amount = $3`,
+            [user_id, transfer.from_vault_id, -amount] // Ensure we're updating the correct entry
+        );
+
+
+        // 3. Credit the destination vault with the funds.
+        await client.query(
+            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
+             VALUES ($1, $2, 'VAULT_TRANSFER_IN', $3, 'SWEPT')`,
+            [user_id, to_vault_id, amount]
+        );
+
+        // 4. Update the main transfer request record to mark it as complete.
+        await client.query(
+            "UPDATE vault_transfers SET status = 'COMPLETED', completed_at = NOW() WHERE transfer_id = $1",
+            [transferId]
+        );
+
+        // 5. Update the user activity log.
+        // We find the original request and update its status.
+        const description = `Requested transfer of ${parseFloat(amount).toFixed(2)} USDC from Vault ${transfer.from_vault_id} to Vault ${transfer.to_vault_id}.`;
+        await client.query(
+            "UPDATE user_activity_log SET status = 'COMPLETED' WHERE user_id = $1 AND activity_type = 'VAULT_TRANSFER_REQUEST' AND description = $2 AND status = 'PENDING'",
+            [user_id, description]
+        );
+
+        // --- START FARMING LEDGER INTEGRATION (FROM PREVIOUS DISCUSSION) ---
+        // Now, we apply the farming logic right here, at the moment the funds are settled.
+        
+        // a) Handle withdrawal from any source farming protocols
+        const fromVaultTypeResult = await client.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [transfer.from_vault_id]);
+        if (fromVaultTypeResult.rows[0]?.vault_type === 'FARMING') {
+            const protocolsInSourceVault = await client.query("SELECT protocol_id FROM farming_protocols WHERE vault_id = $1", [transfer.from_vault_id]);
+            for (const protocol of protocolsInSourceVault.rows) {
+                await client.query(
+                    `INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount)
+                     VALUES ($1, $2, $3, 'WITHDRAWAL', $4)`,
+                    [user_id, transfer.from_vault_id, protocol.protocol_id, amount]
+                );
+            }
+        }
+
+        // b) Handle contribution to any destination farming protocols
+        const toVaultTypeResult = await client.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [transfer.to_vault_id]);
+        if (toVaultTypeResult.rows[0]?.vault_type === 'FARMING') {
+            const activeProtocolsInDestVault = await client.query("SELECT protocol_id FROM farming_protocols WHERE vault_id = $1 AND status = 'FARMING'", [transfer.to_vault_id]);
+            for (const protocol of activeProtocolsInDestVault.rows) {
+                await client.query(
+                    `INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount)
+                     VALUES ($1, $2, $3, 'CONTRIBUTION', $4)`,
+                    [user_id, to_vault_id, protocol.protocol_id, amount]
+                );
+            }
+        }
+        // --- END FARMING LEDGER INTEGRATION ---
+
+        await client.query('COMMIT');
+
+        res.status(200).json({ message: 'Transfer successfully completed and credited to the user.' });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`Error completing transfer ${transferId} by admin ${adminUserId}:`, err);
+        res.status(500).json({ error: 'Failed to complete transfer.' });
+    } finally {
+        client.release();
+    }
+});
+
+// Add this new endpoint to routes/admin.js
+
+router.post('/reports/generate-monthly-drafts', async (req, res) => {
+    const adminUserId = req.user.id;
+    const { vaultId, month, pnlPercentage, notes } = req.body;
+
+    const numericPnl = parseFloat(pnlPercentage);
+    if (!vaultId || !month || isNaN(numericPnl)) {
+        return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and a numeric pnlPercentage are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // --- Step 1: Record the official monthly performance (your existing logic, now integrated here) ---
+        await client.query(
+            `INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (vault_id, month) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, notes = EXCLUDED.notes;`,
+            [vaultId, month, numericPnl, notes, adminUserId]
+        );
+
+        const startDate = new Date(month);
+        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
+
+        // --- Step 2: Find all users who were active in the vault at the start of the month ---
+        const participantsResult = await client.query(
+            `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
+             FROM vault_ledger_entries
+             WHERE vault_id = $1 AND created_at < $2
+             GROUP BY user_id
+             HAVING COALESCE(SUM(amount), 0) > 0;`,
+            [vaultId, startDate]
+        );
+        const participants = participantsResult.rows;
+
+        if (participants.length === 0) {
+            await client.query('COMMIT');
+            return res.status(200).json({ message: 'Monthly performance saved. No active participants found for this period to generate reports for.' });
+        }
+
+        let reportsGenerated = 0;
+        // --- Step 3: Loop through each participant and generate their individual report ---
+        for (const participant of participants) {
+            const userId = participant.user_id;
+            const startingCapital = parseFloat(participant.starting_capital);
+
+            // a) Calculate this user's PNL based on THEIR starting capital
+            const pnlAmount = startingCapital * (numericPnl / 100.0);
+
+            // b) Fetch this user's transactions during the period
+            const transactionsResult = await client.query(
+                `SELECT entry_type, amount, created_at FROM vault_ledger_entries 
+                 WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
+                [userId, vaultId, startDate, endDate]
+            );
+            const periodTransactions = transactionsResult.rows.map(tx => ({ ...tx, amount: parseFloat(tx.amount) }));
+
+            // c) Calculate period totals and ending capital
+            const periodDeposits = periodTransactions.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
+            const periodWithdrawals = periodTransactions.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
+            const endingCapital = startingCapital + pnlAmount + periodDeposits - periodWithdrawals;
+
+            // d) Assemble the final report_data JSON object
+            const reportData = {
+                title: `Performance Report for ${month}`,
+                startDate: startDate.toISOString().split('T')[0],
+                endDate: new Date(endDate - 1).toISOString().split('T')[0], // End of the month
+                openingRemarks: `Official Performance Report for ${new Date(month).toLocaleString('default', { month: 'long', year: 'year' })}.`,
+                closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
+                summary: {
+                    startingCapital,
+                    pnlAmount,
+                    pnlPercentage: numericPnl,
+                    periodDeposits,
+                    periodWithdrawals,
+                    endingCapital,
+                },
+                periodTransactions
+            };
+
+            // e) Upsert the draft report into the database
+            await client.query(
+                `INSERT INTO user_monthly_reports (user_id, report_date, report_data, status, title, last_updated_by)
+                 VALUES ($1, $2, $3, 'DRAFT', $4, $5)
+                 ON CONFLICT (user_id, report_date) DO UPDATE SET report_data = EXCLUDED.report_data, status = 'DRAFT', last_updated_by = EXCLUDED.last_updated_by;`,
+                [userId, month, reportData, reportData.title, adminUserId]
+            );
+            reportsGenerated++;
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Successfully saved monthly performance and generated ${reportsGenerated} draft reports.` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error generating monthly draft reports:', err);
+        res.status(500).json({ error: 'An error occurred during draft generation.' });
+    } finally {
+        client.release();
     }
 });
 
