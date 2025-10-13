@@ -1,9 +1,12 @@
+// routes/vaultDetails.js
+
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const { getPrices } = require('../utils/priceOracle');
-const router = require("./withdraw");
+
+
 
 router.get('/:vaultId', authenticateToken, async (req, res) => {
   const { vaultId } = req.params;
@@ -22,20 +25,18 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       openTradesResult,
       userLedgerResult,
       farmingProtocolsResult,
-      vaultLedgerStatsResult // Added for ownership calculation
+      vaultLedgerStatsResult
     ] = await Promise.all([
       client.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
-      // CORRECTED QUERY: Fetch all columns for assets once.
       client.query('SELECT symbol, contract_address, chain, coingecko_id, is_primary_asset FROM vault_assets WHERE vault_id = $1', [vaultId]),
       client.query('SELECT * FROM vault_trades WHERE vault_id = $1 AND status = \'OPEN\'', [vaultId]),
       client.query(`SELECT * FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 ORDER BY created_at ASC`, [targetUserId, vaultId]),
       client.query(`SELECT protocol_id, name, chain, description, status, has_rewards, rewards_realized_usd, date_reaped FROM farming_protocols WHERE vault_id = $1 ORDER BY status, name ASC`, [vaultId]),
-      // CORRECTED QUERY: Get total principal for the whole vault, not just deposits.
       client.query(`SELECT COALESCE(SUM(amount), 0) as total_principal FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type NOT IN ('PNL_DISTRIBUTION')`, [vaultId])
     ]);
 
     if (vaultInfoResult.rows.length === 0) {
-      client.release();
+      // Small fix: Don't release the client here, let the 'finally' block handle it.
       return res.status(404).json({ error: 'Vault not found' });
     }
 
@@ -77,9 +78,9 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       assetBreakdown: assetBreakdownWithPrices,
       userPosition,
       userLedger: userLedgerEntries.reverse(),
-      openTrades, // Pass this down for Reserve Vault
-      farmingProtocols, // Pass this down for Farming Vault
-      vaultStats: { capitalInTransit, pendingWithdrawals, totalPrincipal: vaultTotalPrincipal }, // Pass down vault total principal
+      openTrades,
+      farmingProtocols,
+      vaultStats: { capitalInTransit, pendingWithdrawals, totalPrincipal: vaultTotalPrincipal },
     };
     
     res.json(responsePayload);
