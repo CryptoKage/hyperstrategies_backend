@@ -1,5 +1,8 @@
-// routes/vaultDetails.js
-
+const express = require('express');
+const router = express.Router();
+const pool = require('../db');
+const authenticateToken = require('../middleware/authenticateToken');
+const { getPrices } = require('../utils/priceOracle');
 const router = require("./withdraw");
 
 router.get('/:vaultId', authenticateToken, async (req, res) => {
