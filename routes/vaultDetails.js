@@ -1,5 +1,7 @@
 // routes/vaultDetails.js
 
+const router = require("./withdraw");
+
 router.get('/:vaultId', authenticateToken, async (req, res) => {
   const { vaultId } = req.params;
   
