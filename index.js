@@ -1,4 +1,4 @@
-// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/index.js
+// index.js
 
 const dotenv = require('dotenv');
 dotenv.config();
@@ -11,6 +11,10 @@ const passport = require('passport');
 const ethers = require('ethers');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
+
+// --- NEW IMPORTS for Production Session Store ---
+const pgSimple = require('connect-pg-simple')(session);
+const pool = require('./db'); // Import your existing database pool
 
 // --- Route Imports ---
 const { corsOptions } = require('./config/cors');
@@ -46,7 +50,11 @@ if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === '') {
   console.error('FATAL ERROR: JWT_SECRET environment variable is not defined.');
   process.exit(1);
 }
-// ... (rest of your startup checks)
+// --- NEW: Fail-fast check for SESSION_SECRET ---
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.trim() === '') {
+  console.error('FATAL ERROR: SESSION_SECRET environment variable is not defined.');
+  process.exit(1);
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -59,7 +67,7 @@ app.use(helmet());
 
 const globalLimiter = rateLimit({
 	windowMs: 15 * 60 * 1000, // 15 minutes
-	max: 250, // Increase the limit
+	max: 250,
 	standardHeaders: true,
 	legacyHeaders: false, 
   message: 'Too many requests from this IP, please try again after 15 minutes.'
@@ -68,15 +76,21 @@ app.use(globalLimiter);
 
 app.use(express.json());
 
-const isProduction = process.env.NODE_ENV === 'production';
+// --- UPDATED: Production-Ready Session Middleware ---
 app.use(session({
+  store: new pgSimple({
+    pool: pool,                // Use your existing database pool
+    tableName: 'user_sessions',// Name of the session table in PostgreSQL
+    createTableIfMissing: true,
+  }),
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: isProduction,
+    secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
-    sameSite: isProduction ? 'strict' : 'lax'
+    sameSite: 'lax', // 'lax' is required for OAuth redirects to work correctly.
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
   }
 }));
 
