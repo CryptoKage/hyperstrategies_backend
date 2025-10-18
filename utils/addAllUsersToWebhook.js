@@ -1,17 +1,27 @@
 // utils/addAllUsersToWebhook.js
-require('dotenv').config(); // Still useful for DATABASE_URL
+require('dotenv').config();
 const { Alchemy } = require('alchemy-sdk');
-const pool = require('../db');
+const { Pool } = require('pg'); // Import Pool directly
 
 // --- NEW: Read from command-line arguments ---
 const ALCHEMY_API_KEY = process.argv[2];
 const WEBHOOK_ID = process.argv[3];
-// --- END NEW ---
 
-if (!process.env.DATABASE_URL) {
-    console.error('ERROR: DATABASE_URL must be set in the environment.');
+// --- MODIFIED: Check for either DATABASE_URL or DB_HOST ---
+const connectionString = process.env.DATABASE_URL || process.env.DB_HOST;
+if (!connectionString) {
+    console.error('ERROR: DATABASE_URL or DB_HOST must be set in the environment.');
     process.exit(1);
 }
+
+// --- MODIFIED: Create a new pool using the connection string ---
+const pool = new Pool({
+  connectionString: connectionString,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
 
 if (!ALCHEMY_API_KEY || !WEBHOOK_ID) {
     console.error('ERROR: This script requires two arguments.');
