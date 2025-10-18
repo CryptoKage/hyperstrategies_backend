@@ -1,31 +1,34 @@
 // utils/addAllUsersToWebhook.js
 require('dotenv').config();
 const { Alchemy } = require('alchemy-sdk');
-const { Pool } = require('pg'); // Import Pool directly
+const { Pool } = require('pg');
 
-// --- NEW: Read from command-line arguments ---
 const ALCHEMY_API_KEY = process.argv[2];
 const WEBHOOK_ID = process.argv[3];
 
-// --- MODIFIED: Check for either DATABASE_URL or DB_HOST ---
-const connectionString = process.env.DATABASE_URL || process.env.DB_HOST;
-if (!connectionString) {
-    console.error('ERROR: DATABASE_URL or DB_HOST must be set in the environment.');
-    process.exit(1);
-}
-
-// --- MODIFIED: Create a new pool using the connection string ---
-const pool = new Pool({
-  connectionString: connectionString,
+// --- NEW, ROBUST CONNECTION LOGIC ---
+// Render provides individual components. Let's use them.
+const dbConfig = {
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT || 5432,
   ssl: {
     rejectUnauthorized: false
   }
-});
+};
 
+if (!dbConfig.host || !dbConfig.user || !dbConfig.password || !dbConfig.database) {
+    console.error('ERROR: Missing one or more required database environment variables: DB_USER, DB_HOST, DB_NAME, DB_PASSWORD');
+    process.exit(1);
+}
+// --- END NEW LOGIC ---
+
+const pool = new Pool(dbConfig);
 
 if (!ALCHEMY_API_KEY || !WEBHOOK_ID) {
-    console.error('ERROR: This script requires two arguments.');
-    console.error('Usage: node utils/addAllUsersToWebhook.js <YOUR_ALCHEMY_API_KEY> <YOUR_ALCHEMY_WEBHOOK_ID>');
+    console.error('ERROR: Script requires arguments: <API_KEY> <WEBHOOK_ID>');
     process.exit(1);
 }
 
@@ -39,17 +42,13 @@ async function addAddresses() {
         const addresses = rows.map(r => r.eth_address);
 
         if (addresses.length === 0) {
-            console.log('No user addresses found in the database to add.');
+            console.log('No user addresses found.');
             return;
         }
 
-        console.log(`Found ${addresses.length} addresses. Adding them to webhook ID: ${WEBHOOK_ID}...`);
-
-        await alchemy.notify.updateWebhook(WEBHOOK_ID, {
-            addAddresses: addresses
-        });
-        
-        console.log(`✅ Successfully added ${addresses.length} addresses to the webhook.`);
+        console.log(`Found ${addresses.length} addresses. Adding to webhook: ${WEBHOOK_ID}...`);
+        await alchemy.notify.updateWebhook(WEBHOOK_ID, { addAddresses: addresses });
+        console.log(`✅ Successfully added ${addresses.length} addresses.`);
 
     } catch (error) {
         console.error('❌ Failed to add addresses to webhook:', error);
