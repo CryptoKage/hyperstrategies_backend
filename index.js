@@ -41,7 +41,7 @@ require('./passport-setup');
 // --- Job & Utility Imports ---
 const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
 const { verifyWithdrawalSweeps } = require('./jobs/verifyWithdrawalSweeps');
-const { initializeWebSocketProvider } = require('./utils/alchemyWebsocketProvider'); 
+//const { initializeWebSocketProvider } = require('./utils/alchemyWebsocketProvider'); 
 const { subscribeToNewBlocks } = require('./jobs/pollDeposits'); 
 const cron = require('node-cron');
 
