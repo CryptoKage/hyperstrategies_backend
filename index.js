@@ -34,6 +34,7 @@ const adminRoutes = require('./routes/admin');
 const userRoutes = require('./routes/user');
 const marketDataRoutes = require('./routes/marketData');
 const performanceRoutes = require('./routes/performance');
+const webhookRoutes = require('./routes/webhooks');
 const systemRoutes = require('./routes/system');
 require('./passport-setup');
 
@@ -64,6 +65,7 @@ const PORT = process.env.PORT || 5000;
 app.use(cookieParser());
 app.use(cors(corsOptions));
 app.use(helmet());
+
 
 const globalLimiter = rateLimit({
 	windowMs: 15 * 60 * 1000, // 15 minutes
@@ -113,6 +115,7 @@ app.use('/api/pins-marketplace', pinsMarketplaceRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
 app.use('/api/pnl', pnlRoutes);
+app.use('/api/webhooks', webhookRoutes);
 //app.use('/api/market-data', marketDataRoutes);
 //app.use('/api/performance', performanceRoutes);
 app.use('/api/system', systemRoutes);
@@ -130,8 +133,8 @@ app.listen(PORT, async () => {
   // --- Initialize All Background Jobs & Services ---
   console.log('🕒 Initializing background jobs and services...');
 
-  initializeWebSocketProvider();
-  subscribeToNewBlocks();
+  //initializeWebSocketProvider();
+  //subscribeToNewBlocks();
   
   // Job 2: Process platform withdrawal queue (every 45 seconds)
   let isProcessingWithdrawals = false;
