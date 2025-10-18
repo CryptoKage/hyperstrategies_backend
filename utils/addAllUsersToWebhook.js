@@ -1,13 +1,21 @@
-// scripts/addAllUsersToWebhook.js
-require('dotenv').config();
+// utils/addAllUsersToWebhook.js
+require('dotenv').config(); // Still useful for DATABASE_URL
 const { Alchemy } = require('alchemy-sdk');
 const pool = require('../db');
 
-const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY;
-const WEBHOOK_ID = process.env.ALCHEMY_WEBHOOK_ID; // You'll need to get this from the Alchemy dashboard URL
+// --- NEW: Read from command-line arguments ---
+const ALCHEMY_API_KEY = process.argv[2];
+const WEBHOOK_ID = process.argv[3];
+// --- END NEW ---
+
+if (!process.env.DATABASE_URL) {
+    console.error('ERROR: DATABASE_URL must be set in the environment.');
+    process.exit(1);
+}
 
 if (!ALCHEMY_API_KEY || !WEBHOOK_ID) {
-    console.error('ERROR: ALCHEMY_API_KEY and ALCHEMY_WEBHOOK_ID must be set in your .env file.');
+    console.error('ERROR: This script requires two arguments.');
+    console.error('Usage: node utils/addAllUsersToWebhook.js <YOUR_ALCHEMY_API_KEY> <YOUR_ALCHEMY_WEBHOOK_ID>');
     process.exit(1);
 }
 
@@ -27,7 +35,6 @@ async function addAddresses() {
 
         console.log(`Found ${addresses.length} addresses. Adding them to webhook ID: ${WEBHOOK_ID}...`);
 
-        // This replaces the entire list of addresses on the webhook
         await alchemy.notify.updateWebhook(WEBHOOK_ID, {
             addAddresses: addresses
         });
