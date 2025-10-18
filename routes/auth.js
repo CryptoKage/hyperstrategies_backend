@@ -224,10 +224,10 @@ router.post(
       };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
+      // CRITICAL FIX: Set the cookie for the parent domain
       res.cookie('token', token, cookieOptions);
       
 
-      // --- THE FINAL FIX ---
       // Send ONE response that includes the user object for the frontend context.
       res.status(200).json({ message: 'Login successful', user: payload.user });
 
@@ -317,12 +317,11 @@ router.get('/google/callback',
        const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       const frontend = process.env.FRONTEND_URL || 'https://www.hyper-strategies.com';
 
-      // --- THE FIX: Use the centralized cookieOptions object ---
       res.cookie('token', token, cookieOptions);
       
       await client.query('COMMIT');
       
-      res.redirect(`${frontend}/oauth-success`);
+      res.redirect(`${process.env.FRONTEND_URL}/oauth-success`);
 
     } catch (err) {
       await client.query('ROLLBACK');
@@ -460,8 +459,9 @@ router.post('/refresh-token', authenticateToken, async (req, res) => {
     
      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
+
      res.cookie('token', token, cookieOptions);
-  res.status(200).json({ user: payload.user });
+     res.status(200).json({ user: payload.user });
 
   } catch (err) {
     console.error('[Token Refresh Error]', err);
@@ -473,9 +473,6 @@ router.post('/logout', (req, res) => {
   res.clearCookie('token', { 
     domain: cookieOptions.domain, 
     path: '/',
-    secure: cookieOptions.secure,
-    sameSite: cookieOptions.sameSite,
-    httpOnly: cookieOptions.httpOnly
   });
   res.status(200).json({ message: 'Logout successful' });
 });
