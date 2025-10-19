@@ -1,13 +1,16 @@
-require('dotenv').config();
+// runJob.js - CORRECTED
 
-// This script allows you to run a specific background job from the command line.
-// Example Usage: node runJob.js updateVaultPerformance
+require('dotenv').config();
+const { findAndCreditDeposits } = require('./jobs/pollDeposits');
+const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
+const { processWithdrawals } = require('./jobs/queueProcessor');
+// Add any other jobs you want to run manually here.
 
 const jobName = process.argv[2];
 
 if (!jobName) {
   console.error('❌ ERROR: Please provide the name of the job to run.');
-  console.log('Example: node runJob.js updateVaultPerformance');
+  console.log('Available jobs: syncDeposits, updateVaultPerformance, processWithdrawals');
   process.exit(1);
 }
 
@@ -16,48 +19,25 @@ const run = async () => {
   
   try {
     switch (jobName) {
-      case 'updateVaultPerformance':
-        const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
-        await updateVaultPerformance();
+      case 'syncDeposits':
+        // This now calls our powerful full-history sync function.
+        console.log('Running a full history scan for all user deposits...');
+        await findAndCreditDeposits({ fromBlock: "0x0" });
         break;
       
-      case 'pollDeposits': {
-        const { ethers } = require('ethers');
-        const { scanBlockForDeposits } = require('./pollDeposits');
-
-        const rpcUrl = process.env.ALCHEMY_RPC_URL;
-        if (!rpcUrl) {
-          throw new Error('ALCHEMY_RPC_URL environment variable is required to run the pollDeposits job manually.');
-        }
-
-        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-        const latestBlock = await provider.getBlockNumber();
-        await scanBlockForDeposits(latestBlock);
-        break;
-      }
-
-          case 'reconstructHistory':
-        const { runReconstruction } = require('./jobs/reconstructHistory');
-        await runReconstruction();
+      case 'updateVaultPerformance':
+        await updateVaultPerformance();
         break;
         
       case 'processWithdrawals':
-        const { processWithdrawals } = require('./jobs/queueProcessor');
         await processWithdrawals();
         break;
-    
-
-     case 'backfillPnl':
-        const { runPnlBackfill } = require('./jobs/backfillVaultHistory');
-        await runPnlBackfill();
-        break;
-
         
-      // Add other job names here as needed...
+      // Add other jobs here if you need them.
 
       default:
         console.error(`❌ ERROR: Job "${jobName}" not found.`);
-        console.log('Available jobs: updateVaultPerformance, pollDeposits, processWithdrawals, backfillPnl');
+        console.log('Available jobs: syncDeposits, updateVaultPerformance, processWithdrawals');
         process.exit(1);
     }
     

@@ -176,4 +176,10 @@ app.listen(PORT, async () => {
     console.log('Triggering scheduled withdrawal sweep verification...');
     verifyWithdrawalSweeps();
   });
+
+    const { scanForRecentDeposits } = require('./jobs/pollDeposits');
+  cron.schedule('*/15 * * * *', () => { // Runs "at every 15th minute"
+    console.log('🕒 Triggering scheduled 15-minute deposit check...');
+    scanForRecentDeposits();
+  });
 });

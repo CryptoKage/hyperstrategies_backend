@@ -10,6 +10,7 @@ const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
 const { decrypt } = require('../utils/walletUtils'); 
 const tokenMap = require('../utils/tokens/tokenMap'); 
 const erc20Abi = require('../utils/abis/erc20.json'); 
+const { findAndCreditDeposits } = require('../jobs/pollDeposits');
 
 const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
@@ -17,6 +18,7 @@ const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Netw
 // Authenticate first, then verify admin status via asynchronous DB lookup.
 router.use(authenticateToken);
 router.use(isAdmin);
+
 
 
 // --- Get Full Admin Dashboard Stats Endpoint (Ledger-Based) ---
@@ -56,6 +58,23 @@ router.get('/dashboard-stats', async (req, res) => {
     console.error("Admin dashboard error:", err);
     res.status(500).json({ error: "Failed to fetch admin stats" });
   }
+});
+
+router.post('/jobs/sync-all-deposits', async (req, res) => {
+    console.log(`[ADMIN] Manual "Sync All Deposits" triggered by admin ${req.user.id}`);
+    
+    // We don't await this. We trigger the job and let it run in the background.
+    // The 'fromBlock: "0x0"' tells it to scan the entire history.
+    findAndCreditDeposits({ fromBlock: "0x0" })
+        .then(result => {
+            console.log(`[ADMIN] Manual sync job finished. Results: ${JSON.stringify(result)}`);
+            // You could add a notification here (e.g., via websocket) to tell the admin it's done.
+        })
+        .catch(err => {
+            console.error(`[ADMIN] Manual sync job FAILED:`, err.message);
+        });
+
+    res.status(202).json({ message: 'Full deposit synchronization job has been triggered. It will run in the background. Check server logs for progress.' });
 });
 
 // --- Manual PnL Application Endpoint ---
