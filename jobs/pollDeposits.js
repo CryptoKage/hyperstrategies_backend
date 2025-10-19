@@ -31,14 +31,14 @@ async function findAndCreditDeposits(options = {}) {
             return { newDeposits: 0, usersChecked: 0 };
         }
         
-        const userAddresses = users.map(u => u.eth_address);
+        // Use a Map for efficient lookups.
         const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
-        // 2. Make ONE batched API call to Alchemy.
+        // 2. Make ONE batched API call to Alchemy, but WITHOUT the 'toAddress' filter.
         const transfers = await alchemy.core.getAssetTransfers({
             fromBlock: fromBlock,
             toBlock: toBlock,
-            toAddress: userAddresses, // This is efficient, but only works on paid Alchemy tiers. Let's adjust.
+            // toAddress: userAddresses, // <-- THIS IS THE LINE WE ARE REMOVING
             category: [AssetTransfersCategory.ERC20],
             contractAddresses: [tokenMap.usdc.address],
             withMetadata: false,
@@ -46,17 +46,17 @@ async function findAndCreditDeposits(options = {}) {
         });
 
         let newDepositsFound = 0;
-        // 3. Process the results.
+        // 3. Process the results. This logic remains the same.
         for (const event of transfers.transfers) {
             const toAddress = event.to?.toLowerCase();
             const txHash = event.hash;
 
-            // Alchemy's `toAddress` filter can sometimes be broad. We double-check.
+            // Our own code now does the filtering. This is reliable.
             if (toAddress && userAddressMap.has(toAddress)) {
                 const { rows: existing } = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
                 if (existing.length === 0) {
                     const userId = userAddressMap.get(toAddress);
-                    const rawAmount = event.value; // Alchemy SDK provides this as a number-string.
+                    const rawAmount = event.value;
                     const formattedAmount = ethers.utils.formatUnits(rawAmount, tokenMap.usdc.decimals);
 
                     await client.query('BEGIN');
@@ -70,13 +70,12 @@ async function findAndCreditDeposits(options = {}) {
             }
         }
         
-        console.log(`[Deposit Scan] Finished. Found ${newDepositsFound} new deposits for ${users.length} users.`);
+        console.log(`[Deposit Scan] Finished. Found ${newDepositsFound} new deposits.`);
         return { newDeposits: newDepositsFound, usersChecked: users.length };
 
     } catch (error) {
         if (client) await client.query('ROLLBACK');
         console.error('❌ Major error in findAndCreditDeposits:', error);
-        // Re-throw the error so the caller knows the job failed
         throw error;
     } finally {
         if (client) client.release();
