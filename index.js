@@ -36,6 +36,7 @@ const marketDataRoutes = require('./routes/marketData');
 const performanceRoutes = require('./routes/performance');
 const webhookRoutes = require('./routes/webhooks');
 const systemRoutes = require('./routes/system');
+const farmingRoutes = require('./routes/farming');
 require('./passport-setup');
 
 // --- Job & Utility Imports ---
@@ -114,6 +115,7 @@ app.use('/api/stats', statsRoutes);
 app.use('/api/vault-details', vaultDetailsRoutes);
 app.use('/api/pnl', pnlRoutes);
 app.use('/api/webhooks', webhookRoutes);
+app.use('/api/farming', farmingRoutes);
 //app.use('/api/market-data', marketDataRoutes);
 //app.use('/api/performance', performanceRoutes);
 app.use('/api/system', systemRoutes);

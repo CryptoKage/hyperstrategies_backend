@@ -2076,4 +2076,127 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
     }
 });
 
+// Add this new endpoint to routes/admin.js
+
+router.post('/rewards/distribute-by-xp', async (req, res) => {
+    const adminUserId = req.user.id;
+    const { totalRewardUsd, participatingVaultIds, description } = req.body;
+
+    // --- 1. Validation ---
+    const numericReward = parseFloat(totalRewardUsd);
+    if (isNaN(numericReward) || numericReward <= 0) {
+        return res.status(400).json({ error: 'A valid, positive totalRewardUsd is required.' });
+    }
+    if (!Array.isArray(participatingVaultIds) || participatingVaultIds.length === 0) {
+        return res.status(400).json({ error: 'participatingVaultIds must be a non-empty array.' });
+    }
+    if (!description || description.trim() === '') {
+        return res.status(400).json({ error: 'A clear description for the activity log is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        console.log(`[XP Reward] Starting distribution of ${numericReward} USD for vaults: [${participatingVaultIds.join(', ')}]`);
+
+        // --- 2. Get a unique list of all users invested in the participating vaults ---
+        const eligibleUsersQuery = `
+            SELECT DISTINCT user_id
+            FROM vault_ledger_entries
+            WHERE vault_id = ANY($1::int[])
+            GROUP BY user_id
+            HAVING SUM(amount) > 0.000001;
+        `;
+        const eligibleUsersResult = await client.query(eligibleUsersQuery, [participatingVaultIds]);
+        const userIds = eligibleUsersResult.rows.map(r => r.user_id);
+
+        if (userIds.length === 0) {
+            await client.query('ROLLBACK'); // No need to proceed if no one is eligible
+            return res.status(200).json({ message: 'Distribution aborted. No eligible users found in the specified vaults.' });
+        }
+        
+        console.log(`[XP Reward] Found ${userIds.length} eligible participants.`);
+
+        // --- 3. Fetch the XP scores for these eligible users ---
+        const userXpQuery = `SELECT user_id, xp FROM users WHERE user_id = ANY($1::uuid[])`;
+        const userXpResult = await client.query(userXpQuery, [userIds]);
+
+        let totalEligibleXp = 0;
+        const userXpMap = new Map();
+        for (const user of userXpResult.rows) {
+            const xp = parseFloat(user.xp);
+            if (xp > 0) {
+                totalEligibleXp += xp;
+                userXpMap.set(user.user_id, xp);
+            }
+        }
+
+        if (totalEligibleXp <= 0) {
+            await client.query('ROLLBACK');
+            return res.status(200).json({ message: 'Distribution aborted. Total XP of eligible users is zero.' });
+        }
+        
+        console.log(`[XP Reward] Total eligible XP for distribution: ${totalEligibleXp}.`);
+
+        // --- 4. For each eligible user, calculate their share and distribute it proportionally across their holdings ---
+        for (const [userId, userXp] of userXpMap.entries()) {
+            const userShare = userXp / totalEligibleXp;
+            const userTotalPnl = numericReward * userShare;
+
+            // Find which of the participating vaults this user is invested in and their capital in each
+            const userHoldingsResult = await client.query(
+                `SELECT vault_id, SUM(amount) as capital
+                 FROM vault_ledger_entries
+                 WHERE user_id = $1 AND vault_id = ANY($2::int[])
+                 GROUP BY vault_id
+                 HAVING SUM(amount) > 0;`,
+                [userId, participatingVaultIds]
+            );
+
+            const userHoldings = userHoldingsResult.rows;
+            const totalUserCapitalInVaults = userHoldings.reduce((sum, holding) => sum + parseFloat(holding.capital), 0);
+
+            if (totalUserCapitalInVaults > 0) {
+                // Distribute the PNL proportionally to their capital in each eligible vault
+                for (const holding of userHoldings) {
+                    const vaultId = holding.vault_id;
+                    const capitalInVault = parseFloat(holding.capital);
+                    const proportion = capitalInVault / totalUserCapitalInVaults;
+                    const pnlForThisVault = userTotalPnl * proportion;
+
+                    if (pnlForThisVault > 0.000001) {
+                        // Insert the PNL into the main ledger
+                        await client.query(
+                            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status)
+                             VALUES ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT');`,
+                            [userId, vaultId, pnlForThisVault]
+                        );
+                    }
+                }
+            }
+            
+            // Create a single, clear activity log entry for the user for the total PNL they received
+            const activityLogDesc = `Received ${userTotalPnl.toFixed(2)} USDC as a platform reward from ${description}.`;
+            await client.query(
+                `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source)
+                 VALUES ($1, 'PLATFORM_REWARD', $2, $3, 'USDC', 'COMPLETED', 'XP_WEIGHTED_DISTRO');`,
+                [userId, activityLogDesc, userTotalPnl]
+            );
+        }
+
+        console.log(`[XP Reward] Successfully calculated and logged PNL for ${userXpMap.size} users.`);
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Successfully distributed ${numericReward} USD to ${userXpMap.size} users based on XP.` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('XP-weighted reward distribution failed:', err);
+        res.status(500).json({ error: 'An error occurred during reward distribution.' });
+    } finally {
+        client.release();
+    }
+});
+
 module.exports = router;
