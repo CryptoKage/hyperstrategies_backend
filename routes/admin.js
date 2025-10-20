@@ -2199,4 +2199,14 @@ router.post('/rewards/distribute-by-xp', async (req, res) => {
     }
 });
 
+router.get('/vaults/all', async (req, res) => {
+    try {
+        const { rows } = await pool.query('SELECT vault_id, name, vault_type, status FROM vaults ORDER BY vault_id ASC');
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error("Error fetching all vaults for admin:", error);
+        res.status(500).json({ error: 'Failed to fetch vault list.' });
+    }
+});
+
 module.exports = router;
