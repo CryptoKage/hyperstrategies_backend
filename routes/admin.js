@@ -2213,4 +2213,69 @@ router.get('/vaults/all', async (req, res) => {
     }
 });
 
+// in routes/admin.js
+
+router.post('/farming-protocols/:protocolId/reap', async (req, res) => {
+    const { protocolId } = req.params;
+    const { realizedUsdValue } = req.body;
+    const adminUserId = req.user.id;
+    
+    const numericValue = parseFloat(realizedUsdValue);
+    if (isNaN(numericValue) || numericValue <= 0) {
+        return res.status(400).json({ error: 'A valid, positive realizedUsdValue is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // --- Step 1: Fetch protocol info and lock the row ---
+        const protocolResult = await client.query(
+            "SELECT vault_id, name FROM farming_protocols WHERE protocol_id = $1 AND status = 'FARMING' FOR UPDATE", 
+            [protocolId]
+        );
+        if (protocolResult.rows.length === 0) {
+            throw new Error('Farming protocol not found or not in FARMING status.');
+        }
+        const { vault_id, name: protocolName } = protocolResult.rows[0];
+        const reapDate = new Date();
+
+        // --- Step 2: Update the protocol to record the harvest ---
+        // We still record the realized value against the protocol for historical tracking.
+        await client.query(
+            `UPDATE farming_protocols 
+             SET has_rewards = TRUE, rewards_realized_usd = COALESCE(rewards_realized_usd, 0) + $1, date_reaped = $2 
+             WHERE protocol_id = $3;`,
+            [numericValue, reapDate, protocolId]
+        );
+        
+        // --- Step 3 (NEW LOGIC): Add the reaped funds to the Buyback Pool Ledger ---
+        const buybackLedgerName = 'FARMING_BUYBACK_POOL';
+        await client.query(
+            `UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = $2`,
+            [numericValue, buybackLedgerName]
+        );
+        
+        // --- Step 4 (NEW LOGIC): Create a treasury transaction for a clear audit trail ---
+        const description = `Reaped $${numericValue.toFixed(2)} from farming protocol '${protocolName}' (ID: ${protocolId}). Funds added to buyback pool.`;
+        await client.query(
+            `INSERT INTO treasury_transactions (to_ledger_id, amount, description) 
+             VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = $1), $2, $3)`,
+            [buybackLedgerName, numericValue, description]
+        );
+        
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Successfully reaped $${numericValue} from ${protocolName}. Funds have been added to the buyback pool.` });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(`Error reaping rewards for protocol ${protocolId}:`, error);
+        res.status(500).json({ error: error.message || 'Failed to reap rewards.' });
+    } finally {
+        client.release();
+    }
+});
+
+
+
 module.exports = router;
