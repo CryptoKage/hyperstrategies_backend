@@ -1673,7 +1673,11 @@ router.patch('/farming-protocols/:protocolId/status', async (req, res) => {
 
         // --- 1. Update the protocol status ---
         const protocolUpdateResult = await client.query(
-            "UPDATE farming_protocols SET status = $1, date_farming_started = CASE WHEN $1 = 'FARMING' THEN NOW() ELSE date_farming_started END WHERE protocol_id = $2 RETURNING protocol_id, vault_id;",
+            `UPDATE farming_protocols 
+             SET status = $1::varchar, 
+                 date_farming_started = CASE WHEN $1::varchar = 'FARMING' THEN NOW() ELSE date_farming_started END 
+             WHERE protocol_id = $2 
+             RETURNING protocol_id, vault_id;`,
             [newStatus, protocolId]
         );
 
