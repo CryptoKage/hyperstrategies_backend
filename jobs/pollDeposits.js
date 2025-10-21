@@ -1,44 +1,39 @@
-// jobs/pollDeposits.js
+// FINAL jobs/pollDeposits.js
 
 const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
 const pool = require('../db');
 const tokenMap = require('../utils/tokens/tokenMap');
 const { ethers } = require('ethers');
 
-// Initialize a single Alchemy instance for this module
 const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
-/**
- * A robust, batched function to scan for USDC deposits for all users.
- * Can be used for both periodic polling and manual admin-triggered syncs.
- * @param {object} [options] - Optional parameters for the scan.
- * @param {string} [options.fromBlock] - The starting block number (hex). If null, starts from a recent block.
- * @param {string} [options.toBlock='latest'] - The ending block number (hex).
- */
+// The key used in your system_state table. Change this if it's different.
+const LAST_SCANNED_BLOCK_KEY = 'lastCheckedBlock';
+
+
 async function findAndCreditDeposits(options = {}) {
-    const { fromBlock = null, toBlock = 'latest' } = options;
+    const { fromBlock, toBlock = 'latest' } = options;
+    
+    if (!fromBlock) {
+        throw new Error("findAndCreditDeposits requires a 'fromBlock' option.");
+    }
     
     let client;
     try {
         client = await pool.connect();
+        console.log(`[Deposit Scan] Scanning from block ${fromBlock} to ${toBlock}.`);
         
-        console.log(`[Deposit Scan] Starting scan from block ${fromBlock || 'recent'} to ${toBlock}.`);
-        
-        // 1. Fetch all user addresses ONCE.
         const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
         if (users.length === 0) {
-            console.log('[Deposit Scan] No users with registered deposit addresses found.');
-            return { newDeposits: 0, usersChecked: 0 };
+            return { newDeposits: 0, blocksScanned: 0 };
         }
         
-        // Use a Map for efficient lookups.
         const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
-        // 2. Make ONE batched API call to Alchemy, but WITHOUT the 'toAddress' filter.
+        // This is the robust method that does not rely on the 'toAddress' filter.
         const transfers = await alchemy.core.getAssetTransfers({
             fromBlock: fromBlock,
             toBlock: toBlock,
-            // toAddress: userAddresses, // <-- THIS IS THE LINE WE ARE REMOVING
             category: [AssetTransfersCategory.ERC20],
             contractAddresses: [tokenMap.usdc.address],
             withMetadata: false,
@@ -46,12 +41,10 @@ async function findAndCreditDeposits(options = {}) {
         });
 
         let newDepositsFound = 0;
-        // 3. Process the results. This logic remains the same.
         for (const event of transfers.transfers) {
             const toAddress = event.to?.toLowerCase();
             const txHash = event.hash;
 
-            // Our own code now does the filtering. This is reliable.
             if (toAddress && userAddressMap.has(toAddress)) {
                 const { rows: existing } = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
                 if (existing.length === 0) {
@@ -70,8 +63,9 @@ async function findAndCreditDeposits(options = {}) {
             }
         }
         
-        console.log(`[Deposit Scan] Finished. Found ${newDepositsFound} new deposits.`);
-        return { newDeposits: newDepositsFound, usersChecked: users.length };
+        const blocksScanned = (parseInt(toBlock, 16) || 0) - (parseInt(fromBlock, 16) || 0);
+        console.log(`[Deposit Scan] Finished. Found ${newDepositsFound} new deposits across ~${blocksScanned} blocks.`);
+        return { newDeposits: newDepositsFound, blocksScanned };
 
     } catch (error) {
         if (client) await client.query('ROLLBACK');
@@ -83,19 +77,48 @@ async function findAndCreditDeposits(options = {}) {
 }
 
 
-/**
- * A wrapper function for the scheduled cron job.
- * Scans the last 100 blocks (approx. 20 minutes) for any deposits.
- */
 async function scanForRecentDeposits() {
+    let client;
     try {
-        const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
-        const latestBlock = await provider.getBlockNumber();
-        const fromBlock = '0x' + (latestBlock - 100).toString(16); // Scan last ~20 mins
+        client = await pool.connect();
+        
+        const lastScannedResult = await client.query("SELECT value FROM system_state WHERE key = $1", [LAST_SCANNED_BLOCK_KEY]);
+        if (lastScannedResult.rows.length === 0) {
+            throw new Error(`System state for '${LAST_SCANNED_BLOCK_KEY}' is not initialized.`);
+        }
+        const fromBlockNum = parseInt(lastScannedResult.rows[0].value) + 1;
 
-        await findAndCreditDeposits({ fromBlock });
+        const latestBlockNum = await alchemy.core.getBlockNumber();
+        const toBlockNum = latestBlockNum - 6; // Safety margin for reorgs
+
+        if (fromBlockNum > toBlockNum) {
+            console.log(`[Deposit Scan] No new blocks to scan. (from: ${fromBlockNum}, to: ${toBlockNum})`);
+            return;
+        }
+
+        // We'll scan in chunks of 2000 blocks to stay within API limits.
+        const MAX_BLOCK_RANGE = 2000;
+        let currentBlock = fromBlockNum;
+
+        while (currentBlock <= toBlockNum) {
+            const endBlock = Math.min(currentBlock + MAX_BLOCK_RANGE - 1, toBlockNum);
+            
+            await findAndCreditDeposits({
+                fromBlock: '0x' + currentBlock.toString(16),
+                toBlock: '0x' + endBlock.toString(16)
+            });
+
+            // Update the state in the database after each successful chunk.
+            await client.query("UPDATE system_state SET value = $1 WHERE key = $2", [endBlock, LAST_SCANNED_BLOCK_KEY]);
+            console.log(`[Deposit Scan] Cron job scanned up to block ${endBlock}. State updated.`);
+            
+            currentBlock = endBlock + 1;
+        }
+
     } catch (error) {
         console.error('❌ Scheduled deposit scan job failed:', error.message);
+    } finally {
+        if (client) client.release();
     }
 }
 
