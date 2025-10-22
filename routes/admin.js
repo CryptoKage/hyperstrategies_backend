@@ -1381,7 +1381,7 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
                 title: `Performance Report for ${month}`,
                 startDate: startDate.toISOString().split('T')[0],
                 endDate: new Date(endDate - 1).toISOString().split('T')[0], // End of the month
-                openingRemarks: `Official Performance Report for ${new Date(month).toLocaleString('default', { month: 'long', year: 'year' })}.`,
+                openingRemarks: `Official Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}.`,
                 closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
                 summary: {
                     startingCapital,
