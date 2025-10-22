@@ -1976,112 +1976,71 @@ router.post('/transfers/:transferId/complete', async (req, res) => {
     }
 });
 
-// Add this new endpoint to routes/admin.js
 
-router.post('/reports/generate-monthly-drafts', async (req, res) => {
-    const adminUserId = req.user.id;
-    const { vaultId, month, pnlPercentage, notes } = req.body;
-
-    const numericPnl = parseFloat(pnlPercentage);
-    // --- THIS IS THE FIX ---
-    // The 'month' comes in as "YYYY-MM". We explicitly treat it as the first day of that month.
-    const monthDate = new Date(month + '-01T00:00:00Z'); // Treat as UTC midnight on the 1st
-    if (!vaultId || !month || isNaN(numericPnl) || isNaN(monthDate.getTime())) {
-        return res.status(400).json({ error: 'vaultId, a valid month (YYYY-MM), and a numeric pnlPercentage are required.' });
-    }
-    const formattedMonth = monthDate.toISOString().split('T')[0]; // "YYYY-MM-DD"
-    // --- END OF FIX ---
-
+router.get('/users/:userId/xp-audit', async (req, res) => {
+    const { userId } = req.params;
     const client = await pool.connect();
+
     try {
-        await client.query('BEGIN');
-
-        // Use the sanitized 'formattedMonth' when saving to the DB
-        await client.query(
-            `INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (vault_id, month) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, notes = EXCLUDED.notes;`,
-            [vaultId, formattedMonth, numericPnl, notes, adminUserId]
-        );
-
-        const startDate = monthDate; // We can now safely use our clean date object
-        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 0);
-
-        // --- Step 2: Find all users who were active in the vault at the start of the month ---
-        const participantsResult = await client.query(
-            `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
-             FROM vault_ledger_entries
-             WHERE vault_id = $1 AND created_at < $2
-             GROUP BY user_id
-             HAVING COALESCE(SUM(amount), 0) > 0;`,
-            [vaultId, startDate]
-        );
-        const participants = participantsResult.rows;
-
-        if (participants.length === 0) {
-            await client.query('COMMIT');
-            return res.status(200).json({ message: 'Monthly performance saved. No active participants found for this period to generate reports for.' });
+        // --- 1. Fetch the user's current XP total from the users table ---
+        const userXpResult = await client.query('SELECT xp FROM users WHERE user_id = $1', [userId]);
+        
+        if (userXpResult.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found.' });
         }
+        const expectedTotal = parseFloat(userXpResult.rows[0].xp);
 
-        let reportsGenerated = 0;
-        // --- Step 3: Loop through each participant and generate their individual report ---
-        for (const participant of participants) {
-            const userId = participant.user_id;
-            const startingCapital = parseFloat(participant.starting_capital);
+        // --- 2. Fetch all historical XP transactions from the activity log ---
+        const xpHistoryQuery = `
+            SELECT 
+                activity_id, 
+                created_at, 
+                description,
+                amount_primary as xp_amount,
+                source,
+                status
+            FROM 
+                user_activity_log 
+            WHERE 
+                user_id = $1 
+                AND (
+                    activity_type LIKE 'XP_%' 
+                    OR source = 'SIGNUP_BONUS'
+                    OR activity_type IN ('DEPOSIT_BONUS', 'REFERRAL_BONUS', 'SIGNUP_BONUS', 'PLATFORM_REWARD')
+                )
+            ORDER BY 
+                created_at DESC;
+        `;
+        const xpHistoryResult = await client.query(xpHistoryQuery, [userId]);
+        const history = xpHistoryResult.rows;
 
-            // a) Calculate this user's PNL based on THEIR starting capital
-            const pnlAmount = startingCapital * (numericPnl / 100.0);
+        // --- 3. Calculate the total from the log, respecting the status ---
+        // We only sum entries that have been 'CLAIMED' or 'COMPLETED'. 'UNCLAIMED' XP doesn't count toward the user's total yet.
+        const calculatedTotal = history
+            .filter(log => log.status === 'CLAIMED' || log.status === 'COMPLETED')
+            .reduce((sum, log) => sum + parseFloat(log.xp_amount), 0);
 
-            // b) Fetch this user's transactions during the period
-            const transactionsResult = await client.query(
-                `SELECT entry_type, amount, created_at FROM vault_ledger_entries 
-                 WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
-                [userId, vaultId, startDate, endDate]
-            );
-            const periodTransactions = transactionsResult.rows.map(tx => ({ ...tx, amount: parseFloat(tx.amount) }));
-
-            // c) Calculate period totals and ending capital
-            const periodDeposits = periodTransactions.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
-            const periodWithdrawals = periodTransactions.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
-            const endingCapital = startingCapital + pnlAmount + periodDeposits - periodWithdrawals;
-
-            // d) Assemble the final report_data JSON object
-            const reportData = {
-                title: `Performance Report for ${month}`,
-                startDate: startDate.toISOString().split('T')[0],
-                endDate: new Date(endDate - 1).toISOString().split('T')[0], // End of the month
-                openingRemarks: `Official Performance Report for ${new Date(month).toLocaleString('default', { month: 'long', year: 'year' })}.`,
-                closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
-                summary: {
-                    startingCapital,
-                    pnlAmount,
-                    pnlPercentage: numericPnl,
-                    periodDeposits,
-                    periodWithdrawals,
-                    endingCapital,
-                },
-                periodTransactions
-            };
-
-            // e) Upsert the draft report into the database
-            await client.query(
-                `INSERT INTO user_monthly_reports (user_id, report_date, report_data, status, title, last_updated_by)
-                 VALUES ($1, $2, $3, 'DRAFT', $4, $5)
-                 ON CONFLICT (user_id, report_date) DO UPDATE SET report_data = EXCLUDED.report_data, status = 'DRAFT', last_updated_by = EXCLUDED.last_updated_by;`,
-                [userId, month, reportData, reportData.title, adminUserId]
-            );
-            reportsGenerated++;
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ message: `Successfully saved monthly performance and generated ${reportsGenerated} draft reports.` });
+        // --- 4. Assemble the final report ---
+        const auditReport = {
+            userId: userId,
+            expectedTotal: expectedTotal,
+            calculatedTotal: parseFloat(calculatedTotal.toFixed(8)), // Round to match DB precision
+            discrepancy: parseFloat((expectedTotal - calculatedTotal).toFixed(8)),
+            history: history.map(log => ({
+                ...log,
+                xp_amount: parseFloat(log.xp_amount)
+            }))
+        };
+        
+        res.status(200).json(auditReport);
 
     } catch (err) {
-        await client.query('ROLLBACK');
-        console.error('Error generating monthly draft reports:', err);
-        res.status(500).json({ error: 'An error occurred during draft generation.' });
+        console.error(`Error performing XP audit for user ${userId}:`, err);
+        res.status(500).json({ error: 'An error occurred during the XP audit.' });
     } finally {
-        client.release();
+        if (client) {
+            client.release();
+        }
     }
 });
 
