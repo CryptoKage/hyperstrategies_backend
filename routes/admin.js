@@ -2240,6 +2240,15 @@ router.post('/farming-protocols/:protocolId/reap', async (req, res) => {
     }
 });
 
-
+router.get('/reports/draft-count', async (req, res) => {
+    try {
+        const { rows } = await pool.query("SELECT COUNT(*) FROM user_monthly_reports WHERE status = 'DRAFT'");
+        const count = parseInt(rows[0].count, 10);
+        res.json({ draftCount: count });
+    } catch (error) {
+        console.error("Error fetching draft report count:", error);
+        res.status(500).json({ error: 'Failed to fetch count.' });
+    }
+});
 
 module.exports = router;
