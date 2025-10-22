@@ -787,4 +787,34 @@ router.get('/reports/:reportId', authenticateToken, async (req, res) => {
     }
 });
 
+
+router.get('/report-eligibility', authenticateToken, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const firstDepositResult = await pool.query(
+            `SELECT MIN(created_at) as first_deposit_date 
+             FROM vault_ledger_entries 
+             WHERE user_id = $1 AND entry_type = 'DEPOSIT'`,
+            [userId]
+        );
+
+        const firstDepositDate = firstDepositResult.rows[0]?.first_deposit_date;
+
+        if (!firstDepositDate) {
+            return res.json({ eligible: false });
+        }
+
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+        const isEligible = new Date(firstDepositDate) < thirtyDaysAgo;
+        
+        res.json({ eligible: isEligible });
+
+    } catch (error) {
+        console.error("Error fetching report eligibility:", error);
+        res.status(500).json({ error: 'Failed to fetch eligibility status.' });
+    }
+});
+
 module.exports = router;
