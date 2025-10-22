@@ -1983,24 +1983,29 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
     const { vaultId, month, pnlPercentage, notes } = req.body;
 
     const numericPnl = parseFloat(pnlPercentage);
-    if (!vaultId || !month || isNaN(numericPnl)) {
-        return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and a numeric pnlPercentage are required.' });
+    // --- THIS IS THE FIX ---
+    // The 'month' comes in as "YYYY-MM". We explicitly treat it as the first day of that month.
+    const monthDate = new Date(month + '-01T00:00:00Z'); // Treat as UTC midnight on the 1st
+    if (!vaultId || !month || isNaN(numericPnl) || isNaN(monthDate.getTime())) {
+        return res.status(400).json({ error: 'vaultId, a valid month (YYYY-MM), and a numeric pnlPercentage are required.' });
     }
+    const formattedMonth = monthDate.toISOString().split('T')[0]; // "YYYY-MM-DD"
+    // --- END OF FIX ---
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // --- Step 1: Record the official monthly performance (your existing logic, now integrated here) ---
+        // Use the sanitized 'formattedMonth' when saving to the DB
         await client.query(
             `INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (vault_id, month) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, notes = EXCLUDED.notes;`,
-            [vaultId, month, numericPnl, notes, adminUserId]
+            [vaultId, formattedMonth, numericPnl, notes, adminUserId]
         );
 
-        const startDate = new Date(month);
-        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
+        const startDate = monthDate; // We can now safely use our clean date object
+        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 0);
 
         // --- Step 2: Find all users who were active in the vault at the start of the month ---
         const participantsResult = await client.query(
