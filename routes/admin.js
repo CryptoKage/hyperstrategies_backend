@@ -1338,7 +1338,7 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
 
         const startDate = new Date(month);
         const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
-        const periodEndDate = new Date(endDate - 1); // The actual last day of the month
+        const periodEndDate = new Date(endDate - 1);
 
         // Step 2: Find all users active in the vault at the start of the month
         const participantsResult = await client.query(
@@ -1363,7 +1363,6 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
             const startingCapital = parseFloat(participant.starting_capital);
             const pnlAmount = startingCapital * (numericPnl / 100.0);
 
-            // Fetch all transactions for this user/vault within the period
             const transactionsResult = await client.query(
                 `SELECT entry_type, amount FROM vault_ledger_entries 
                  WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
@@ -1373,34 +1372,40 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
             const periodDeposits = periodTransactions.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
             const periodWithdrawals = periodTransactions.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
 
-            // Fetch buyback gains and performance fees
-            const [buybackGainsResult, performanceFeesResult] = await Promise.all([
-                client.query(
-                    `SELECT COALESCE(SUM(amount_primary), 0) as total_gains
-                     FROM user_activity_log WHERE user_id = $1 AND activity_type = 'BONUS_POINT_BUYBACK' AND created_at >= $2 AND created_at < $3`,
-                    [userId, startDate, endDate]
-                ),
-                client.query(
-                    `SELECT COALESCE(SUM(amount), 0) as total_fees
-                     FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'PERFORMANCE_FEE' AND created_at >= $3 AND created_at < $4`,
-                    [userId, vaultId, startDate, endDate]
-                )
+            const [buybackGainsResult, performanceFeesResult, bonusPointsResult] = await Promise.all([
+                client.query(`SELECT COALESCE(SUM(amount_primary), 0) as total_gains FROM user_activity_log WHERE user_id = $1 AND activity_type = 'BONUS_POINT_BUYBACK' AND created_at >= $2 AND created_at < $3`, [userId, startDate, endDate]),
+                client.query(`SELECT COALESCE(SUM(amount), 0) as total_fees FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'PERFORMANCE_FEE' AND created_at >= $3 AND created_at < $4`, [userId, vaultId, startDate, endDate]),
+                client.query(`SELECT COALESCE(SUM(points_amount), 0) as total_points FROM bonus_points WHERE user_id = $1 AND created_at < $2`, [userId, endDate])
             ]);
+            
             const buybackGains = parseFloat(buybackGainsResult.rows[0].total_gains);
             const performanceFeesPaid = parseFloat(performanceFeesResult.rows[0].total_fees);
-
-            // Fetch ending bonus points balance
-            const bonusPointsResult = await client.query(
-                `SELECT COALESCE(SUM(points_amount), 0) as total_points FROM bonus_points WHERE user_id = $1 AND created_at < $2`,
-                [userId, endDate]
-            );
             const endingBonusPointsBalance = parseFloat(bonusPointsResult.rows[0].total_points);
-
-            // Calculate final capital amounts
+            
             const endingCapital = startingCapital + pnlAmount + buybackGains + performanceFeesPaid + periodDeposits - periodWithdrawals;
             const totalAccountValue = endingCapital + endingBonusPointsBalance;
 
-            const reportData = { /* ... same reportData object as before ... */ }; // (Omitted for brevity, no changes here)
+            // --- THIS IS THE FIX: The full reportData object is now defined correctly ---
+            const reportData = {
+                title: `Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}`,
+                startDate: startDate.toISOString().split('T')[0],
+                endDate: periodEndDate.toISOString().split('T')[0],
+                openingRemarks: `Official Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}.`,
+                closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
+                summary: {
+                    startingCapital,
+                    pnlAmount,
+                    pnlPercentage: numericPnl,
+                    buybackGains,
+                    performanceFeesPaid,
+                    periodDeposits,
+                    periodWithdrawals,
+                    endingCapital,
+                    endingBonusPointsBalance,
+                    totalAccountValue
+                },
+                periodTransactions
+            };
 
             // Upsert the draft report
             await client.query(
@@ -1410,14 +1415,13 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
                 [userId, month, reportData, reportData.title, adminUserId]
             );
 
-            // --- NEW LOGIC: Save the performance snapshot ---
+            // Save the performance snapshot
             await client.query(
                 `INSERT INTO user_performance_snapshots (user_id, vault_id, period_end_date, ending_account_value)
                  VALUES ($1, $2, $3, $4)
                  ON CONFLICT (user_id, vault_id, period_end_date) DO UPDATE SET ending_account_value = EXCLUDED.ending_account_value;`,
-                [userId, vaultId, periodEndDate, endingCapital] // We store the liquid capital value
+                [userId, vaultId, periodEndDate, endingCapital]
             );
-            // --- END NEW LOGIC ---
 
             reportsGenerated++;
         }
@@ -1428,7 +1432,8 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Error generating monthly draft reports:', err);
-        res.status(500).json({ error: 'An error occurred during draft generation.' });
+        // Pass the database error back to the frontend for clarity
+        res.status(500).json({ error: 'An error occurred during draft generation.', details: err.message });
     } finally {
         client.release();
     }
