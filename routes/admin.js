@@ -2424,6 +2424,8 @@ router.get('/reports/aggregate', async (req, res) => {
 
 // Add this new route to routes/admin.js
 
+// REPLACE the existing '/calculate-and-post-fees' route in admin.js with this one.
+
 router.post('/calculate-and-post-fees', async (req, res) => {
     const { vaultId, month, pnlPercentage } = req.body;
     const adminUserId = req.user.id;
@@ -2439,6 +2441,10 @@ router.post('/calculate-and-post-fees', async (req, res) => {
         await client.query('BEGIN');
 
         const startDate = new Date(month);
+        // --- THIS IS THE FIX: Determine the exact end-of-month timestamp for the fee ---
+        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
+        const feeTimestamp = new Date(endDate - 1000); // Set timestamp to 1 second before the next month starts
+        // --- END OF FIX ---
 
         const participantsResult = await client.query(
             `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
@@ -2477,17 +2483,15 @@ router.post('/calculate-and-post-fees', async (req, res) => {
             let feeAmount = 0;
             
             if (newAccountValue > highWaterMark && grossPnl > 0) {
-                // --- THIS IS THE FIX ---
-                // The profit subject to fees is the smaller of the gross profit or the amount above the HWM.
                 const profitSubjectToFee = Math.min(grossPnl, newAccountValue - highWaterMark);
                 feeAmount = profitSubjectToFee * PERFORMANCE_FEE_RATE;
-                // --- END OF FIX ---
 
                 if (feeAmount > 0.000001) {
+                    // --- THIS IS THE FIX: Use the calculated feeTimestamp ---
                     await client.query(
-                        `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status)
-                         VALUES ($1, $2, 'PERFORMANCE_FEE', $3, 'SWEPT');`,
-                        [userId, vaultId, -feeAmount]
+                        `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status, created_at)
+                         VALUES ($1, $2, 'PERFORMANCE_FEE', $3, 'SWEPT', $4);`,
+                        [userId, vaultId, -feeAmount, feeTimestamp]
                     );
                     feesPostedCount++;
                     totalFeesCalculated += feeAmount;
