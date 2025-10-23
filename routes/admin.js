@@ -2423,12 +2423,10 @@ router.post('/calculate-and-post-fees', async (req, res) => {
     const { vaultId, month, pnlPercentage } = req.body;
     const adminUserId = req.user.id;
 
-    // --- 1. Validation ---
     const numericPnl = parseFloat(pnlPercentage);
     if (!vaultId || !month || isNaN(numericPnl)) {
         return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and a numeric pnlPercentage are required.' });
     }
-    // For now, we assume a hardcoded 20% performance fee. This could be moved to the vaults table later.
     const PERFORMANCE_FEE_RATE = 0.20; 
 
     const client = await pool.connect();
@@ -2437,7 +2435,6 @@ router.post('/calculate-and-post-fees', async (req, res) => {
 
         const startDate = new Date(month);
 
-        // --- 2. Find all users who were active in the vault at the start of the month ---
         const participantsResult = await client.query(
             `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
              FROM vault_ledger_entries
@@ -2457,12 +2454,10 @@ router.post('/calculate-and-post-fees', async (req, res) => {
         let totalFeesCalculated = 0;
         const results = [];
 
-        // --- 3. Loop through each participant to calculate their individual fee ---
         for (const participant of participants) {
             const userId = participant.user_id;
             const startingCapital = parseFloat(participant.starting_capital);
             
-            // a) Fetch the user's high-water mark (highest previous ending value)
             const hwmResult = await client.query(
                 `SELECT COALESCE(MAX(ending_account_value), 0) as high_water_mark
                  FROM user_performance_snapshots
@@ -2471,21 +2466,22 @@ router.post('/calculate-and-post-fees', async (req, res) => {
             );
             const highWaterMark = parseFloat(hwmResult.rows[0].high_water_mark);
 
-            // b) Calculate the user's gross PNL and new potential account value
             const grossPnl = startingCapital * (numericPnl / 100.0);
             const newAccountValue = startingCapital + grossPnl;
             
             let feeAmount = 0;
-            // c) Check if a fee is due
+            
             if (newAccountValue > highWaterMark && grossPnl > 0) {
-                const profitAboveHwm = newAccountValue - highWaterMark;
-                feeAmount = profitAboveHwm * PERFORMANCE_FEE_RATE;
+                // --- THIS IS THE FIX ---
+                // The profit subject to fees is the smaller of the gross profit or the amount above the HWM.
+                const profitSubjectToFee = Math.min(grossPnl, newAccountValue - highWaterMark);
+                feeAmount = profitSubjectToFee * PERFORMANCE_FEE_RATE;
+                // --- END OF FIX ---
 
-                // d) Post the fee as a negative ledger entry
                 if (feeAmount > 0.000001) {
                     await client.query(
                         `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status)
-                         VALUES ($1, $2, 'PERFORMANCE_FEE', $3, 'SWEPT');`, // Fees are 'SWEPT' immediately
+                         VALUES ($1, $2, 'PERFORMANCE_FEE', $3, 'SWEPT');`,
                         [userId, vaultId, -feeAmount]
                     );
                     feesPostedCount++;
@@ -2493,7 +2489,6 @@ router.post('/calculate-and-post-fees', async (req, res) => {
                 }
             }
 
-            // e) Store the result for the admin to review on the frontend
             results.push({
                 userId,
                 username: (await client.query('SELECT username FROM users WHERE user_id = $1', [userId])).rows[0].username,
@@ -2519,8 +2514,6 @@ router.post('/calculate-and-post-fees', async (req, res) => {
         client.release();
     }
 });
-
-// Add this new route to routes/admin.js
 
 router.get('/monthly-audit-data', async (req, res) => {
     const { vaultId, month } = req.query;
