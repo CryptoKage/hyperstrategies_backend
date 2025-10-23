@@ -1327,7 +1327,7 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // --- Step 1: Record the official monthly performance (your existing logic, now integrated here) ---
+        // --- Step 1: Record the official monthly performance ---
         await client.query(
             `INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
              VALUES ($1, $2, $3, $4, $5)
@@ -1344,7 +1344,7 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
              FROM vault_ledger_entries
              WHERE vault_id = $1 AND created_at < $2
              GROUP BY user_id
-             HAVING COALESCE(SUM(amount), 0) > 0;`,
+             HAVING COALESCE(SUM(amount), 0) > 0.000001;`, // Only users with a starting balance > 0
             [vaultId, startDate]
         );
         const participants = participantsResult.rows;
@@ -1360,10 +1360,10 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
             const userId = participant.user_id;
             const startingCapital = parseFloat(participant.starting_capital);
 
-            // a) Calculate this user's PNL based on THEIR starting capital
+            // a) Calculate this user's strategy PNL based on THEIR starting capital
             const pnlAmount = startingCapital * (numericPnl / 100.0);
 
-            // b) Fetch this user's transactions during the period
+            // b) Fetch this user's deposits/withdrawals from the vault during the period
             const transactionsResult = await client.query(
                 `SELECT entry_type, amount, created_at FROM vault_ledger_entries 
                  WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
@@ -1371,22 +1371,38 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
             );
             const periodTransactions = transactionsResult.rows.map(tx => ({ ...tx, amount: parseFloat(tx.amount) }));
 
-            // c) Calculate period totals and ending capital
+            // c) Calculate period capital movement totals
             const periodDeposits = periodTransactions.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
             const periodWithdrawals = periodTransactions.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
-            const endingCapital = startingCapital + pnlAmount + periodDeposits - periodWithdrawals;
 
-            // d) Assemble the final report_data JSON object
+            // --- NEW LOGIC ---
+            // d) Fetch this user's gains from the buyback engine during the period
+            const buybackGainsResult = await client.query(
+                `SELECT COALESCE(SUM(amount_primary), 0) as total_gains
+                 FROM user_activity_log
+                 WHERE user_id = $1
+                   AND activity_type = 'BONUS_POINT_BUYBACK'
+                   AND created_at >= $2 AND created_at < $3`,
+                [userId, startDate, endDate]
+            );
+            const buybackGains = parseFloat(buybackGainsResult.rows[0].total_gains);
+            // --- END NEW LOGIC ---
+
+            // e) Calculate the final ending capital, now including buyback gains
+            const endingCapital = startingCapital + pnlAmount + buybackGains + periodDeposits - periodWithdrawals;
+
+            // f) Assemble the final report_data JSON object
             const reportData = {
-                title: `Performance Report for ${month}`,
+                title: `Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}`,
                 startDate: startDate.toISOString().split('T')[0],
                 endDate: new Date(endDate - 1).toISOString().split('T')[0], // End of the month
                 openingRemarks: `Official Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}.`,
                 closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
                 summary: {
                     startingCapital,
-                    pnlAmount,
+                    pnlAmount, // This remains the PNL from trading strategy
                     pnlPercentage: numericPnl,
+                    buybackGains, // NEW: Add the buyback gains
                     periodDeposits,
                     periodWithdrawals,
                     endingCapital,
@@ -1394,7 +1410,7 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
                 periodTransactions
             };
 
-            // e) Upsert the draft report into the database
+            // g) Upsert the draft report into the database
             await client.query(
                 `INSERT INTO user_monthly_reports (user_id, report_date, report_data, status, title, last_updated_by)
                  VALUES ($1, $2, $3, 'DRAFT', $4, $5)
@@ -2273,6 +2289,24 @@ router.delete('/reports/:reportId', async (req, res) => {
     } catch (error) {
         console.error(`Error deleting report ${reportIdToDelete}:`, error);
         res.status(500).json({ error: 'An internal server error occurred while trying to delete the report.' });
+    }
+});
+
+router.get('/users/:userId/reports', async (req, res) => {
+    const { userId: targetUserId } = req.params;
+
+    try {
+        const { rows } = await pool.query(
+            `SELECT report_id, title, report_date, status, created_at
+             FROM user_monthly_reports
+             WHERE user_id = $1
+             ORDER BY report_date DESC`,
+            [targetUserId]
+        );
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error(`Error fetching reports for user ${targetUserId}:`, error);
+        res.status(500).json({ error: 'Failed to fetch user reports.' });
     }
 });
 
