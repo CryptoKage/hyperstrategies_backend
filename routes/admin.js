@@ -2328,4 +2328,109 @@ router.get('/users/:userId/reports', async (req, res) => {
     }
 });
 
+// Add this new route to routes/admin.js
+
+router.get('/reports/aggregate', async (req, res) => {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+        return res.status(400).json({ error: 'startDate and endDate query parameters (YYYY-MM-DD) are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        // We run all our analytical queries in parallel for efficiency
+        const [
+            depositStats,
+            withdrawalStats,
+            feeStats,
+            buybackStats,
+            pnlStats
+        ] = await Promise.all([
+            // 1. Total capital deposited onto the platform
+            client.query(
+                `SELECT COALESCE(SUM(amount), 0) as total_deposited, COUNT(*) as deposit_count
+                 FROM deposits
+                 WHERE detected_at >= $1 AND detected_at < $2`,
+                [startDate, endDate]
+            ),
+            // 2. Total capital withdrawn from the platform
+            client.query(
+                `SELECT COALESCE(SUM(amount), 0) as total_withdrawn, COUNT(*) as withdrawal_count
+                 FROM withdrawals
+                 WHERE processed_at >= $1 AND processed_at < $2`,
+                [startDate, endDate]
+            ),
+            // 3. Total fees collected (both deposit and performance)
+            client.query(
+                `SELECT
+                    COALESCE(SUM(CASE WHEN entry_type = 'DEPOSIT' THEN fee_amount ELSE 0 END), 0) as deposit_fees,
+                    COALESCE(SUM(CASE WHEN entry_type = 'PERFORMANCE_FEE' THEN amount ELSE 0 END), 0) as performance_fees
+                 FROM vault_ledger_entries
+                 WHERE created_at >= $1 AND created_at < $2`,
+                [startDate, endDate]
+            ),
+            // 4. Total USDC paid out in bonus point buybacks
+            client.query(
+                `SELECT COALESCE(SUM(amount_primary), 0) as total_buybacks
+                 FROM user_activity_log
+                 WHERE activity_type = 'BONUS_POINT_BUYBACK' AND created_at >= $1 AND created_at < $2`,
+                [startDate, endDate]
+            ),
+            // 5. Total PNL distributed from trading strategies
+            client.query(
+                `SELECT COALESCE(SUM(amount), 0) as total_pnl
+                 FROM vault_ledger_entries
+                 WHERE entry_type = 'PNL_DISTRIBUTION' AND created_at >= $1 AND created_at < $2`,
+                [startDate, endDate]
+            )
+        ]);
+
+        const depositData = depositStats.rows[0];
+        const withdrawalData = withdrawalStats.rows[0];
+        const feeData = feeStats.rows[0];
+        const buybackData = buybackStats.rows[0];
+        const pnlData = pnlStats.rows[0];
+        
+        const totalFees = parseFloat(feeData.deposit_fees) + Math.abs(parseFloat(feeData.performance_fees));
+        const totalPnl = parseFloat(pnlData.total_pnl);
+        const totalDeposits = parseFloat(depositData.total_deposited);
+        const totalWithdrawals = parseFloat(withdrawalData.total_withdrawn);
+        const netFlow = totalDeposits - totalWithdrawals;
+
+        // Assemble the final report object
+        const aggregateReport = {
+            period: {
+                startDate,
+                endDate
+            },
+            capitalFlow: {
+                totalDeposits,
+                depositCount: parseInt(depositData.deposit_count, 10),
+                totalWithdrawals,
+                withdrawalCount: parseInt(withdrawalData.withdrawal_count, 10),
+                netFlow
+            },
+            revenueAndDistribution: {
+                totalPnlDistributed: totalPnl,
+                totalBuybacksPaid: parseFloat(buybackData.total_buybacks),
+                fees: {
+                    depositFees: parseFloat(feeData.deposit_fees),
+                    performanceFees: Math.abs(parseFloat(feeData.performance_fees)), // Stored as negative, display as positive
+                    totalFees
+                },
+                platformNet: totalFees - parseFloat(buybackData.total_buybacks) // A simple metric of fees vs. payouts
+            }
+        };
+
+        res.status(200).json(aggregateReport);
+
+    } catch (error) {
+        console.error('Error generating aggregate report:', error);
+        res.status(500).json({ error: 'Failed to generate aggregate report.' });
+    } finally {
+        client.release();
+    }
+});
+
 module.exports = router;
