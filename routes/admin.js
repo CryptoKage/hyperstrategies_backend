@@ -2251,4 +2251,29 @@ router.get('/reports/draft-count', async (req, res) => {
     }
 });
 
+router.delete('/reports/:reportId', async (req, res) => {
+    const { reportId: reportIdToDelete } = req.params;
+    const adminUserId = req.user.id;
+
+    console.log(`[ADMIN] Received request to delete report ID ${reportIdToDelete} by admin ${adminUserId}.`);
+
+    try {
+        const deleteResult = await pool.query(
+            'DELETE FROM user_monthly_reports WHERE report_id = $1',
+            [reportIdToDelete]
+        );
+
+        if (deleteResult.rowCount === 0) {
+            // If no rows were deleted, it means the report was not found.
+            return res.status(404).json({ error: 'Report not found or already deleted.' });
+        }
+
+        res.status(200).json({ message: `Report ${reportIdToDelete} has been successfully deleted.` });
+
+    } catch (error) {
+        console.error(`Error deleting report ${reportIdToDelete}:`, error);
+        res.status(500).json({ error: 'An internal server error occurred while trying to delete the report.' });
+    }
+});
+
 module.exports = router;
