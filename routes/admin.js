@@ -2578,4 +2578,141 @@ router.get('/monthly-audit-data', async (req, res) => {
     }
 });
 
+router.get('/pnl-events', async (req, res) => {
+    const { vaultId, month } = req.query;
+
+    if (!vaultId || !month) {
+        return res.status(400).json({ error: 'vaultId and month (YYYY-MM-01) query parameters are required.' });
+    }
+
+    try {
+        const startDate = new Date(month);
+        const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
+
+        const { rows } = await pool.query(
+            `SELECT
+                vle.entry_id,
+                vle.user_id,
+                u.username,
+                vle.amount,
+                vle.created_at
+             FROM vault_ledger_entries vle
+             JOIN users u ON vle.user_id = u.user_id
+             WHERE
+                vle.vault_id = $1
+                AND vle.entry_type = 'PNL_DISTRIBUTION'
+                AND vle.created_at >= $2
+                AND vle.created_at < $3
+             ORDER BY vle.created_at DESC`,
+            [vaultId, startDate, endDate]
+        );
+
+        // Format the data for the frontend
+        const pnlEvents = rows.map(row => ({
+            ...row,
+            amount: parseFloat(row.amount)
+        }));
+        
+        res.status(200).json(pnlEvents);
+
+    } catch (error) {
+        console.error('Error fetching PNL events:', error);
+        res.status(500).json({ error: 'Failed to fetch PNL events.' });
+    }
+});
+
+router.post('/pnl-events', async (req, res) => {
+    const { vaultId, userId, amount, eventDate } = req.body;
+
+    // --- Validation ---
+    const numericAmount = parseFloat(amount);
+    if (!vaultId || !userId || !eventDate || isNaN(numericAmount)) {
+        return res.status(400).json({ error: 'vaultId, userId, a valid eventDate, and a numeric amount are required.' });
+    }
+    if (new Date(eventDate).toString() === 'Invalid Date') {
+        return res.status(400).json({ error: 'The provided eventDate is not a valid date string.' });
+    }
+
+    try {
+        const insertQuery = `
+            INSERT INTO vault_ledger_entries
+                (user_id, vault_id, entry_type, amount, status, created_at)
+            VALUES
+                ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT', $4)
+            RETURNING entry_id, user_id, vault_id, entry_type, amount, created_at;
+        `;
+
+        const { rows } = await pool.query(insertQuery, [userId, vaultId, numericAmount, eventDate]);
+        
+        const newPnlEvent = {
+            ...rows[0],
+            amount: parseFloat(rows[0].amount)
+        };
+        
+        res.status(201).json({ message: 'PNL event successfully added.', newEvent: newPnlEvent });
+
+    } catch (error) {
+        console.error('Error adding PNL event:', error);
+        res.status(500).json({ error: 'Failed to add PNL event.' });
+    }
+});
+
+router.post('/pnl-events', async (req, res) => {
+    const { vaultId, userId, amount, eventDate } = req.body;
+
+    // --- Validation ---
+    const numericAmount = parseFloat(amount);
+    if (!vaultId || !userId || !eventDate || isNaN(numericAmount)) {
+        return res.status(400).json({ error: 'vaultId, userId, a valid eventDate, and a numeric amount are required.' });
+    }
+    if (new Date(eventDate).toString() === 'Invalid Date') {
+        return res.status(400).json({ error: 'The provided eventDate is not a valid date string.' });
+    }
+
+    try {
+        const insertQuery = `
+            INSERT INTO vault_ledger_entries
+                (user_id, vault_id, entry_type, amount, status, created_at)
+            VALUES
+                ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT', $4)
+            RETURNING entry_id, user_id, vault_id, entry_type, amount, created_at;
+        `;
+
+        const { rows } = await pool.query(insertQuery, [userId, vaultId, numericAmount, eventDate]);
+        
+        const newPnlEvent = {
+            ...rows[0],
+            amount: parseFloat(rows[0].amount)
+        };
+        
+        res.status(201).json({ message: 'PNL event successfully added.', newEvent: newPnlEvent });
+
+    } catch (error) {
+        console.error('Error adding PNL event:', error);
+        res.status(500).json({ error: 'Failed to add PNL event.' });
+    }
+});
+
+router.delete('/pnl-events/:entryId', async (req, res) => {
+    const { entryId } = req.params;
+
+    try {
+        const deleteQuery = `
+            DELETE FROM vault_ledger_entries
+            WHERE entry_id = $1 AND entry_type = 'PNL_DISTRIBUTION';
+        `;
+        
+        const result = await pool.query(deleteQuery, [entryId]);
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'PNL event not found or it has already been deleted.' });
+        }
+
+        res.status(200).json({ message: `PNL event ${entryId} has been successfully deleted.` });
+    } catch (error) {
+        console.error(`Error deleting PNL event ${entryId}:`, error);
+        res.status(500).json({ error: 'Failed to delete PNL event.' });
+    }
+});
+
 module.exports = router;
