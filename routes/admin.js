@@ -1317,105 +1317,100 @@ router.post('/reports/:reportId/publish', async (req, res) => {
 
 router.post('/reports/generate-monthly-drafts', async (req, res) => {
     const adminUserId = req.user.id;
-    const { vaultId, month, pnlPercentage, notes } = req.body;
+    // NOTE: pnlPercentage and notes are no longer used but we leave them in the signature
+    // to avoid breaking the old DeskResultsPage immediately.
+    const { vaultId, month } = req.body;
 
-    const numericPnl = parseFloat(pnlPercentage);
-    if (!vaultId || !month || isNaN(numericPnl)) {
-        return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and a numeric pnlPercentage are required.' });
+    if (!vaultId || !month) {
+        return res.status(400).json({ error: 'vaultId and month (YYYY-MM-01) are required.' });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // Step 1: Record the official monthly performance
-        await client.query(
-            `INSERT INTO vault_monthly_performance (vault_id, month, pnl_percentage, notes, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (vault_id, month) DO UPDATE SET pnl_percentage = EXCLUDED.pnl_percentage, notes = EXCLUDED.notes;`,
-            [vaultId, month, numericPnl, notes, adminUserId]
-        );
-
         const startDate = new Date(month);
         const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
         const periodEndDate = new Date(endDate - 1);
 
-        // Step 2: Find all users active in the vault at the start of the month
+        // Find all users who had any capital in the vault during the month. This is more inclusive.
         const participantsResult = await client.query(
-            `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
-             FROM vault_ledger_entries
-             WHERE vault_id = $1 AND created_at < $2
-             GROUP BY user_id
-             HAVING COALESCE(SUM(amount), 0) > 0.000001;`,
-            [vaultId, startDate]
+            `SELECT DISTINCT user_id FROM vault_ledger_entries WHERE vault_id = $1 AND created_at < $2`,
+            [vaultId, endDate] // Any user with entries before the end of the month
         );
         const participants = participantsResult.rows;
 
         if (participants.length === 0) {
             await client.query('COMMIT');
-            return res.status(200).json({ message: 'Monthly performance saved. No active participants found to generate reports for.' });
+            return res.status(200).json({ message: 'No participants found for this period to generate reports for.' });
         }
 
         let reportsGenerated = 0;
-        // Step 3: Loop through each participant to generate their individual report
+        // Loop through each participant and generate their individual, accurate report
         for (const participant of participants) {
             const userId = participant.user_id;
-            const startingCapital = parseFloat(participant.starting_capital);
-            const pnlAmount = startingCapital * (numericPnl / 100.0);
 
-            const transactionsResult = await client.query(
-                `SELECT entry_type, amount FROM vault_ledger_entries 
-                 WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
+            // a) Get this user's starting capital
+            const startingCapitalResult = await client.query(
+                `SELECT COALESCE(SUM(amount), 0) as capital FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at < $3`,
+                [userId, vaultId, startDate]
+            );
+            const startingCapital = parseFloat(startingCapitalResult.rows[0].capital);
+            
+            // Only generate a report if the user actually had capital at the start or during the month
+            const allPeriodEntries = await client.query(
+                `SELECT entry_type, amount FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4`,
                 [userId, vaultId, startDate, endDate]
             );
-            const periodTransactions = transactionsResult.rows.map(tx => ({ ...tx, amount: parseFloat(tx.amount) }));
-            const periodDeposits = periodTransactions.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
-            const periodWithdrawals = periodTransactions.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
 
-            const [buybackGainsResult, performanceFeesResult, bonusPointsResult] = await Promise.all([
-                client.query(`SELECT COALESCE(SUM(amount_primary), 0) as total_gains FROM user_activity_log WHERE user_id = $1 AND activity_type = 'BONUS_POINT_BUYBACK' AND created_at >= $2 AND created_at < $3`, [userId, startDate, endDate]),
-                client.query(`SELECT COALESCE(SUM(amount), 0) as total_fees FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'PERFORMANCE_FEE' AND created_at >= $3 AND created_at < $4`, [userId, vaultId, startDate, endDate]),
-                client.query(`SELECT COALESCE(SUM(points_amount), 0) as total_points FROM bonus_points WHERE user_id = $1 AND created_at < $2`, [userId, endDate])
+            if (startingCapital <= 0 && allPeriodEntries.rows.length === 0) {
+                continue; // Skip users who were not involved in this period at all
+            }
+
+            // b) Calculate totals by summing the specific ledger entries for the period
+            const periodEntries = allPeriodEntries.rows.map(tx => ({ ...tx, amount: parseFloat(tx.amount) }));
+            
+            const pnlAmount = periodEntries.filter(tx => tx.entry_type === 'PNL_DISTRIBUTION').reduce((sum, tx) => sum + tx.amount, 0);
+            const performanceFeesPaid = periodEntries.filter(tx => tx.entry_type === 'PERFORMANCE_FEE').reduce((sum, tx) => sum + tx.amount, 0);
+            const periodDeposits = periodEntries.filter(tx => tx.entry_type === 'DEPOSIT' || tx.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, tx) => sum + tx.amount, 0);
+            const periodWithdrawals = periodEntries.filter(tx => tx.entry_type.includes('WITHDRAWAL') || tx.entry_type.includes('TRANSFER_OUT')).reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
+
+            // c) Fetch other balances
+            const [buybackGainsResult, bonusPointsResult] = await Promise.all([
+                 client.query(`SELECT COALESCE(SUM(amount_primary), 0) as total_gains FROM user_activity_log WHERE user_id = $1 AND activity_type = 'BONUS_POINT_BUYBACK' AND created_at >= $2 AND created_at < $3`, [userId, startDate, endDate]),
+                 client.query(`SELECT COALESCE(SUM(points_amount), 0) as total_points FROM bonus_points WHERE user_id = $1 AND created_at < $2`, [userId, endDate])
             ]);
-            
             const buybackGains = parseFloat(buybackGainsResult.rows[0].total_gains);
-            const performanceFeesPaid = parseFloat(performanceFeesResult.rows[0].total_fees);
             const endingBonusPointsBalance = parseFloat(bonusPointsResult.rows[0].total_points);
-            
+
+            // d) Calculate final capital amounts
             const endingCapital = startingCapital + pnlAmount + buybackGains + performanceFeesPaid + periodDeposits - periodWithdrawals;
             const totalAccountValue = endingCapital + endingBonusPointsBalance;
+            const pnlPercentage = startingCapital > 0 ? (pnlAmount / startingCapital) * 100 : 0;
 
-            // --- THIS IS THE FIX: The full reportData object is now defined correctly ---
+            // e) Assemble the report_data object
+            const monthYearString = startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
             const reportData = {
-                title: `Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}`,
+                title: { key: 'reports.generated.title', vars: { monthYear: monthYearString } },
                 startDate: startDate.toISOString().split('T')[0],
                 endDate: periodEndDate.toISOString().split('T')[0],
-                openingRemarks: `Official Performance Report for ${startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}.`,
-                closingRemarks: `Thank you for your continued partnership. Please reach out with any questions.`,
+                openingRemarks: { key: 'reports.generated.openingRemarks', vars: { monthYear: monthYearString } },
+                closingRemarks: { key: 'reports.generated.closingRemarks' },
                 summary: {
-                    startingCapital,
-                    pnlAmount,
-                    pnlPercentage: numericPnl,
-                    buybackGains,
-                    performanceFeesPaid,
-                    periodDeposits,
-                    periodWithdrawals,
-                    endingCapital,
-                    endingBonusPointsBalance,
-                    totalAccountValue
-                },
-                periodTransactions
+                    startingCapital, pnlAmount, pnlPercentage: parseFloat(pnlPercentage.toFixed(4)), buybackGains, performanceFeesPaid,
+                    periodDeposits, periodWithdrawals, endingCapital, endingBonusPointsBalance, totalAccountValue
+                }
             };
 
-            // Upsert the draft report
+            // f) Upsert the draft report
             await client.query(
                 `INSERT INTO user_monthly_reports (user_id, report_date, report_data, status, title, last_updated_by)
                  VALUES ($1, $2, $3, 'DRAFT', $4, $5)
                  ON CONFLICT (user_id, report_date) DO UPDATE SET report_data = EXCLUDED.report_data, status = 'DRAFT', last_updated_by = EXCLUDED.last_updated_by;`,
-                [userId, month, reportData, reportData.title, adminUserId]
+                [userId, month, reportData, reportData.title.key, adminUserId]
             );
 
-            // Save the performance snapshot
+            // g) Save the performance snapshot
             await client.query(
                 `INSERT INTO user_performance_snapshots (user_id, vault_id, period_end_date, ending_account_value)
                  VALUES ($1, $2, $3, $4)
@@ -1427,12 +1422,11 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
         }
 
         await client.query('COMMIT');
-        res.status(200).json({ message: `Successfully generated ${reportsGenerated} draft reports and saved historical snapshots.` });
+        res.status(200).json({ message: `Successfully generated ${reportsGenerated} accurate, event-driven draft reports.` });
 
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Error generating monthly draft reports:', err);
-        // Pass the database error back to the frontend for clarity
+        console.error('Error generating event-driven draft reports:', err);
         res.status(500).json({ error: 'An error occurred during draft generation.', details: err.message });
     } finally {
         client.release();
