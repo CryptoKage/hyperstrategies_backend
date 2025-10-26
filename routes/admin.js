@@ -2269,28 +2269,33 @@ router.get('/reports/draft-count', async (req, res) => {
     }
 });
 
-router.delete('/reports/:reportId', async (req, res) => {
-    const { reportId: reportIdToDelete } = req.params;
+router.delete('/reports', async (req, res) => {
+    // We now expect an array of IDs in the request body, e.g., { reportIds: [...] }
+    const { reportIds } = req.body;
     const adminUserId = req.user.id;
 
-    console.log(`[ADMIN] Received request to delete report ID ${reportIdToDelete} by admin ${adminUserId}.`);
+    if (!Array.isArray(reportIds) || reportIds.length === 0) {
+        return res.status(400).json({ error: 'An array of reportIds is required.' });
+    }
+
+    console.log(`[ADMIN] Request to delete ${reportIds.length} reports by admin ${adminUserId}.`);
 
     try {
+        // The ANY() function with an array parameter is the most efficient way to delete multiple rows.
         const deleteResult = await pool.query(
-            'DELETE FROM user_monthly_reports WHERE report_id = $1',
-            [reportIdToDelete]
+            'DELETE FROM user_monthly_reports WHERE report_id = ANY($1::uuid[])',
+            [reportIds]
         );
 
         if (deleteResult.rowCount === 0) {
-            // If no rows were deleted, it means the report was not found.
-            return res.status(404).json({ error: 'Report not found or already deleted.' });
+            return res.status(404).json({ error: 'None of the specified reports were found.' });
         }
 
-        res.status(200).json({ message: `Report ${reportIdToDelete} has been successfully deleted.` });
+        res.status(200).json({ message: `Successfully deleted ${deleteResult.rowCount} reports.` });
 
     } catch (error) {
-        console.error(`Error deleting report ${reportIdToDelete}:`, error);
-        res.status(500).json({ error: 'An internal server error occurred while trying to delete the report.' });
+        console.error('Error during batch delete of reports:', error);
+        res.status(500).json({ error: 'An internal server error occurred while deleting reports.' });
     }
 });
 
