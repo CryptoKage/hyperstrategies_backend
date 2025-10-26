@@ -2341,7 +2341,7 @@ router.get('/reports/aggregate', async (req, res) => {
             client.query(
                 `SELECT COALESCE(SUM(amount), 0) as total_withdrawn, COUNT(*) as withdrawal_count
                  FROM withdrawals
-                 WHERE processed_at >= $1 AND processed_at < $2`,
+                 WHERE created_at >= $1 AND processed_at < $2`,
                 [startDate, endDate]
             ),
             // 3. Total fees collected (both deposit and performance)
