@@ -2425,13 +2425,15 @@ router.get('/reports/aggregate', async (req, res) => {
 
 // REPLACE the existing '/calculate-and-post-fees' route in admin.js with this one.
 
+// REPLACE the existing '/calculate-and-post-fees' route in admin.js with this one.
+
 router.post('/calculate-and-post-fees', async (req, res) => {
-    const { vaultId, month, pnlPercentage } = req.body;
+    // NOTE: We no longer use pnlPercentage. It is ignored.
+    const { vaultId, month } = req.body;
     const adminUserId = req.user.id;
 
-    const numericPnl = parseFloat(pnlPercentage);
-    if (!vaultId || !month || isNaN(numericPnl)) {
-        return res.status(400).json({ error: 'vaultId, month (YYYY-MM-01), and a numeric pnlPercentage are required.' });
+    if (!vaultId || !month) {
+        return res.status(400).json({ error: 'vaultId and month (YYYY-MM-01) are required.' });
     }
     const PERFORMANCE_FEE_RATE = 0.20; 
 
@@ -2440,24 +2442,18 @@ router.post('/calculate-and-post-fees', async (req, res) => {
         await client.query('BEGIN');
 
         const startDate = new Date(month);
-        // --- THIS IS THE FIX: Determine the exact end-of-month timestamp for the fee ---
         const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 1);
-        const feeTimestamp = new Date(endDate - 1000); // Set timestamp to 1 second before the next month starts
-        // --- END OF FIX ---
+        const feeTimestamp = new Date(endDate - 1000);
 
         const participantsResult = await client.query(
-            `SELECT user_id, COALESCE(SUM(amount), 0) as starting_capital
-             FROM vault_ledger_entries
-             WHERE vault_id = $1 AND created_at < $2
-             GROUP BY user_id
-             HAVING COALESCE(SUM(amount), 0) > 0.000001;`,
-            [vaultId, startDate]
+            `SELECT DISTINCT user_id FROM vault_ledger_entries WHERE vault_id = $1 AND created_at < $2`,
+            [vaultId, endDate]
         );
         const participants = participantsResult.rows;
 
         if (participants.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(200).json({ message: 'No active participants found for this period. No fees calculated.' });
+            return res.status(200).json({ message: 'No participants found for this period. No fees calculated.' });
         }
 
         let feesPostedCount = 0;
@@ -2466,19 +2462,25 @@ router.post('/calculate-and-post-fees', async (req, res) => {
 
         for (const participant of participants) {
             const userId = participant.user_id;
-            const startingCapital = parseFloat(participant.starting_capital);
-            
-            const hwmResult = await client.query(
-                `SELECT COALESCE(MAX(ending_account_value), 0) as high_water_mark
-                 FROM user_performance_snapshots
-                 WHERE user_id = $1 AND vault_id = $2 AND period_end_date < $3`,
-                [userId, vaultId, startDate]
-            );
+
+            // --- THIS IS THE FIX: We get the TRUE PNL from the ledger ---
+            const [startingCapitalResult, truePnlResult] = await Promise.all([
+                client.query(`SELECT COALESCE(SUM(amount), 0) as capital FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at < $3`, [userId, vaultId, startDate]),
+                client.query(`SELECT COALESCE(SUM(amount), 0) as pnl FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'PNL_DISTRIBUTION' AND created_at >= $3 AND created_at < $4`, [userId, vaultId, startDate, endDate])
+            ]);
+            const startingCapital = parseFloat(startingCapitalResult.rows[0].capital);
+            const grossPnl = parseFloat(truePnlResult.rows[0].pnl);
+            // --- END OF FIX ---
+
+            // Skip users who weren't active in this period
+            if (startingCapital <= 0 && grossPnl === 0 && (await client.query('SELECT 1 FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4 LIMIT 1', [userId, vaultId, startDate, endDate])).rows.length === 0) {
+                continue;
+            }
+
+            const hwmResult = await client.query(`SELECT COALESCE(MAX(ending_account_value), 0) as high_water_mark FROM user_performance_snapshots WHERE user_id = $1 AND vault_id = $2 AND period_end_date < $3`, [userId, vaultId, startDate]);
             const highWaterMark = parseFloat(hwmResult.rows[0].high_water_mark);
 
-            const grossPnl = startingCapital * (numericPnl / 100.0);
             const newAccountValue = startingCapital + grossPnl;
-            
             let feeAmount = 0;
             
             if (newAccountValue > highWaterMark && grossPnl > 0) {
@@ -2486,7 +2488,6 @@ router.post('/calculate-and-post-fees', async (req, res) => {
                 feeAmount = profitSubjectToFee * PERFORMANCE_FEE_RATE;
 
                 if (feeAmount > 0.000001) {
-                    // --- THIS IS THE FIX: Use the calculated feeTimestamp ---
                     await client.query(
                         `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status, created_at)
                          VALUES ($1, $2, 'PERFORMANCE_FEE', $3, 'SWEPT', $4);`,
@@ -2498,19 +2499,14 @@ router.post('/calculate-and-post-fees', async (req, res) => {
             }
 
             results.push({
-                userId,
-                username: (await client.query('SELECT username FROM users WHERE user_id = $1', [userId])).rows[0].username,
-                startingCapital,
-                highWaterMark,
-                grossPnl,
-                newAccountValue,
-                feeAmount
+                userId, username: (await client.query('SELECT username FROM users WHERE user_id = $1', [userId])).rows[0].username,
+                startingCapital, highWaterMark, grossPnl, newAccountValue, feeAmount
             });
         }
 
         await client.query('COMMIT');
         res.status(200).json({ 
-            message: `Fee calculation complete. Posted ${feesPostedCount} fee transactions totaling $${totalFeesCalculated.toFixed(2)}.`,
+            message: `Fee calculation complete using event-driven PNL. Posted ${feesPostedCount} fee transactions totaling $${totalFeesCalculated.toFixed(2)}.`,
             calculationResults: results
         });
 
