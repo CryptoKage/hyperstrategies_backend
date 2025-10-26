@@ -2322,7 +2322,6 @@ router.get('/reports/aggregate', async (req, res) => {
 
     const client = await pool.connect();
     try {
-        // We run all our analytical queries in parallel for efficiency
         const [
             depositStats,
             withdrawalStats,
@@ -2330,21 +2329,21 @@ router.get('/reports/aggregate', async (req, res) => {
             buybackStats,
             pnlStats
         ] = await Promise.all([
-            // 1. Total capital deposited onto the platform
+            // 1. Total capital deposited
             client.query(
                 `SELECT COALESCE(SUM(amount), 0) as total_deposited, COUNT(*) as deposit_count
                  FROM deposits
                  WHERE detected_at >= $1 AND detected_at < $2`,
                 [startDate, endDate]
             ),
-            // 2. Total capital withdrawn from the platform
+            // 2. Total capital withdrawn --- THIS QUERY IS NOW FIXED ---
             client.query(
                 `SELECT COALESCE(SUM(amount), 0) as total_withdrawn, COUNT(*) as withdrawal_count
                  FROM withdrawals
-                 WHERE created_at >= $1 AND processed_at < $2`,
+                 WHERE created_at >= $1 AND created_at < $2`, // The column is 'created_at'
                 [startDate, endDate]
             ),
-            // 3. Total fees collected (both deposit and performance)
+            // 3. Total fees collected
             client.query(
                 `SELECT
                     COALESCE(SUM(CASE WHEN entry_type = 'DEPOSIT' THEN fee_amount ELSE 0 END), 0) as deposit_fees,
@@ -2353,14 +2352,14 @@ router.get('/reports/aggregate', async (req, res) => {
                  WHERE created_at >= $1 AND created_at < $2`,
                 [startDate, endDate]
             ),
-            // 4. Total USDC paid out in bonus point buybacks
+            // 4. Total buybacks paid out
             client.query(
                 `SELECT COALESCE(SUM(amount_primary), 0) as total_buybacks
                  FROM user_activity_log
                  WHERE activity_type = 'BONUS_POINT_BUYBACK' AND created_at >= $1 AND created_at < $2`,
                 [startDate, endDate]
             ),
-            // 5. Total PNL distributed from trading strategies
+            // 5. Total PNL distributed
             client.query(
                 `SELECT COALESCE(SUM(amount), 0) as total_pnl
                  FROM vault_ledger_entries
