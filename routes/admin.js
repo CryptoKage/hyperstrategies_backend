@@ -1386,7 +1386,8 @@ router.post('/reports/generate-monthly-drafts', async (req, res) => {
             // d) Calculate final capital amounts
             const endingCapital = startingCapital + pnlAmount + buybackGains + performanceFeesPaid + periodDeposits - periodWithdrawals;
             const totalAccountValue = endingCapital + endingBonusPointsBalance;
-            const pnlPercentage = startingCapital > 0 ? (pnlAmount / startingCapital) * 100 : 0;
+            const capitalBase = startingCapital > 0 ? startingCapital : periodDeposits;
+            const pnlPercentage = capitalBase > 0 ? (pnlAmount / capitalBase) * 100 : 0;
 
             // e) Assemble the report_data object
             const monthYearString = startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
