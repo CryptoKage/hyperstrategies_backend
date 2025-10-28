@@ -82,13 +82,12 @@ router.post('/invest', authenticateToken, async (req, res) => {
         }
 
         const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, numericAmount);
-        const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         
-        // --- THIS LOGIC IS NOW CORRECTLY INCLUDED ---
+        const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
         await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, feeBreakdown.finalFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
         await dbClient.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, $4, 'PENDING_SWEEP')`, [userId, vaultId, feeBreakdown.finalTradableAmount, feeBreakdown.finalFeeAmount]);
-        
+
         const vaultTypeResult = await dbClient.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [vaultId]);
         if (vaultTypeResult.rows[0]?.vault_type === 'FARMING') {
             const activeProtocolsResult = await dbClient.query("SELECT protocol_id FROM farming_protocols WHERE vault_id = $1 AND status = 'FARMING'", [vaultId]);
@@ -101,14 +100,29 @@ router.post('/invest', authenticateToken, async (req, res) => {
         await dbClient.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_ALLOCATION', $2, $3, 'USDC', 'COMPLETED')`, [userId, allocationDescription, amount]);
 
         const xpForAmount = investmentAmountBigNum.div(ethers.utils.parseUnits('10', tokenDecimals)).toNumber();
-        await awardXp({ userId, xpAmount: xpForAmount, type: 'DEPOSIT_BONUS', descriptionKey: 'xp_history.deposit_bonus', descriptionVars: { amount: xpForAmount.toFixed(2), vaultId }}, dbClient);
+        
+        // --- THIS IS THE MAIN FIX: Pass the vaultId to the xpEngine ---
+        await awardXp({
+            userId: userId,
+            xpAmount: xpForAmount,
+            type: 'DEPOSIT_BONUS',
+            descriptionKey: 'xp_history.deposit_bonus',
+            descriptionVars: { amount: xpForAmount.toFixed(2), vaultId: vaultId },
+            relatedVaultId: vaultId // Pass the vaultId
+        }, dbClient);
         
         const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
         if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
-            await awardXp({ userId: theUser.referred_by_user_id, xpAmount: xpForAmount, type: 'REFERRAL_BONUS', descriptionKey: 'xp_history.referral_bonus', descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username }}, dbClient);
+            await awardXp({
+                userId: theUser.referred_by_user_id,
+                xpAmount: xpForAmount,
+                type: 'REFERRAL_BONUS',
+                descriptionKey: 'xp_history.referral_bonus',
+                descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username },
+                relatedVaultId: vaultId // Also attribute referral bonus to the vault
+            }, dbClient);
         }
         
-
         await dbClient.query('COMMIT');
         res.status(200).json(ok('INVEST_SUCCESS'));
 
