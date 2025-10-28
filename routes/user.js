@@ -9,6 +9,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
 const axios = require('axios');
 const erc20Abi = require('../utils/abis/erc20.json');
+const { ok, fail } = require('../utils/response');
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
@@ -152,25 +153,21 @@ router.put('/profile', authenticateToken, async (req, res) => {
   const currentUserId = req.user.id;
 
   if (!newUsername || typeof newUsername !== 'string' || newUsername.trim().length < 3) {
-    return res.status(400).json({ error: 'Username must be at least 3 characters long.' });
+    return res.status(400).json(fail('USERNAME_TOO_SHORT'));
   }
   const sanitizedUsername = newUsername.trim();
   
- 
   const client = await pool.connect();
-
   try {
     await client.query('BEGIN');
-
   
     const currentUserResult = await client.query('SELECT username FROM users WHERE user_id = $1', [currentUserId]);
     if (currentUserResult.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'User not found.' });
+      return res.status(404).json(fail('USER_NOT_FOUND'));
     }
     const oldUsername = currentUserResult.rows[0].username;
 
-  
     const existingUserCheck = await client.query(
       'SELECT user_id FROM users WHERE username = $1 AND user_id != $2',
       [sanitizedUsername, currentUserId]
@@ -178,33 +175,19 @@ router.put('/profile', authenticateToken, async (req, res) => {
 
     if (existingUserCheck.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'This username is already taken. Please choose another.' });
+      return res.status(409).json(fail('USERNAME_TAKEN', { username: sanitizedUsername }));
     }
-
   
-    await client.query(
-      'UPDATE users SET username = $1 WHERE user_id = $2',
-      [sanitizedUsername, currentUserId]
-    );
-    
+    await client.query('UPDATE users SET username = $1 WHERE user_id = $2', [sanitizedUsername, currentUserId]);
+    await client.query(`INSERT INTO username_history (user_id, old_username, new_username) VALUES ($1, $2, $3)`, [currentUserId, oldUsername, sanitizedUsername]);
    
-    await client.query(
-        `INSERT INTO username_history (user_id, old_username, new_username)
-         VALUES ($1, $2, $3)`,
-        [currentUserId, oldUsername, sanitizedUsername]
-    );
-   
-
     await client.query('COMMIT');
-    res.status(200).json({ message: 'Username updated successfully!' });
+    res.status(200).json(ok('PROFILE_SAVED'));
 
   } catch (err) {
     await client.query('ROLLBACK');
-    if (err.code === '23505') { 
-      return res.status(409).json({ error: 'This username was just claimed. Please try another.' });
-    }
     console.error(`Error updating username for user ${currentUserId}:`, err);
-    res.status(500).json({ error: 'An error occurred while updating your profile.' });
+    res.status(500).json(fail('GENERIC_SERVER_ERROR'));
   } finally {
     client.release();
   }
@@ -281,11 +264,11 @@ router.put('/referral-code', authenticateToken, async (req, res) => {
   const { desiredCode } = req.body;
   const authenticatedUserId = req.user.id;
   if (!desiredCode || typeof desiredCode !== 'string') {
-    return res.status(400).json({ message: 'A referral code must be provided.' });
+    return res.status(400).json(fail('REFERRAL_CODE_REQUIRED'));
   }
   const sanitizedCode = desiredCode.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (sanitizedCode.length < 3 || sanitizedCode.length > 15) {
-    return res.status(400).json({ message: 'Code must be between 3 and 15 alphanumeric characters.' });
+    return res.status(400).json(fail('INVALID_REFERRAL_CODE'));
   }
   const finalReferralCode = `HS-${sanitizedCode}`;
   try {
@@ -295,27 +278,26 @@ router.put('/referral-code', authenticateToken, async (req, res) => {
     );
     if (existingCodeResult.rows.length > 0) {
       if (existingCodeResult.rows[0].user_id !== authenticatedUserId) {
-        return res.status(409).json({ message: 'This referral code is already taken. Please try another.' });
+        return res.status(409).json(fail('REFERRAL_CODE_TAKEN', { code: finalReferralCode }));
       }
-      return res.status(200).json({ 
-        message: 'This is already your referral code.',
-        referralCode: finalReferralCode 
-      });
+      // If it's already their code, we can just send a success response.
+      return res.status(200).json(ok('REFERRAL_CODE_UNCHANGED', { code: finalReferralCode }));
     }
+    
     await pool.query(
       'UPDATE users SET referral_code = $1 WHERE user_id = $2',
       [finalReferralCode, authenticatedUserId]
     );
-    res.status(200).json({
-      message: 'Success! Your new referral link is ready.',
-      referralCode: finalReferralCode
-    });
+    
+    // We pass the code back so the frontend can display it if needed.
+    res.status(200).json(ok('REFERRAL_CODE_SAVED', { code: finalReferralCode }));
+
   } catch (err) {
-    if (err.code === '23505') {
-      return res.status(409).json({ message: 'This referral code was just claimed. Please try another.' });
+    if (err.code === '23505') { // Handles a race condition where the code was just taken
+      return res.status(409).json(fail('REFERRAL_CODE_TAKEN', { code: finalReferralCode }));
     }
     console.error("Error updating referral code:", err.message);
-    res.status(500).send('Server Error');
+    res.status(500).json(fail('GENERIC_SERVER_ERROR'));
   }
 });
 

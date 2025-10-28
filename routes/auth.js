@@ -15,6 +15,7 @@ const { autoEquipBestPins } = require('../utils/pinUtils');
 const { TIER_DATA } = require('../utils/tierUtils');
 const { sendEmail } = require('../utils/msGraphMailer');
 const { awardXp } = require('../utils/xpEngine');
+const { ok, fail } = require('../utils/response');
 
 const cookieOptions = {
   httpOnly: true,
@@ -64,7 +65,9 @@ router.post(
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      const firstError = errors.array()[0];
+      // Use the 'fail' helper for validation errors
+      return res.status(400).json(fail('VALIDATION_ERROR', { field: firstError.param, message: firstError.msg }));
     }
 
     const { email, password, username, referralCode } = req.body;
@@ -77,12 +80,12 @@ router.post(
       const emailCheck = await client.query('SELECT user_id FROM users WHERE email = $1', [email]);
       if (emailCheck.rows.length > 0) {
         await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'User with this email already exists.' });
+        return res.status(409).json(fail('EMAIL_ALREADY_EXISTS'));
       }
       const usernameCheck = await client.query('SELECT user_id FROM users WHERE username = $1', [username]);
       if (usernameCheck.rows.length > 0) {
         await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'This username is already taken.' });
+        return res.status(409).json(fail('USERNAME_ALREADY_EXISTS'));
       }
 
       const userCountResult = await client.query('SELECT COUNT(*) FROM users');
@@ -113,7 +116,6 @@ router.post(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING user_id, email, username, eth_address`;
 
-      // We set initial XP to 0 here, as the engine will handle the addition.
       const initialXp = 0; 
       
       let newUserResult;
@@ -143,14 +145,14 @@ router.post(
       const newUserId = newlyCreatedUser.user_id;
 
       if (xpToAward > 0) {
-  await awardXp({
-    userId: newUserId,
-    xpAmount: xpToAward,
-    type: 'SIGNUP_BONUS',
-    descriptionKey: 'xp_history.signup_bonus', 
-    descriptionVars: { amount: xpToAward }      
-  }, client);
-}
+        await awardXp({
+          userId: newUserId,
+          xpAmount: xpToAward,
+          type: 'SIGNUP_BONUS',
+          descriptionKey: 'xp_history.signup_bonus', 
+          descriptionVars: { amount: xpToAward }      
+        }, client);
+      }
      
       if (referralCode) {
             const syndicateResult = await client.query(
@@ -168,12 +170,13 @@ router.post(
         }
 
       await client.query('COMMIT');
-      res.status(201).json({ message: 'User created successfully', user: newlyCreatedUser });
+      // Use the 'ok' helper for the success response
+      res.status(201).json(ok('REGISTER_SUCCESS'));
 
     } catch (error) {
       if (client) await client.query('ROLLBACK');
       console.error('REGISTRATION PROCESS FAILED:', error); 
-      res.status(500).json({ error: 'Server error during registration.' });
+      res.status(500).json(fail('GENERIC_SERVER_ERROR'));
     } finally {
       if (client) client.release();
     }
@@ -190,7 +193,7 @@ router.post(
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      return res.status(400).json(fail('INVALID_CREDENTIALS'));
     }
 
     try {
@@ -198,14 +201,14 @@ router.post(
       const result = await pool.query('SELECT user_id, username, email, password_hash, is_admin, account_tier, xp FROM users WHERE email = $1', [email]);
       
       if (result.rows.length === 0) {
-        return res.status(401).json({ error: 'Invalid credentials.' });
+        return res.status(401).json(fail('INVALID_CREDENTIALS'));
       }
 
       const user = result.rows[0];
       const isMatch = await bcrypt.compare(password, user.password_hash);
 
       if (!isMatch) {
-        return res.status(401).json({ error: 'Invalid credentials.' });
+        return res.status(401).json(fail('INVALID_CREDENTIALS'));
       }
 
       const currentTierInfo = TIER_DATA.find(t => t.tier === user.account_tier) || TIER_DATA[0];
@@ -224,16 +227,14 @@ router.post(
       };
       const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
       
-      // CRITICAL FIX: Set the cookie for the parent domain
       res.cookie('token', token, cookieOptions);
       
-
-      // Send ONE response that includes the user object for the frontend context.
-      res.status(200).json({ message: 'Login successful', user: payload.user });
+      // Use 'ok' helper and pass the user object back in the 'extra' parameter
+      res.status(200).json(ok('LOGIN_SUCCESS', {}, { user: payload.user }));
 
     } catch (err) {
       console.error('[Login Error]', err);
-      res.status(500).json({ error: 'Server error during login.' });
+      res.status(500).json(fail('GENERIC_SERVER_ERROR'));
     }
   }
 );
@@ -348,41 +349,40 @@ router.post('/forgot-password', authLimiter, [ body('email').isEmail().normalize
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      // Even with a validation error, we send a generic success response for security
+      return res.status(200).json(ok('FORGOT_PASSWORD_SUCCESS'));
     }
     const { email } = req.body;
     try {
       const userResult = await pool.query('SELECT user_id FROM users WHERE email = $1', [email]);
       
-      // Security: Always return the same message to prevent email enumeration attacks.
-      if (userResult.rows.length === 0) {
-        return res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
+      if (userResult.rows.length > 0) {
+        const user = userResult.rows[0];
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+        const tokenExpires = new Date(Date.now() + 3600000); // 1 hour
+
+        await pool.query(
+          'UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE user_id = $3',
+          [hashedToken, tokenExpires, user.user_id]
+        );
+
+        const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+        
+        await sendEmail({
+          to: email,
+          subject: 'Your HyperStrategies Password Reset Link',
+          html: `<p>You requested a password reset. Please click this link to set a new password:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>This link will expire in one hour.</p>`,
+        });
       }
-      const user = userResult.rows[0];
-
-      const resetToken = crypto.randomBytes(32).toString('hex');
-      const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-      const tokenExpires = new Date(Date.now() + 3600000); // Token expires in 1 hour
-
-      await pool.query(
-        'UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE user_id = $3',
-        [hashedToken, tokenExpires, user.user_id]
-      );
-
-      const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
       
-      await sendEmail({
-        to: email,
-        subject: 'Your HyperStrategies Password Reset Link',
-        html: `<p>You requested a password reset. Please click this link to set a new password:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>This link will expire in one hour.</p>`,
-      });
-      
-      res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
+      // Security: Always return the same 'ok' response to prevent email enumeration attacks.
+      res.status(200).json(ok('FORGOT_PASSWORD_SUCCESS'));
 
     } catch (err) {
       console.error('Forgot password error:', err);
-      // Don't leak internal errors to the user.
-      res.status(200).json({ message: 'If a user with that email exists, a password reset link has been sent.' });
+      // In case of a server error, still send the generic success response.
+      res.status(200).json(ok('FORGOT_PASSWORD_SUCCESS'));
     }
   }
 );
@@ -397,7 +397,7 @@ router.post(
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      return res.status(400).json(fail('VALIDATION_ERROR', { message: errors.array()[0].msg }));
     }
     const { token, password } = req.body;
     try {
@@ -408,7 +408,7 @@ router.post(
       );
 
       if (userResult.rows.length === 0) {
-        return res.status(400).json({ error: 'Password reset token is invalid or has expired.' });
+        return res.status(400).json(fail('INVALID_OR_EXPIRED_TOKEN'));
       }
       const user = userResult.rows[0];
 
@@ -420,11 +420,11 @@ router.post(
         [newPasswordHash, user.user_id]
       );
       
-      res.status(200).json({ message: 'Password has been successfully reset. You can now log in.' });
+      res.status(200).json(ok('RESET_PASSWORD_SUCCESS'));
 
-    } catch (err) {
+    } catch (err) { // --- THIS IS THE FIX ---
       console.error('Reset password error:', err);
-      res.status(500).json({ error: 'An error occurred.' });
+      res.status(500).json(fail('GENERIC_SERVER_ERROR'));
     }
   }
 );
