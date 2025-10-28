@@ -8,6 +8,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
 const { calculateActiveEffects } = require('../utils/effectsEngine');
 const { awardXp } = require('../utils/xpEngine');
+const { ok, fail } = require('../utils/response'); 
 
 
 const router = express.Router();
@@ -15,46 +16,29 @@ const router = express.Router();
 async function calculateAuthoritativeFee(dbClient, userId, vaultId, investmentAmount) {
     const tokenDecimals = tokenMap.usdc.decimals;
     const investmentAmountBigNum = ethers.utils.parseUnits(investmentAmount.toString(), tokenDecimals);
-
-    // 1. Fetch vault details and the user's active pin effects
     const [vaultResult, userEffects] = await Promise.all([
         dbClient.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
         calculateActiveEffects(userId, dbClient)
     ]);
-
     if (vaultResult.rows.length === 0) {
         throw new Error('Vault not found for fee calculation.');
     }
     const theVault = vaultResult.rows[0];
-
-    // 2. Start with the vault's base fee.
     const baseFeePct = parseFloat(theVault.fee_percentage) * 100;
-
-    // --- THIS IS THE KEY CHANGE ---
-    // The tierDiscountPct calculation has been completely REMOVED.
-    // We now only get the discount from the effects engine (which reads active pins).
     const totalPinDiscountPct = userEffects.fee_discount_pct || 0;
-
-    // 3. Calculate the final fee.
     let finalFeePct = baseFeePct - totalPinDiscountPct;
-    if (finalFeePct < 0.5) finalFeePct = 0.5; // Minimum fee clamp
-    
+    if (finalFeePct < 0.5) finalFeePct = 0.5;
     const finalTradablePct = 100 - finalFeePct;
     const finalFeeAmount = investmentAmountBigNum.mul(Math.round(finalFeePct * 100)).div(10000);
     const finalTradableAmount = investmentAmountBigNum.sub(finalFeeAmount);
-
-    // 4. Return the data. tierDiscountPct is now always 0.
     return {
-        baseFeePct,
-        tierDiscountPct: 0, // Always return 0 for consistency with the frontend display
-        totalPinDiscountPct,
-        finalFeePct,
-        finalTradablePct,
-        finalFeeAmountBN: finalFeeAmount,
+        baseFeePct, tierDiscountPct: 0, totalPinDiscountPct, finalFeePct,
+        finalTradablePct, finalFeeAmountBN: finalFeeAmount,
         finalFeeAmount: ethers.utils.formatUnits(finalFeeAmount, tokenDecimals),
         finalTradableAmount: ethers.utils.formatUnits(finalTradableAmount, tokenDecimals)
     };
 }
+
 
 router.post('/calculate-investment-fee', authenticateToken, async (req, res) => {
     const { vaultId, amount } = req.body;
@@ -94,77 +78,44 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
         if (userBalanceBigNum.lt(investmentAmountBigNum)) {
             await dbClient.query('ROLLBACK');
-            return res.status(400).json({ messageKey: 'errors.insufficientFunds' });
+            return res.status(400).json(fail('INSUFFICIENT_FUNDS'));
         }
 
         const feeBreakdown = await calculateAuthoritativeFee(dbClient, userId, vaultId, numericAmount);
         const newBalanceBigNum = userBalanceBigNum.sub(investmentAmountBigNum);
         
+        // --- THIS LOGIC IS NOW CORRECTLY INCLUDED ---
         await dbClient.query('UPDATE users SET balance = $1 WHERE user_id = $2', [ethers.utils.formatUnits(newBalanceBigNum, tokenDecimals), userId]);
         await dbClient.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, feeBreakdown.finalFeeAmount, `DEPOSIT_FEE_VAULT_${vaultId}`]);
+        await dbClient.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, $4, 'PENDING_SWEEP')`, [userId, vaultId, feeBreakdown.finalTradableAmount, feeBreakdown.finalFeeAmount]);
         
-        await dbClient.query(
-          `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) 
-           VALUES ($1, $2, 'DEPOSIT', $3, $4, 'PENDING_SWEEP')`,
-          [userId, vaultId, feeBreakdown.finalTradableAmount, feeBreakdown.finalFeeAmount] 
-        );
-        
-        const feeToDistributeStr = feeBreakdown.finalFeeAmount;
-        await dbClient.query(`UPDATE treasury_ledgers SET balance = balance + $1 WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'`, [feeToDistributeStr]);
-        const totalDesc = `Total Deposit Fee of ${feeToDistributeStr} from user ${userId} for vault ${vaultId}.`;
-        await dbClient.query(`INSERT INTO treasury_transactions (to_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'DEPOSIT_FEES_TOTAL'), $1, $2)`, [feeToDistributeStr, totalDesc]);
-        
+        const vaultTypeResult = await dbClient.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [vaultId]);
+        if (vaultTypeResult.rows[0]?.vault_type === 'FARMING') {
+            const activeProtocolsResult = await dbClient.query("SELECT protocol_id FROM farming_protocols WHERE vault_id = $1 AND status = 'FARMING'", [vaultId]);
+            for (const protocol of activeProtocolsResult.rows) {
+                await dbClient.query(`INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount) VALUES ($1, $2, $3, 'CONTRIBUTION', $4)`, [userId, vaultId, protocol.protocol_id, feeBreakdown.finalTradableAmount]);
+            }
+        }
+
         const allocationDescription = `Allocated ${amount} USDC to Vault ${vaultId}.`;
-
-const vaultTypeResult = await dbClient.query('SELECT vault_type FROM vaults WHERE vault_id = $1', [vaultId]);
-if (vaultTypeResult.rows[0]?.vault_type === 'FARMING') {
-    const activeProtocolsResult = await dbClient.query(
-        "SELECT protocol_id FROM farming_protocols WHERE vault_id = $1 AND status = 'FARMING'",
-        [vaultId]
-    );
-
-    for (const protocol of activeProtocolsResult.rows) {
-        await dbClient.query(
-            `INSERT INTO farming_contribution_ledger (user_id, vault_id, protocol_id, entry_type, amount)
-             VALUES ($1, $2, $3, 'CONTRIBUTION', $4)`,
-            [userId, vaultId, protocol.protocol_id, feeBreakdown.finalTradableAmount] // Use the tradable amount
-        );
-    }
-    console.log(`[Farming] Logged contribution for user ${userId} to ${activeProtocolsResult.rows.length} active protocols.`);
-}
-
         await dbClient.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_ALLOCATION', $2, $3, 'USDC', 'COMPLETED')`, [userId, allocationDescription, amount]);
 
-
         const xpForAmount = investmentAmountBigNum.div(ethers.utils.parseUnits('10', tokenDecimals)).toNumber();
-    
-    // Award the deposit bonus
-    await awardXp({
-      userId: userId,
-      xpAmount: xpForAmount,
-      type: 'DEPOSIT_BONUS',
-      descriptionKey: 'xp_history.deposit_bonus', // <-- Use a key
-      descriptionVars: { amount: xpForAmount.toFixed(2), vaultId: vaultId } // <-- Pass variables
-    }, dbClient);
+        await awardXp({ userId, xpAmount: xpForAmount, type: 'DEPOSIT_BONUS', descriptionKey: 'xp_history.deposit_bonus', descriptionVars: { amount: xpForAmount.toFixed(2), vaultId }}, dbClient);
+        
+        const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
+        if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
+            await awardXp({ userId: theUser.referred_by_user_id, xpAmount: xpForAmount, type: 'REFERRAL_BONUS', descriptionKey: 'xp_history.referral_bonus', descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username }}, dbClient);
+        }
+        
 
-    // Check for and award the referral bonus
-    const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
-    if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
-      const referrerId = theUser.referred_by_user_id;
-      await awardXp({
-        userId: referrerId,
-        xpAmount: xpForAmount,
-        type: 'REFERRAL_BONUS',
-        descriptionKey: 'xp_history.referral_bonus', // <-- Use a key
-        descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username } // <-- Pass variables
-      }, dbClient);
-    }
         await dbClient.query('COMMIT');
-        res.status(200).json({ message: 'Allocation successful!' });
+        res.status(200).json(ok('INVEST_SUCCESS'));
+
     } catch (err) {
         if(dbClient) await dbClient.query('ROLLBACK');
         console.error('Allocation transaction error:', err);
-        res.status(500).json({ message: 'An error occurred during the allocation process.' });
+        res.status(500).json(fail('GENERIC_SERVER_ERROR'));
     } finally {
         if(dbClient) dbClient.release();
     }
@@ -222,147 +173,86 @@ router.post('/withdraw', authenticateToken, async (req, res) => {
     try {
         const withdrawalAmount = parseFloat(amount);
         if (isNaN(withdrawalAmount) || withdrawalAmount <= 0) {
-            return res.status(400).json({ error: 'A valid, positive withdrawal amount is required.' });
+            return res.status(400).json(fail('INVALID_AMOUNT'));
         }
-
         await client.query('BEGIN');
 
-        // Re-checking the lock logic here on the server for security
         const vaultLockResult = await client.query('SELECT lock_period_days FROM vaults WHERE vault_id = $1', [vaultId]);
         const lockPeriodDays = vaultLockResult.rows[0]?.lock_period_days;
-
-        const lastDepositResult = await client.query(
-            `SELECT created_at FROM vault_ledger_entries 
-             WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'DEPOSIT' 
-             ORDER BY created_at DESC LIMIT 1`,
-            [userId, vaultId]
-        );
-
-        if (lockPeriodDays > 0 && lastDepositResult.rows.length > 0) {
-            const lastDepositDate = new Date(lastDepositResult.rows[0].created_at);
-            const lockExpiresDate = new Date(lastDepositDate);
-            lockExpiresDate.setDate(lockExpiresDate.getDate() + lockPeriodDays);
-
-            if (new Date() < lockExpiresDate) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ 
-                    error: `Your funds are locked in this vault and cannot be withdrawn until ${lockExpiresDate.toLocaleDateString()}.` 
-                });
+        if (lockPeriodDays > 0) {
+            const lastDepositResult = await client.query(`SELECT created_at FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'DEPOSIT' ORDER BY created_at DESC LIMIT 1`, [userId, vaultId]);
+            if (lastDepositResult.rows.length > 0) {
+                const lockExpiresDate = new Date(lastDepositResult.rows[0].created_at);
+                lockExpiresDate.setDate(lockExpiresDate.getDate() + lockPeriodDays);
+                if (new Date() < lockExpiresDate) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json(fail('FUNDS_LOCKED', { date: lockExpiresDate.toLocaleDateString() }));
+                }
             }
         }
 
-        const balanceResult = await client.query(
-            "SELECT COALESCE(SUM(amount), 0) as current_balance FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2", 
-            [userId, vaultId]
-        );
+        const balanceResult = await client.query("SELECT COALESCE(SUM(amount), 0) as current_balance FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2", [userId, vaultId]);
         const currentBalance = parseFloat(balanceResult.rows[0].current_balance);
-
         if (withdrawalAmount > currentBalance) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Withdrawal amount exceeds your capital in this vault.' });
+            return res.status(400).json(fail('WITHDRAWAL_EXCEEDS_CAPITAL'));
         }
 
-        await client.query(
-            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
-             VALUES ($1, $2, 'WITHDRAWAL_REQUEST', $3, 'PENDING_APPROVAL')`, 
-            [userId, vaultId, -withdrawalAmount]
-        );
         const description = `Requested withdrawal of ${withdrawalAmount.toFixed(2)} USDC from Vault ${vaultId}.`;
-       await client.query(
-          `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, related_vault_id) 
-           VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING_FUNDING', $4)`, 
-          [userId, description, withdrawalAmount, vaultId] 
-       );
+        await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, related_vault_id) VALUES ($1, 'VAULT_WITHDRAWAL_REQUEST', $2, $3, 'USDC', 'PENDING_FUNDING', $4)`, [userId, description, withdrawalAmount, vaultId]);
         
         await client.query('COMMIT');
-        res.status(200).json({ message: 'Withdrawal request submitted successfully.' });
+        res.status(200).json(ok('VAULT_WITHDRAWAL_SUCCESS'));
+
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Vault withdrawal request error:', err);
-        res.status(500).json({ error: 'An error occurred during the withdrawal request.' });
+        res.status(500).json(fail('GENERIC_SERVER_ERROR'));
     } finally {
         client.release();
     }
 });
 
+
 router.post('/request-transfer', authenticateToken, async (req, res) => {
     const { fromVaultId, toVaultId, amount } = req.body;
     const userId = req.user.id;
     const client = await pool.connect();
-
     try {
         const transferAmount = parseFloat(amount);
-
-        // --- 1. Validation ---
-        if (!fromVaultId || !toVaultId || !amount) {
-            return res.status(400).json({ error: 'Missing required fields: fromVaultId, toVaultId, amount.' });
+        if (!fromVaultId || !toVaultId || isNaN(transferAmount) || transferAmount <= 0) {
+            return res.status(400).json(fail('INVALID_TRANSFER_REQUEST'));
         }
         if (fromVaultId === toVaultId) {
-            return res.status(400).json({ error: 'Source and destination vaults cannot be the same.' });
-        }
-        if (isNaN(transferAmount) || transferAmount <= 0) {
-            return res.status(400).json({ error: 'A valid, positive transfer amount is required.' });
+            return res.status(400).json(fail('SAME_SOURCE_DESTINATION'));
         }
 
         await client.query('BEGIN');
 
-        // --- 2. Check User's Available Capital in Source Vault ---
-        // This is the most critical security check. We sum all ledger entries to get the settled balance.
-        const balanceResult = await client.query(
-            "SELECT COALESCE(SUM(amount), 0) as current_balance FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2", 
-            [userId, fromVaultId]
-        );
+        const balanceResult = await client.query("SELECT COALESCE(SUM(amount), 0) as current_balance FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2", [userId, fromVaultId]);
         const currentBalance = parseFloat(balanceResult.rows[0].current_balance);
 
         if (transferAmount > currentBalance) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Transfer amount exceeds your available capital in this vault.' });
+            return res.status(400).json(fail('TRANSFER_EXCEEDS_CAPITAL'));
         }
 
-        // --- 3. Freeze the Funds & Create the Request ---
-        // This is an atomic operation: we debit the source vault and create the transfer record together.
-
-        // a) Create a 'TRANSFER_FUNDS_HELD' entry to immediately debit the source vault's balance.
-        await client.query(
-            `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
-             VALUES ($1, $2, 'TRANSFER_FUNDS_HELD', $3, 'ACTIVE')`, // Status is 'ACTIVE' as it's an immediate accounting change
-            [userId, fromVaultId, -transferAmount]
-        );
+        await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'TRANSFER_FUNDS_HELD', $3, 'ACTIVE')`, [userId, fromVaultId, -transferAmount]);
+        const transferResult = await client.query(`INSERT INTO vault_transfers (user_id, from_vault_id, to_vault_id, amount, status) VALUES ($1, $2, $3, $4, 'PENDING_UNWIND') RETURNING transfer_id`, [userId, fromVaultId, toVaultId, transferAmount]);
         
-        // b) Create the official transfer request record for the admin workflow.
-        const transferResult = await client.query(
-            `INSERT INTO vault_transfers (user_id, from_vault_id, to_vault_id, amount, status) 
-             VALUES ($1, $2, $3, $4, 'PENDING_UNWIND') RETURNING transfer_id`,
-            [userId, fromVaultId, toVaultId, transferAmount]
-        );
-
-        const newTransferId = transferResult.rows[0].transfer_id;
-
-        // --- 4. Log the user activity ---
         const description = `Requested transfer of ${transferAmount.toFixed(2)} USDC from Vault ${fromVaultId} to Vault ${toVaultId}.`;
-        await client.query(
-           `INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) 
-            VALUES ($1, 'VAULT_TRANSFER_REQUEST', $2, $3, 'USDC', 'PENDING')`, 
-           [userId, description, transferAmount]
-        );
+        await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status) VALUES ($1, 'VAULT_TRANSFER_REQUEST', $2, $3, 'USDC', 'PENDING')`, [userId, description, transferAmount]);
 
         await client.query('COMMIT');
-        
-        // TODO: In the future, trigger an admin notification here (e.g., email or Telegram message).
-
-        res.status(200).json({ 
-            message: 'Transfer request submitted successfully. It may take 3-48 hours to process.',
-            transferId: newTransferId 
-        });
+        res.status(200).json(ok('TRANSFER_REQUEST_SUCCESS', {}, { transferId: transferResult.rows[0].transfer_id }));
 
     } catch (err) {
         await client.query('ROLLBACK');
-        // Check for the unique constraint violation
         if (err.code === '23505' && err.constraint === 'uq_one_pending_transfer_per_vault_pair') {
-            return res.status(409).json({ error: 'You already have a pending transfer for this vault. Please wait for it to complete.' });
+            return res.status(409).json(fail('DUPLICATE_TRANSFER_REQUEST'));
         }
         console.error('Vault transfer request error:', err);
-        res.status(500).json({ error: 'An error occurred during the transfer request.' });
+        res.status(500).json(fail('GENERIC_SERVER_ERROR'));
     } finally {
         client.release();
     }

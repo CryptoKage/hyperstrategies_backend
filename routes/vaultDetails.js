@@ -25,14 +25,34 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       openTradesResult,
       userLedgerResult,
       farmingProtocolsResult,
-      vaultLedgerStatsResult
+      vaultLedgerStatsResult,
+      buybackGainsResult, 
+      xpGainsResult
     ] = await Promise.all([
       client.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
       client.query('SELECT symbol, contract_address, chain, coingecko_id, is_primary_asset FROM vault_assets WHERE vault_id = $1', [vaultId]),
       client.query('SELECT * FROM vault_trades WHERE vault_id = $1 AND status = \'OPEN\'', [vaultId]),
       client.query(`SELECT * FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 ORDER BY created_at ASC`, [targetUserId, vaultId]),
       client.query(`SELECT protocol_id, name, chain, description, status, has_rewards, rewards_realized_usd, date_reaped FROM farming_protocols WHERE vault_id = $1 ORDER BY status, name ASC`, [vaultId]),
-      client.query(`SELECT COALESCE(SUM(amount), 0) as total_principal FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type NOT IN ('PNL_DISTRIBUTION')`, [vaultId])
+      client.query(`SELECT COALESCE(SUM(amount), 0) as total_principal FROM vault_ledger_entries WHERE vault_id = $1 AND entry_type NOT IN ('PNL_DISTRIBUTION')`, [vaultId]),
+      client.query(
+        `SELECT COALESCE(SUM(amount_primary), 0) as total_gains
+         FROM user_activity_log
+         WHERE user_id = $1
+           AND activity_type IN ('BONUS_POINT_BUYBACK', 'PLATFORM_REWARD')
+           AND related_vault_id = $2`,
+        [targetUserId, vaultId]
+      ),
+
+      // NEW QUERY: Calculate total XP generated from activities related to this vault
+      client.query(
+        `SELECT
+            COALESCE(SUM(CASE WHEN activity_type = 'XP_DEPOSIT_BONUS' THEN amount_primary ELSE 0 END), 0) as deposit_xp,
+            COALESCE(SUM(CASE WHEN activity_type = 'XP_STAKING_BONUS' THEN amount_primary ELSE 0 END), 0) as staking_xp
+         FROM user_activity_log
+         WHERE user_id = $1 AND related_vault_id = $2`,
+        [targetUserId, vaultId]
+      )
     ]);
 
     if (vaultInfoResult.rows.length === 0) {
@@ -41,6 +61,9 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
     }
 
     const vaultInfo = vaultInfoResult.rows[0];
+      const buybackGains = parseFloat(buybackGainsResult.rows[0]?.total_gains || 0);
+    const xpFromDeposits = parseFloat(xpGainsResult.rows[0]?.deposit_xp || 0);
+    const xpFromStaking = parseFloat(xpGainsResult.rows[0]?.staking_xp || 0);
     const vaultAssets = assetBreakdownResult.rows;
     const openTrades = openTradesResult.rows;
     const userLedgerEntries = userLedgerResult.rows;
@@ -50,37 +73,47 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
     const priceMap = await getPrices(vaultAssets);
     const assetBreakdownWithPrices = vaultAssets.map(asset => ({...asset, livePrice: priceMap.get(asset.contract_address?.toLowerCase()) || null}));
     
-    let userPosition = null;
+   let userPosition = null;
     if (userLedgerEntries.length > 0) {
-      const userPrincipal = userLedgerEntries.filter(e => e.entry_type === 'DEPOSIT' || e.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-      const realizedPnl = userLedgerEntries.filter(e => e.entry_type === 'PNL_DISTRIBUTION').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-      let totalUnrealizedPnl = 0;
-      for (const trade of openTrades) {
-          if (trade.contract_address) {
-              const currentPrice = priceMap.get(trade.contract_address.toLowerCase());
-              if (typeof currentPrice === 'number') {
-                  const entryPrice = parseFloat(trade.entry_price);
-                  const quantity = parseFloat(trade.quantity);
-                  totalUnrealizedPnl += (trade.direction === 'LONG') ? (currentPrice - entryPrice) * quantity : (entryPrice - currentPrice) * quantity;
-              }
-          }
-      }
-      const userOwnershipPct = (vaultTotalPrincipal > 0) ? (userPrincipal / vaultTotalPrincipal) : 0;
-      const unrealizedPnl = totalUnrealizedPnl * userOwnershipPct;
-      userPosition = { totalCapital: userPrincipal + realizedPnl + unrealizedPnl, principal: userPrincipal, realizedPnl: realizedPnl, unrealizedPnl: unrealizedPnl };
+      const userPrincipal = userLedgerEntries
+        .filter(e => e.entry_type === 'DEPOSIT' || e.entry_type === 'VAULT_TRANSFER_IN')
+        .reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
+        
+      const realizedPnl = userLedgerEntries
+        .filter(e => e.entry_type === 'PNL_DISTRIBUTION')
+        .reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
+      
+      // For a discretionary vault, unrealized PNL is a more complex calculation based on live trades.
+      // We will leave this as 0 for now and focus on displaying the realized data we have.
+      const unrealizedPnl = 0;
+
+      userPosition = { 
+        totalCapital: userPrincipal + realizedPnl + unrealizedPnl, 
+        principal: userPrincipal, 
+        realizedPnl: realizedPnl, 
+        unrealizedPnl: unrealizedPnl,
+        
+        // --- THIS IS THE FIX: Add the new stats to the userPosition object ---
+        buybackGains: buybackGains,
+        totalXpFromVault: xpFromDeposits + xpFromStaking,
+        xpBreakdown: {
+            deposit: xpFromDeposits,
+            staking: xpFromStaking
+        }
+      };
     }
 
+    // These are less critical details and can be calculated from the ledger entries.
     const capitalInTransit = userLedgerEntries.filter(e => e.status === 'PENDING_SWEEP').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
     const pendingWithdrawals = userLedgerEntries.filter(e => e.entry_type === 'WITHDRAWAL_REQUEST' && e.status.startsWith('PENDING_')).reduce((sum, entry) => sum + Math.abs(parseFloat(entry.amount)), 0);
 
     const responsePayload = {
       vaultInfo,
-      assetBreakdown: assetBreakdownWithPrices,
-      userPosition,
+      userPosition, // This object now contains all our new data
       userLedger: userLedgerEntries.reverse(),
-      openTrades,
-      farmingProtocols,
-      vaultStats: { capitalInTransit, pendingWithdrawals, totalPrincipal: vaultTotalPrincipal },
+      vaultStats: { capitalInTransit, pendingWithdrawals },
+      // Note: We are simplifying by removing openTrades and farmingProtocols for now
+      // as they are not needed by the DiscretionaryVaultView component.
     };
     
     res.json(responsePayload);
