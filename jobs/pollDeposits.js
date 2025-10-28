@@ -1,4 +1,4 @@
-// FINAL jobs/pollDeposits.js
+// hyperstrategies_backend/jobs/pollDeposits.js
 
 const { Alchemy, Network, AssetTransfersCategory } = require('alchemy-sdk');
 const pool = require('../db');
@@ -7,7 +7,7 @@ const { ethers } = require('ethers');
 
 const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
-// The key used in your system_state table. Change this if it's different.
+// The key used in your system_state table.
 const LAST_SCANNED_BLOCK_KEY = 'lastCheckedBlock';
 
 
@@ -17,6 +17,15 @@ async function findAndCreditDeposits(options = {}) {
     if (!fromBlock) {
         throw new Error("findAndCreditDeposits requires a 'fromBlock' option.");
     }
+
+    // --- LOGGING FIX: Resolve 'latest' to a real number for accurate telemetry ---
+    let endBlockForLog = toBlock;
+    if (toBlock === 'latest') {
+        // We create a temporary provider instance to get the block number.
+        const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
+        endBlockForLog = await provider.getBlockNumber();
+    }
+    // --- END LOGGING FIX ---
     
     let client;
     try {
@@ -25,12 +34,12 @@ async function findAndCreditDeposits(options = {}) {
         
         const { rows: users } = await client.query('SELECT user_id, eth_address FROM users WHERE eth_address IS NOT NULL');
         if (users.length === 0) {
+            console.log('[Deposit Scan] No users with wallets found. Exiting scan.');
             return { newDeposits: 0, blocksScanned: 0 };
         }
         
         const userAddressMap = new Map(users.map(u => [u.eth_address.toLowerCase(), u.user_id]));
 
-        // This is the robust method that does not rely on the 'toAddress' filter.
         const transfers = await alchemy.core.getAssetTransfers({
             fromBlock: fromBlock,
             toBlock: toBlock,
@@ -49,8 +58,7 @@ async function findAndCreditDeposits(options = {}) {
                 const { rows: existing } = await client.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
                 if (existing.length === 0) {
                     const userId = userAddressMap.get(toAddress);
-                    const rawAmount = event.value;
-                    const formattedAmount = ethers.utils.formatUnits(rawAmount, tokenMap.usdc.decimals);
+                    const formattedAmount = ethers.utils.formatUnits(event.value, tokenMap.usdc.decimals);
 
                     await client.query('BEGIN');
                     await client.query('INSERT INTO deposits (user_id, amount, token, tx_hash) VALUES ($1, $2, $3, $4)', [userId, formattedAmount, 'usdc', txHash]);
@@ -63,12 +71,13 @@ async function findAndCreditDeposits(options = {}) {
             }
         }
         
-        const blocksScanned = (parseInt(toBlock, 16) || 0) - (parseInt(fromBlock, 16) || 0);
+        // --- LOGGING FIX: Use our resolved block number for the log message ---
+        const blocksScanned = (parseInt(endBlockForLog.toString()) || 0) - (parseInt(fromBlock, 16) || 0);
         console.log(`[Deposit Scan] Finished. Found ${newDepositsFound} new deposits across ~${blocksScanned} blocks.`);
         return { newDeposits: newDepositsFound, blocksScanned };
 
     } catch (error) {
-        if (client) await client.query('ROLLBACK');
+        if (client) await client.query('ROLLBACK').catch(console.error);
         console.error('❌ Major error in findAndCreditDeposits:', error);
         throw error;
     } finally {
@@ -96,7 +105,6 @@ async function scanForRecentDeposits() {
             return;
         }
 
-        // We'll scan in chunks of 2000 blocks to stay within API limits.
         const MAX_BLOCK_RANGE = 2000;
         let currentBlock = fromBlockNum;
 
@@ -108,7 +116,6 @@ async function scanForRecentDeposits() {
                 toBlock: '0x' + endBlock.toString(16)
             });
 
-            // Update the state in the database after each successful chunk.
             await client.query("UPDATE system_state SET value = $1 WHERE key = $2", [endBlock, LAST_SCANNED_BLOCK_KEY]);
             console.log(`[Deposit Scan] Cron job scanned up to block ${endBlock}. State updated.`);
             
@@ -122,4 +129,12 @@ async function scanForRecentDeposits() {
     }
 }
 
-module.exports = { findAndCreditDeposits, scanForRecentDeposits };
+// --- RUNNER FIX: This is the new wrapper function that the manual runner will call. ---
+async function pollDeposits() {
+    console.log('Starting scheduled deposit polling job via manual trigger...');
+    await scanForRecentDeposits();
+    console.log('Scheduled deposit polling job finished.');
+}
+// --- END RUNNER FIX ---
+
+module.exports = { findAndCreditDeposits, scanForRecentDeposits, pollDeposits };

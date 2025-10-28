@@ -1747,123 +1747,6 @@ router.patch('/farming-protocols/:protocolId/status', async (req, res) => {
 });
 
 
-// 3. REAP rewards and distribute PNL
-// in routes/admin.js
-
-router.post('/farming-protocols/:protocolId/reap', async (req, res) => {
-    const { protocolId } = req.params;
-    const { realizedUsdValue } = req.body;
-    
-    const numericValue = parseFloat(realizedUsdValue);
-    if (isNaN(numericValue) || numericValue <= 0) {
-        return res.status(400).json({ error: 'A valid, positive realizedUsdValue is required.' });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        // --- Step 1: Fetch protocol info and lock the row ---
-        const protocolResult = await client.query(
-            "SELECT vault_id, name, date_farming_started FROM farming_protocols WHERE protocol_id = $1 AND status = 'FARMING' FOR UPDATE", 
-            [protocolId]
-        );
-        if (protocolResult.rows.length === 0) {
-            throw new Error('Farming protocol not found or not in FARMING status.');
-        }
-        const { vault_id, name: protocolName, date_farming_started } = protocolResult.rows[0];
-        const reapDate = new Date();
-
-        // --- Step 2: Update the protocol to mark it as reaped ---
-        await client.query(
-            `UPDATE farming_protocols 
-             SET has_rewards = TRUE, rewards_realized_usd = COALESCE(rewards_realized_usd, 0) + $1, date_reaped = $2 
-             WHERE protocol_id = $3;`,
-            [numericValue, reapDate, protocolId]
-        );
-        // Note: You may want to change the status to 'REAPED' here or have a separate control for it.
-        // For now, we leave it in FARMING to support multiple airdrops as you described.
-
-        // --- Step 3: Calculate Time-Weighted Contributions ("Dollar-Seconds") ---
-        const contributions = await client.query(
-            `SELECT user_id, entry_type, amount, created_at 
-             FROM farming_contribution_ledger 
-             WHERE protocol_id = $1 AND created_at >= $2 AND created_at <= $3 
-             ORDER BY user_id, created_at ASC;`,
-            [protocolId, date_farming_started, reapDate]
-        );
-
-        const userDollarSeconds = new Map();
-        let totalDollarSeconds = 0;
-
-        // Group contributions by user
-        const contributionsByUser = contributions.rows.reduce((acc, row) => {
-            if (!acc[row.user_id]) acc[row.user_id] = [];
-            acc[row.user_id].push(row);
-            return acc;
-        }, {});
-
-        for (const userId in contributionsByUser) {
-            const userEvents = contributionsByUser[userId];
-            let userTotalSeconds = 0;
-            let currentBalance = 0;
-            let lastEventTime = date_farming_started;
-
-            for (const event of userEvents) {
-                const eventTime = new Date(event.created_at);
-                const durationSeconds = (eventTime - lastEventTime) / 1000;
-                
-                userTotalSeconds += currentBalance * durationSeconds;
-
-                if (event.entry_type === 'CONTRIBUTION') {
-                    currentBalance += parseFloat(event.amount);
-                } else if (event.entry_type === 'WITHDRAWAL') {
-                    currentBalance -= parseFloat(event.amount);
-                }
-                lastEventTime = eventTime;
-            }
-
-            // Add the final period from the last event until the reapDate
-            const finalDurationSeconds = (reapDate - lastEventTime) / 1000;
-            userTotalSeconds += currentBalance * finalDurationSeconds;
-            
-            if (userTotalSeconds > 0) {
-                userDollarSeconds.set(userId, userTotalSeconds);
-                totalDollarSeconds += userTotalSeconds;
-            }
-        }
-
-        // --- Step 4: Distribute PNL ---
-        if (totalDollarSeconds <= 0) {
-            throw new Error('No user contributions found for this farming period. Cannot distribute PNL.');
-        }
-
-        let participantsCount = 0;
-        for (const [userId, dollarSeconds] of userDollarSeconds.entries()) {
-            const userShare = dollarSeconds / totalDollarSeconds;
-            const pnlAmount = numericValue * userShare;
-
-            if (pnlAmount > 0.000001) {
-                await client.query(
-                    `INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) 
-                     VALUES ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT');`,
-                    [userId, vault_id, pnlAmount]
-                );
-                participantsCount++;
-            }
-        }
-        
-        await client.query('COMMIT');
-        res.status(200).json({ message: `Successfully reaped $${numericValue} from ${protocolName} and distributed time-weighted PNL to ${participantsCount} users.` });
-
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error(`Error reaping rewards for protocol ${protocolId}:`, error);
-        res.status(500).json({ error: error.message || 'Failed to reap rewards.' });
-    } finally {
-        client.release();
-    }
-});
 
 router.get('/farming-protocols', async (req, res) => {
     const { vaultId } = req.query;
@@ -2709,5 +2592,216 @@ router.delete('/pnl-events/:entryId', async (req, res) => {
         res.status(500).json({ error: 'Failed to delete PNL event.' });
     }
 });
+
+// Add this new route to routes/admin.js
+
+router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
+    const { totalRewardUsd, participatingVaultIds } = req.body;
+
+    const numericReward = parseFloat(totalRewardUsd);
+    if (isNaN(numericReward) || numericReward <= 0 || !Array.isArray(participatingVaultIds) || participatingVaultIds.length === 0) {
+        return res.status(400).json({ error: 'A valid totalRewardUsd and a non-empty array of participatingVaultIds are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        // 1. Get a unique list of all users invested in the participating vaults
+        const eligibleUsersResult = await client.query(
+            `SELECT DISTINCT u.user_id, u.username, u.xp
+             FROM users u
+             JOIN vault_ledger_entries vle ON u.user_id = vle.user_id
+             WHERE vle.vault_id = ANY($1::int[])`,
+            [participatingVaultIds]
+        );
+        const eligibleUsers = eligibleUsersResult.rows;
+        const userIds = eligibleUsers.map(u => u.user_id);
+
+        if (userIds.length === 0) {
+            return res.json({ message: 'No eligible users found in the specified vaults.', preview: [] });
+        }
+
+        // 2. Fetch bonus point and XP totals for ONLY these eligible users
+        const [bonusPointsResult, totalXpResult] = await Promise.all([
+            client.query(
+                `SELECT user_id, COALESCE(SUM(points_amount), 0) as total_points
+                 FROM bonus_points
+                 WHERE user_id = ANY($1::uuid[])
+                 GROUP BY user_id`,
+                [userIds]
+            ),
+            client.query(
+                `SELECT COALESCE(SUM(xp), 0) as total_xp FROM users WHERE user_id = ANY($1::uuid[])`,
+                [userIds]
+            )
+        ]);
+        
+        const bonusPointsMap = new Map(bonusPointsResult.rows.map(r => [r.user_id, parseFloat(r.total_points)]));
+        const totalEligibleXp = parseFloat(totalXpResult.rows[0].total_xp);
+        let totalOutstandingBonusPoints = Array.from(bonusPointsMap.values()).reduce((sum, points) => sum + points, 0);
+
+        // 3. Perform the calculation logic
+        let remainingRewardPool = numericReward;
+        const previewResults = [];
+
+        // --- Tier 1: Bonus Point Buyback ---
+        let amountForBuyback = Math.min(remainingRewardPool, totalOutstandingBonusPoints);
+        if (amountForBuyback > 0) {
+            remainingRewardPool -= amountForBuyback;
+        }
+
+        // --- Tier 2: XP-Weighted Distribution ---
+        let amountForXp = remainingRewardPool;
+
+        for (const user of eligibleUsers) {
+            let userBuybackAmount = 0;
+            if (amountForBuyback > 0 && totalOutstandingBonusPoints > 0) {
+                const userBonusPoints = bonusPointsMap.get(user.user_id) || 0;
+                userBuybackAmount = (userBonusPoints / totalOutstandingBonusPoints) * amountForBuyback;
+            }
+
+            let userXpAmount = 0;
+            if (amountForXp > 0 && totalEligibleXp > 0) {
+                const userXp = parseFloat(user.xp) || 0;
+                userXpAmount = (userXp / totalEligibleXp) * amountForXp;
+            }
+
+            previewResults.push({
+                userId: user.user_id,
+                username: user.username,
+                bonusPointPayout: userBuybackAmount,
+                xpBasedPayout: userXpAmount,
+                totalPayout: userBuybackAmount + userXpAmount
+            });
+        }
+        
+        // Sort by total payout descending for a clear preview
+        previewResults.sort((a, b) => b.totalPayout - a.totalPayout);
+
+        res.status(200).json({
+            summary: {
+                totalRewardPool: numericReward,
+                allocatedToBuyback: amountForBuyback,
+                allocatedToXp: amountForXp,
+                participantCount: eligibleUsers.length
+            },
+            preview: previewResults
+        });
+
+    } catch (error) {
+        console.error('Error previewing hybrid distribution:', error);
+        res.status(500).json({ error: 'Failed to generate distribution preview.' });
+    } finally {
+        client.release();
+    }
+});
+
+// Add this new route to routes/admin.js
+
+router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
+    const { totalRewardUsd, participatingVaultIds, description } = req.body;
+    const adminUserId = req.user.id;
+
+    const numericReward = parseFloat(totalRewardUsd);
+    if (isNaN(numericReward) || numericReward <= 0 || !Array.isArray(participatingVaultIds) || participatingVaultIds.length === 0 || !description) {
+        return res.status(400).json({ error: 'A valid totalRewardUsd, a non-empty array of participatingVaultIds, and a description are required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // The calculation logic here is an exact mirror of the 'preview' endpoint for consistency.
+        const eligibleUsersResult = await client.query(`SELECT DISTINCT u.user_id, u.username, u.xp FROM users u JOIN vault_ledger_entries vle ON u.user_id = vle.user_id WHERE vle.vault_id = ANY($1::int[])`, [participatingVaultIds]);
+        const eligibleUsers = eligibleUsersResult.rows;
+        const userIds = eligibleUsers.map(u => u.user_id);
+
+        if (userIds.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(200).json({ message: 'No eligible users found. No funds distributed.' });
+        }
+
+        const [bonusPointsResult, totalXpResult] = await Promise.all([
+            client.query(`SELECT user_id, COALESCE(SUM(points_amount), 0) as total_points FROM bonus_points WHERE user_id = ANY($1::uuid[]) GROUP BY user_id`, [userIds]),
+            client.query(`SELECT COALESCE(SUM(xp), 0) as total_xp FROM users WHERE user_id = ANY($1::uuid[])`, [userIds])
+        ]);
+        
+        const bonusPointsMap = new Map(bonusPointsResult.rows.map(r => [r.user_id, parseFloat(r.total_points)]));
+        const totalEligibleXp = parseFloat(totalXpResult.rows[0].total_xp);
+        let totalOutstandingBonusPoints = Array.from(bonusPointsMap.values()).reduce((sum, points) => sum + points, 0);
+
+        let remainingRewardPool = numericReward;
+        let amountForBuyback = Math.min(remainingRewardPool, totalOutstandingBonusPoints);
+        if (amountForBuyback > 0) {
+            remainingRewardPool -= amountForBuyback;
+        }
+        let amountForXp = remainingRewardPool;
+
+        // --- Execute the loop to perform database writes ---
+        for (const user of eligibleUsers) {
+            const userId = user.user_id;
+            let userBuybackAmount = 0;
+            if (amountForBuyback > 0 && totalOutstandingBonusPoints > 0) {
+                const userBonusPoints = bonusPointsMap.get(userId) || 0;
+                userBuybackAmount = (userBonusPoints / totalOutstandingBonusPoints) * amountForBuyback;
+            }
+
+            let userXpAmount = 0;
+            if (amountForXp > 0 && totalEligibleXp > 0) {
+                const userXp = parseFloat(user.xp) || 0;
+                userXpAmount = (userXp / totalEligibleXp) * amountForXp;
+            }
+
+            const totalPayout = userBuybackAmount + userXpAmount;
+            if (totalPayout <= 0) continue;
+
+            // Find the user's primary vault (most capital) among the participating ones
+            const primaryVaultResult = await client.query(
+                `SELECT vault_id, SUM(amount) as capital
+                 FROM vault_ledger_entries
+                 WHERE user_id = $1 AND vault_id = ANY($2::int[])
+                 GROUP BY vault_id ORDER BY capital DESC LIMIT 1`,
+                [userId, participatingVaultIds]
+            );
+            // Default to the first participating vault if user has no capital (edge case)
+            const targetVaultId = primaryVaultResult.rows[0]?.vault_id || participatingVaultIds[0];
+
+            // --- Execute Bonus Point Buyback Portion ---
+            if (userBuybackAmount > 0.000001) {
+                // 1. Debit their bonus points
+                await client.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, -userBuybackAmount, 'HYBRID_DISTRIBUTION_BUYBACK']);
+                // 2. Credit their vault position as a new DEPOSIT
+                await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 0, 'SWEPT')`, [userId, targetVaultId, userBuybackAmount]);
+                // 3. Award XP for the buyback (using our standard engine)
+                const { awardXp } = require('../utils/xpEngine');
+                await awardXp({
+                    userId: userId,
+                    xpAmount: userBuybackAmount * 0.1, // 10% of buyback value
+                    type: 'BONUS_POINT_BUYBACK',
+                    descriptionKey: 'xp_history.hybrid_buyback',
+                    descriptionVars: { amount: userBuybackAmount.toFixed(2) }
+                }, client);
+            }
+            
+            // --- Execute XP-Based Distribution Portion ---
+            if (userXpAmount > 0.000001) {
+                // 1. Credit their vault position as PNL
+                await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT')`, [userId, targetVaultId, userXpAmount]);
+                // 2. Log the activity for reporting
+                await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source) VALUES ($1, 'PLATFORM_REWARD', $2, $3, 'USDC', 'COMPLETED', 'HYBRID_DISTRIBUTION_XP')`, [userId, description, userXpAmount]);
+            }
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Successfully distributed $${numericReward.toFixed(2)} to ${eligibleUsers.length} users.` });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error executing hybrid distribution:', error);
+        res.status(500).json({ error: 'Failed to execute distribution.' });
+    } finally {
+        client.release();
+    }
+});
+
 
 module.exports = router;

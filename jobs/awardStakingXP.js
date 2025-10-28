@@ -1,9 +1,9 @@
-// PASTE THIS ENTIRE CONTENT TO REPLACE: hyperstrategies_backend/jobs/awardStakingXP.js
+// hyperstrategies_backend/jobs/awardStakingXP.js
 
 const pool = require('../db');
 const { calculateUserTier } = require('../utils/tierUtils');
 const { calculateActiveEffects } = require('../utils/effectsEngine');
-const { awardXp } = require('../utils/xpEngine'); // <-- ACTION: Import the new engine
+const { awardXp } = require('../utils/xpEngine');
 
 const processTimeWeightedRewards = async () => {
   console.log('Kicking off daily time-weighted reward processing...');
@@ -22,7 +22,6 @@ const processTimeWeightedRewards = async () => {
     console.log(`Found ${positions.length} active positions to process.`);
 
     const userUpdates = new Map();
-
     const allUserIds = [...new Set(positions.map(p => p.user_id))];
     const userEffectsMap = new Map();
     for (const userId of allUserIds) {
@@ -44,45 +43,34 @@ const processTimeWeightedRewards = async () => {
       const xpBoostPercentage = userEffects.xp_boost_pct || 0;
       
       const finalDailyXpAward = baseDailyXpAward * (1 + (xpBoostPercentage / 100));
-
       const currentGain = userUpdates.get(position.user_id) || 0;
       userUpdates.set(position.user_id, currentGain + finalDailyXpAward);
     }
 
     await client.query('BEGIN');
-    try {
-      for (const [userId, total_xp_gain] of userUpdates.entries()) {
-        
-        // ==============================================================================
-        // --- REFACTOR: XP logic now uses the centralized xpEngine ---
-        // We no longer need to manually update the user's XP and tier here.
-        // The xpEngine handles both the XP update and the activity log creation.
-        // ==============================================================================
-        await awardXp({
-          userId: userId,
-          xpAmount: total_xp_gain,
-          type: 'STAKING_BONUS',
-          description: `Earned ${total_xp_gain.toFixed(4)} XP from daily staking rewards.`,
-        }, client);
-        
-        // --- ACTION: We still need to recalculate and update the tier ---
-        const userResult = await client.query('SELECT xp FROM users WHERE user_id = $1', [userId]);
-        const newTotalXp = parseFloat(userResult.rows[0].xp);
-        const newCalculatedTier = calculateUserTier(newTotalXp);
-        await client.query('UPDATE users SET account_tier = $1 WHERE user_id = $2', [newCalculatedTier, userId]);
-      }
-      await client.query('COMMIT');
-      console.log(`✅ Daily reward processing complete. Updated ${userUpdates.size} users.`);
-    } catch (dbError) {
-      await client.query('ROLLBACK');
-      console.error('Database error during bulk update. Rolling back.', dbError);
+    for (const [userId, total_xp_gain] of userUpdates.entries()) {
+      await awardXp({
+        userId: userId,
+        xpAmount: total_xp_gain,
+        type: 'STAKING_BONUS',
+        descriptionKey: 'xp_history.staking_bonus',
+        descriptionVars: { amount: total_xp_gain.toFixed(4) }
+      }, client);
+      
+      const userResult = await client.query('SELECT xp FROM users WHERE user_id = $1', [userId]);
+      const newTotalXp = parseFloat(userResult.rows[0].xp);
+      const newCalculatedTier = calculateUserTier(newTotalXp);
+      await client.query('UPDATE users SET account_tier = $1 WHERE user_id = $2', [newCalculatedTier, userId]);
     }
+    await client.query('COMMIT');
+    console.log(`✅ Daily reward processing complete. Updated ${userUpdates.size} users.`);
 
   } catch (error) {
+    if(client) await client.query('ROLLBACK').catch(console.error);
     console.error('❌ Major error in processTimeWeightedRewards job:', error);
   } finally {
     if (client) client.release();
   }
 };
 
-module.exports = {  processTimeWeightedRewards, };
+module.exports = { processTimeWeightedRewards };

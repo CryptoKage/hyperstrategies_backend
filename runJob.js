@@ -1,54 +1,40 @@
-// runJob.js - CORRECTED
-
+// hyperstrategies_backend/runJob.js
 require('dotenv').config();
-const { findAndCreditDeposits } = require('./jobs/pollDeposits');
-const { updateVaultPerformance } = require('./jobs/updateVaultPerformance');
-const { processWithdrawals } = require('./jobs/queueProcessor');
-// Add any other jobs you want to run manually here.
 
 const jobName = process.argv[2];
-
 if (!jobName) {
   console.error('❌ ERROR: Please provide the name of the job to run.');
-  console.log('Available jobs: syncDeposits, updateVaultPerformance, processWithdrawals');
+  console.log('Available jobs: pollDeposits, updateVaultPerformance, processWithdrawals, awardStakingXP');
   process.exit(1);
 }
 
 const run = async () => {
   console.log(`--- Manually triggering job: ${jobName} ---`);
-  
   try {
+    let jobFunction;
     switch (jobName) {
-      case 'syncDeposits':
-        // This now calls our powerful full-history sync function.
-        console.log('Running a full history scan for all user deposits...');
-        await findAndCreditDeposits({ fromBlock: "0x0" });
+      case 'pollDeposits':
+        jobFunction = require('./jobs/pollDeposits').pollDeposits;
         break;
-      
       case 'updateVaultPerformance':
-        await updateVaultPerformance();
+        jobFunction = require('./jobs/updateVaultPerformance').updateVaultPerformance;
         break;
-        
       case 'processWithdrawals':
-        await processWithdrawals();
+        jobFunction = require('./jobs/queueProcessor').processWithdrawals;
         break;
-        
-      // Add other jobs here if you need them.
-
+      case 'awardStakingXP':
+        jobFunction = require('./jobs/awardStakingXP').processTimeWeightedRewards;
+        break;
       default:
         console.error(`❌ ERROR: Job "${jobName}" not found.`);
-        console.log('Available jobs: syncDeposits, updateVaultPerformance, processWithdrawals');
         process.exit(1);
     }
-    
+    await jobFunction();
     console.log(`--- ✅ Job "${jobName}" finished successfully. ---`);
-    process.exit(0); // Exit with success code
-
+    process.exit(0);
   } catch (error) {
-    console.error(`--- ❌ Job "${jobName}" failed. ---`);
-    console.error(error);
-    process.exit(1); // Exit with failure code
+    console.error(`--- ❌ Job "${jobName}" failed. ---`, error);
+    process.exit(1);
   }
 };
-
 run();
