@@ -403,7 +403,6 @@ router.post('/mint-troll-pin', authenticateToken, async (req, res) => {
   }
 });
 
-const { calculateActiveEffects } = require('../utils/effectsEngine');
 
 router.post('/active-pins', authenticateToken, async (req, res) => {
   const userId = req.user.id;
