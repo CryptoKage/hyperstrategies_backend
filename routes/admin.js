@@ -2674,11 +2674,14 @@ router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
     }
 });
 
+// In routes/admin.js, replace the entire 'execute-hybrid-distribution' function.
+// Make sure the necessary 'require' statements for 'awardXp' are at the top of the file.
+
 router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     const { totalRewardUsd, participatingVaultIds, description } = req.body;
     const adminUserId = req.user.id;
-
     const numericReward = parseFloat(totalRewardUsd);
+
     if (isNaN(numericReward) || numericReward <= 0 || !Array.isArray(participatingVaultIds) || participatingVaultIds.length === 0 || !description) {
         return res.status(400).json({ error: 'A valid totalRewardUsd, a non-empty array of participatingVaultIds, and a description are required.' });
     }
@@ -2687,7 +2690,6 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     try {
         await client.query('BEGIN');
         
-        // 1. VERIFY FUNDS IN THE POOL
         const poolBalanceResult = await client.query("SELECT balance FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL' FOR UPDATE");
         const poolBalance = parseFloat(poolBalanceResult.rows[0]?.balance || 0);
 
@@ -2695,34 +2697,27 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             throw new Error(`Insufficient funds in FARMING_BUYBACK_POOL. Available: $${poolBalance.toFixed(2)}, Requested: $${numericReward.toFixed(2)}`);
         }
 
-        // 2. GET ELIGIBLE USERS & THEIR STATS
+        // ... (User and XP calculation logic remains the same)
         const eligibleUsersResult = await client.query(`SELECT DISTINCT u.user_id, u.username, u.xp FROM users u JOIN vault_ledger_entries vle ON u.user_id = vle.user_id WHERE vle.vault_id = ANY($1::int[])`, [participatingVaultIds]);
         const eligibleUsers = eligibleUsersResult.rows;
-        const userIds = eligibleUsers.map(u => u.user_id);
-
-        if (userIds.length === 0) {
+        if (eligibleUsers.length === 0) {
             await client.query('ROLLBACK');
             return res.status(200).json({ message: 'No eligible users found. No funds distributed.' });
         }
-
+        const userIds = eligibleUsers.map(u => u.user_id);
         const [bonusPointsResult, totalXpResult] = await Promise.all([
             client.query(`SELECT user_id, COALESCE(SUM(points_amount), 0) as total_points FROM bonus_points WHERE user_id = ANY($1::uuid[]) GROUP BY user_id`, [userIds]),
             client.query(`SELECT COALESCE(SUM(xp), 0) as total_xp FROM users WHERE user_id = ANY($1::uuid[])`, [userIds])
         ]);
-        
         const bonusPointsMap = new Map(bonusPointsResult.rows.map(r => [r.user_id, parseFloat(r.total_points)]));
         const totalEligibleXp = parseFloat(totalXpResult.rows[0].total_xp);
         let totalOutstandingBonusPoints = Array.from(bonusPointsMap.values()).reduce((sum, points) => sum + points, 0);
-
-        // 3. CALCULATE DISTRIBUTION TIERS
         let remainingRewardPool = numericReward;
         let amountForBuyback = Math.min(remainingRewardPool, totalOutstandingBonusPoints);
-        if (amountForBuyback > 0) {
-            remainingRewardPool -= amountForBuyback;
-        }
+        if (amountForBuyback > 0) { remainingRewardPool -= amountForBuyback; }
         let amountForXp = remainingRewardPool;
 
-        // 4. EXECUTE DISTRIBUTION & LOGGING FOR EACH USER
+
         for (const user of eligibleUsers) {
             const userId = user.user_id;
             let userBuybackAmount = 0;
@@ -2738,7 +2733,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             }
 
             const totalPayout = userBuybackAmount + userXpAmount;
-            if (totalPayout <= 0) continue;
+            if (totalPayout <= 0.000001) continue;
 
             const primaryVaultResult = await client.query(
                 `SELECT vault_id FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = ANY($2::int[]) GROUP BY vault_id ORDER BY SUM(amount) DESC LIMIT 1`,
@@ -2746,9 +2741,21 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             );
             const targetVaultId = primaryVaultResult.rows[0]?.vault_id || participatingVaultIds[0];
 
+            // --- REFACTORED AND CORRECTED LOGGING ---
+            
+            // Part 1: Handle Bonus Point Buyback
             if (userBuybackAmount > 0.000001) {
+                // --- THIS IS THE FIX: Use a dedicated entry type ---
+                await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT_BUYBACK', $3, 0, 'SWEPT')`, [userId, targetVaultId, userBuybackAmount]);
+                
+                // Debit bonus points
                 await client.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, -userBuybackAmount, 'HYBRID_DISTRIBUTION_BUYBACK']);
-                await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 0, 'SWEPT')`, [userId, targetVaultId, userBuybackAmount]);
+                
+                // Create a clear activity log for the USDC gain
+                const buybackDesc = `Received ${userBuybackAmount.toFixed(2)} USDC from platform Bonus Point buyback.`;
+                await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source, related_vault_id) VALUES ($1, 'BONUS_POINT_BUYBACK', $2, $3, 'USDC', 'COMPLETED', 'HYBRID_DISTRIBUTION', $4)`, [userId, buybackDesc, userBuybackAmount, targetVaultId]);
+
+                // Award the associated XP
                 await awardXp({
                     userId: userId, xpAmount: userBuybackAmount * 0.1, type: 'BONUS_POINT_BUYBACK',
                     descriptionKey: 'xp_history.hybrid_buyback', descriptionVars: { amount: userBuybackAmount.toFixed(2) },
@@ -2756,24 +2763,21 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
                 }, client);
             }
             
+            // Part 2: Handle XP-Weighted Payout
             if (userXpAmount > 0.000001) {
+                // Credit the vault as PNL (this is correct)
                 await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT')`, [userId, targetVaultId, userXpAmount]);
-                await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source, related_vault_id) VALUES ($1, 'PLATFORM_REWARD', $2, $3, 'USDC', 'COMPLETED', 'HYBRID_DISTRIBUTION_XP', $4)`, [userId, description, userXpAmount, targetVaultId]);
+                
+                // Create a clear activity log for the USDC gain
+                const xpDesc = `Received ${userXpAmount.toFixed(2)} USDC from XP-weighted platform rewards.`;
+                await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source, related_vault_id) VALUES ($1, 'PLATFORM_REWARD', $2, $3, 'USDC', 'COMPLETED', 'HYBRID_DISTRIBUTION', $4)`, [userId, xpDesc, userXpAmount, targetVaultId]);
             }
         }
         
-        // 5. DEBIT TREASURY & CREATE TRANSACTION LOG
-        await client.query(
-            `UPDATE treasury_ledgers SET balance = balance - $1 WHERE ledger_name = 'FARMING_BUYBACK_POOL'`,
-            [numericReward]
-        );
-        
+        // Treasury logic is correct and remains unchanged
+        await client.query(`UPDATE treasury_ledgers SET balance = balance - $1 WHERE ledger_name = 'FARMING_BUYBACK_POOL'`, [numericReward]);
         const treasuryDesc = `Executed Hybrid Distribution: "${description}". Total: $${numericReward.toFixed(2)}. Admin: ${adminUserId}.`;
-        await client.query(
-            `INSERT INTO treasury_transactions (from_ledger_id, amount, description) 
-             VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL'), $1, $2)`,
-            [numericReward, treasuryDesc]
-        );
+        await client.query(`INSERT INTO treasury_transactions (from_ledger_id, amount, description) VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL'), $1, $2)`, [numericReward, treasuryDesc]);
 
         await client.query('COMMIT');
         res.status(200).json({ message: `Successfully distributed $${numericReward.toFixed(2)} to ${eligibleUsers.length} users.` });
