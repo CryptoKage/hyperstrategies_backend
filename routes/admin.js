@@ -2709,8 +2709,16 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        
+        // --- 1. VERIFY FUNDS IN THE POOL ---
+        const poolBalanceResult = await client.query("SELECT balance FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL' FOR UPDATE");
+        const poolBalance = parseFloat(poolBalanceResult.rows[0]?.balance || 0);
 
-        // The calculation logic here is an exact mirror of the 'preview' endpoint for consistency.
+        if (poolBalance < numericReward) {
+            throw new Error(`Insufficient funds in FARMING_BUYBACK_POOL. Available: $${poolBalance.toFixed(2)}, Requested: $${numericReward.toFixed(2)}`);
+        }
+
+        // The rest of the calculation logic is the same...
         const eligibleUsersResult = await client.query(`SELECT DISTINCT u.user_id, u.username, u.xp FROM users u JOIN vault_ledger_entries vle ON u.user_id = vle.user_id WHERE vle.vault_id = ANY($1::int[])`, [participatingVaultIds]);
         const eligibleUsers = eligibleUsersResult.rows;
         const userIds = eligibleUsers.map(u => u.user_id);
@@ -2736,8 +2744,8 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
         }
         let amountForXp = remainingRewardPool;
 
-        // --- Execute the loop to perform database writes ---
         for (const user of eligibleUsers) {
+            // ... (user-level calculation logic is unchanged) ...
             const userId = user.user_id;
             let userBuybackAmount = 0;
             if (amountForBuyback > 0 && totalOutstandingBonusPoints > 0) {
@@ -2754,42 +2762,42 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             const totalPayout = userBuybackAmount + userXpAmount;
             if (totalPayout <= 0) continue;
 
-            // Find the user's primary vault (most capital) among the participating ones
             const primaryVaultResult = await client.query(
-                `SELECT vault_id, SUM(amount) as capital
-                 FROM vault_ledger_entries
-                 WHERE user_id = $1 AND vault_id = ANY($2::int[])
-                 GROUP BY vault_id ORDER BY capital DESC LIMIT 1`,
+                `SELECT vault_id, SUM(amount) as capital FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = ANY($2::int[]) GROUP BY vault_id ORDER BY capital DESC LIMIT 1`,
                 [userId, participatingVaultIds]
             );
-            // Default to the first participating vault if user has no capital (edge case)
             const targetVaultId = primaryVaultResult.rows[0]?.vault_id || participatingVaultIds[0];
 
-            // --- Execute Bonus Point Buyback Portion ---
             if (userBuybackAmount > 0.000001) {
-                // 1. Debit their bonus points
                 await client.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, -userBuybackAmount, 'HYBRID_DISTRIBUTION_BUYBACK']);
-                // 2. Credit their vault position as a new DEPOSIT
                 await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 0, 'SWEPT')`, [userId, targetVaultId, userBuybackAmount]);
-                // 3. Award XP for the buyback (using our standard engine)
-                const { awardXp } = require('../utils/xpEngine');
                 await awardXp({
-                    userId: userId,
-                    xpAmount: userBuybackAmount * 0.1, // 10% of buyback value
-                    type: 'BONUS_POINT_BUYBACK',
-                    descriptionKey: 'xp_history.hybrid_buyback',
-                    descriptionVars: { amount: userBuybackAmount.toFixed(2) }
+                    userId: userId, xpAmount: userBuybackAmount * 0.1, type: 'BONUS_POINT_BUYBACK',
+                    descriptionKey: 'xp_history.hybrid_buyback', descriptionVars: { amount: userBuybackAmount.toFixed(2) }
                 }, client);
             }
             
-            // --- Execute XP-Based Distribution Portion ---
             if (userXpAmount > 0.000001) {
-                // 1. Credit their vault position as PNL
                 await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, status) VALUES ($1, $2, 'PNL_DISTRIBUTION', $3, 'SWEPT')`, [userId, targetVaultId, userXpAmount]);
-                // 2. Log the activity for reporting
-                await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source) VALUES ($1, 'PLATFORM_REWARD', $2, $3, 'USDC', 'COMPLETED', 'HYBRID_DISTRIBUTION_XP')`, [userId, description, userXpAmount]);
+                await client.query(`INSERT INTO user_activity_log (user_id, activity_type, description, amount_primary, symbol_primary, status, source, related_vault_id) VALUES ($1, 'PLATFORM_REWARD', $2, $3, 'USDC', 'COMPLETED', 'HYBRID_DISTRIBUTION_XP', $4)`, [userId, description, userXpAmount, targetVaultId]);
             }
         }
+        
+        // --- THIS IS THE NEWLY ADDED TREASURY LOGIC ---
+        // 2. Debit the treasury pool
+        await client.query(
+            `UPDATE treasury_ledgers SET balance = balance - $1 WHERE ledger_name = 'FARMING_BUYBACK_POOL'`,
+            [numericReward]
+        );
+        
+        // 3. Create a treasury transaction for the audit trail
+        const treasuryDesc = `Executed Hybrid Distribution: "${description}". Total: $${numericReward.toFixed(2)}. Admin: ${adminUserId}.`;
+        await client.query(
+            `INSERT INTO treasury_transactions (from_ledger_id, amount, description) 
+             VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL'), $1, $2)`,
+            [numericReward, treasuryDesc]
+        );
+        // --- END OF NEW LOGIC ---
 
         await client.query('COMMIT');
         res.status(200).json({ message: `Successfully distributed $${numericReward.toFixed(2)} to ${eligibleUsers.length} users.` });
@@ -2797,7 +2805,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error executing hybrid distribution:', error);
-        res.status(500).json({ error: 'Failed to execute distribution.' });
+        res.status(500).json({ error: error.message || 'Failed to execute distribution.' });
     } finally {
         client.release();
     }
