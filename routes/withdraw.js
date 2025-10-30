@@ -5,6 +5,7 @@ const { ethers } = require('ethers'); // This is the correct import for ethers v
 const pool = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const tokenMap = require('../utils/tokens/tokenMap');
+const { ok, fail } = require('../utils/response');
 
 const router = express.Router();
 
@@ -16,74 +17,60 @@ const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
 router.post('/', authenticateToken, async (req, res) => {
   const { toAddress, amount, token = 'USDC' } = req.body;
   const userId = req.user.id;
-  const client = await pool.connect(); // Use a client for transactions
+  const client = await pool.connect();
 
   try {
-    // --- All initial validation remains the same ---
     if (!ethers.utils.isAddress(toAddress)) {
-      return res.status(400).json({ message: 'Invalid ETH address' });
+      return res.status(400).json(fail('INVALID_ADDRESS'));
     }
     const validatedAmount = parseFloat(amount);
     if (isNaN(validatedAmount) || validatedAmount <= 0) {
-      return res.status(400).json({ message: 'Invalid amount format or value.' });
+      return res.status(400).json(fail('INVALID_AMOUNT'));
     }
     const tokenInfo = tokenMap[token.toLowerCase()];
     if (!tokenInfo) {
-      return res.status(400).json({ message: 'Unsupported token symbol.' });
+      return res.status(400).json(fail('UNSUPPORTED_TOKEN'));
     }
 
-    // ==============================================================================
-    // --- REFACTOR: Perform balance check and deduction in a secure transaction ---
-    // ==============================================================================
     await client.query('BEGIN');
 
-    // 1. Get the user's current balance and lock the row for update.
     const userResult = await client.query('SELECT balance FROM users WHERE user_id = $1 FOR UPDATE', [userId]);
     if (userResult.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'User not found.' });
+      return res.status(404).json(fail('USER_NOT_FOUND'));
     }
     const currentBalance = parseFloat(userResult.rows[0].balance);
 
-    // 2. Check if the user has sufficient "Available Balance".
     if (currentBalance < validatedAmount) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ message: `Insufficient available balance. You have $${currentBalance.toFixed(2)}.` });
+      return res.status(400).json(fail('INSUFFICIENT_FUNDS'));
     }
 
-    // 3. Deduct the amount from their balance immediately.
     const newBalance = currentBalance - validatedAmount;
     await client.query('UPDATE users SET balance = $1 WHERE user_id = $2', [newBalance, userId]);
 
-    // 4. Queue the withdrawal request.
     await client.query(
       `INSERT INTO withdrawal_queue (user_id, to_address, amount, "token")
        VALUES ($1, $2, $3, $4)`,
       [userId, toAddress, validatedAmount, tokenInfo.symbol]
     );
     
-    // 5. Commit the transaction.
     await client.query('COMMIT');
-    // ==============================================================================
-    // --- END OF REFACTOR ---
-    // ==============================================================================
 
     console.log(`📥 Queued platform withdrawal for user ${userId}. Balance debited by ${validatedAmount}.`);
-
-    return res.status(200).json({
-      status: 'queued',
-      message: 'Withdrawal has been queued for processing. Your balance has been updated.'
-    });
+    
+    // Return standardized success response
+    return res.status(200).json(ok('WITHDRAWAL_QUEUED'));
 
   } catch (err) {
-    if (client) await client.query('ROLLBACK'); // Ensure rollback on any error
+    if (client) await client.query('ROLLBACK');
     console.error('Queue insert error:', err);
-    return res.status(500).json({ message: 'Failed to queue withdrawal' });
+    // Return standardized generic error
+    return res.status(500).json(fail('GENERIC_SERVER_ERROR'));
   } finally {
     if (client) client.release();
   }
 });
-
 
 // --- Get User's Withdrawal History Endpoint ---
 // This is the complete and correct history route.

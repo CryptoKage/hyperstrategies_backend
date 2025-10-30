@@ -101,25 +101,18 @@ router.post('/invest', authenticateToken, async (req, res) => {
 
         const xpForAmount = investmentAmountBigNum.div(ethers.utils.parseUnits('10', tokenDecimals)).toNumber();
         
-        // --- THIS IS THE MAIN FIX: Pass the vaultId to the xpEngine ---
         await awardXp({
-            userId: userId,
-            xpAmount: xpForAmount,
-            type: 'DEPOSIT_BONUS',
-            descriptionKey: 'xp_history.deposit_bonus',
-            descriptionVars: { amount: xpForAmount.toFixed(2), vaultId: vaultId },
-            relatedVaultId: vaultId // Pass the vaultId
+            userId: userId, xpAmount: xpForAmount, type: 'DEPOSIT_BONUS',
+            descriptionKey: 'xp_history.deposit_bonus', descriptionVars: { amount: xpForAmount.toFixed(2), vaultId: vaultId },
+            relatedVaultId: vaultId
         }, dbClient);
         
         const firstDepositCheck = await dbClient.query("SELECT COUNT(*) FROM vault_ledger_entries WHERE user_id = $1 AND entry_type = 'DEPOSIT'", [userId]);
         if (parseInt(firstDepositCheck.rows[0].count) === 1 && theUser.referred_by_user_id) {
             await awardXp({
-                userId: theUser.referred_by_user_id,
-                xpAmount: xpForAmount,
-                type: 'REFERRAL_BONUS',
-                descriptionKey: 'xp_history.referral_bonus',
-                descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username },
-                relatedVaultId: vaultId // Also attribute referral bonus to the vault
+                userId: theUser.referred_by_user_id, xpAmount: xpForAmount, type: 'REFERRAL_BONUS',
+                descriptionKey: 'xp_history.referral_bonus', descriptionVars: { amount: xpForAmount.toFixed(2), username: theUser.username },
+                relatedVaultId: vaultId
             }, dbClient);
         }
         
@@ -134,6 +127,7 @@ router.post('/invest', authenticateToken, async (req, res) => {
         if(dbClient) dbClient.release();
     }
 });
+
 
 router.get('/:vaultId/lock-status', authenticateToken, async (req, res) => {
     const { vaultId } = req.params;
@@ -271,5 +265,6 @@ router.post('/request-transfer', authenticateToken, async (req, res) => {
         client.release();
     }
 });
+
 
 module.exports = router;
