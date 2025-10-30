@@ -14,6 +14,8 @@ const { findAndCreditDeposits } = require('../jobs/pollDeposits');
 
 const alchemy = new Alchemy({ apiKey: process.env.ALCHEMY_API_KEY, network: Network.ETH_MAINNET });
 
+const { awardXp } = require('../utils/xpEngine');
+const { calculateUserTier } = require('../utils/tierUtils');
 
 // Authenticate first, then verify admin status via asynchronous DB lookup.
 router.use(authenticateToken);
@@ -38,7 +40,7 @@ router.get('/dashboard-stats', async (req, res) => {
         JOIN users u ON log.user_id = u.user_id 
         WHERE 
           log.activity_type = 'VAULT_WITHDRAWAL_REQUEST' 
-          AND log.status NOT IN ('COMPLETED', 'FAILED') -- <-- THIS IS THE FIX
+          AND log.status NOT IN ('COMPLETED', 'FAILED')
         ORDER BY 
           log.created_at ASC;
       `)
@@ -58,23 +60,6 @@ router.get('/dashboard-stats', async (req, res) => {
     console.error("Admin dashboard error:", err);
     res.status(500).json({ error: "Failed to fetch admin stats" });
   }
-});
-
-router.post('/jobs/sync-all-deposits', async (req, res) => {
-    console.log(`[ADMIN] Manual "Sync All Deposits" triggered by admin ${req.user.id}`);
-    
-    // We don't await this. We trigger the job and let it run in the background.
-    // The 'fromBlock: "0x0"' tells it to scan the entire history.
-    findAndCreditDeposits({ fromBlock: "0x0" })
-        .then(result => {
-            console.log(`[ADMIN] Manual sync job finished. Results: ${JSON.stringify(result)}`);
-            // You could add a notification here (e.g., via websocket) to tell the admin it's done.
-        })
-        .catch(err => {
-            console.error(`[ADMIN] Manual sync job FAILED:`, err.message);
-        });
-
-    res.status(202).json({ message: 'Full deposit synchronization job has been triggered. It will run in the background. Check server logs for progress.' });
 });
 
 // --- Manual PnL Application Endpoint ---
@@ -2710,7 +2695,6 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     try {
         await client.query('BEGIN');
         
-        // --- 1. VERIFY FUNDS IN THE POOL ---
         const poolBalanceResult = await client.query("SELECT balance FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL' FOR UPDATE");
         const poolBalance = parseFloat(poolBalanceResult.rows[0]?.balance || 0);
 
@@ -2718,7 +2702,6 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             throw new Error(`Insufficient funds in FARMING_BUYBACK_POOL. Available: $${poolBalance.toFixed(2)}, Requested: $${numericReward.toFixed(2)}`);
         }
 
-        // The rest of the calculation logic is the same...
         const eligibleUsersResult = await client.query(`SELECT DISTINCT u.user_id, u.username, u.xp FROM users u JOIN vault_ledger_entries vle ON u.user_id = vle.user_id WHERE vle.vault_id = ANY($1::int[])`, [participatingVaultIds]);
         const eligibleUsers = eligibleUsersResult.rows;
         const userIds = eligibleUsers.map(u => u.user_id);
@@ -2745,7 +2728,6 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
         let amountForXp = remainingRewardPool;
 
         for (const user of eligibleUsers) {
-            // ... (user-level calculation logic is unchanged) ...
             const userId = user.user_id;
             let userBuybackAmount = 0;
             if (amountForBuyback > 0 && totalOutstandingBonusPoints > 0) {
@@ -2771,9 +2753,12 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             if (userBuybackAmount > 0.000001) {
                 await client.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, -userBuybackAmount, 'HYBRID_DISTRIBUTION_BUYBACK']);
                 await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 0, 'SWEPT')`, [userId, targetVaultId, userBuybackAmount]);
+                
+                // The 'awardXp' call is now valid because it was imported.
                 await awardXp({
                     userId: userId, xpAmount: userBuybackAmount * 0.1, type: 'BONUS_POINT_BUYBACK',
-                    descriptionKey: 'xp_history.hybrid_buyback', descriptionVars: { amount: userBuybackAmount.toFixed(2) }
+                    descriptionKey: 'xp_history.hybrid_buyback', descriptionVars: { amount: userBuybackAmount.toFixed(2) },
+                    relatedVaultId: targetVaultId // Also associate this XP with the vault
                 }, client);
             }
             
@@ -2783,21 +2768,17 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             }
         }
         
-        // --- THIS IS THE NEWLY ADDED TREASURY LOGIC ---
-        // 2. Debit the treasury pool
         await client.query(
             `UPDATE treasury_ledgers SET balance = balance - $1 WHERE ledger_name = 'FARMING_BUYBACK_POOL'`,
             [numericReward]
         );
         
-        // 3. Create a treasury transaction for the audit trail
         const treasuryDesc = `Executed Hybrid Distribution: "${description}". Total: $${numericReward.toFixed(2)}. Admin: ${adminUserId}.`;
         await client.query(
             `INSERT INTO treasury_transactions (from_ledger_id, amount, description) 
              VALUES ((SELECT ledger_id FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL'), $1, $2)`,
             [numericReward, treasuryDesc]
         );
-        // --- END OF NEW LOGIC ---
 
         await client.query('COMMIT');
         res.status(200).json({ message: `Successfully distributed $${numericReward.toFixed(2)} to ${eligibleUsers.length} users.` });
