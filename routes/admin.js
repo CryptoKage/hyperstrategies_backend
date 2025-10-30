@@ -2590,7 +2590,6 @@ router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
 
     const client = await pool.connect();
     try {
-        // 1. Get a unique list of all users invested in the participating vaults
         const eligibleUsersResult = await client.query(
             `SELECT DISTINCT u.user_id, u.username, u.xp
              FROM users u
@@ -2605,7 +2604,6 @@ router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
             return res.json({ message: 'No eligible users found in the specified vaults.', preview: [] });
         }
 
-        // 2. Fetch bonus point and XP totals for ONLY these eligible users
         const [bonusPointsResult, totalXpResult] = await Promise.all([
             client.query(
                 `SELECT user_id, COALESCE(SUM(points_amount), 0) as total_points
@@ -2624,17 +2622,14 @@ router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
         const totalEligibleXp = parseFloat(totalXpResult.rows[0].total_xp);
         let totalOutstandingBonusPoints = Array.from(bonusPointsMap.values()).reduce((sum, points) => sum + points, 0);
 
-        // 3. Perform the calculation logic
         let remainingRewardPool = numericReward;
         const previewResults = [];
 
-        // --- Tier 1: Bonus Point Buyback ---
         let amountForBuyback = Math.min(remainingRewardPool, totalOutstandingBonusPoints);
         if (amountForBuyback > 0) {
             remainingRewardPool -= amountForBuyback;
         }
 
-        // --- Tier 2: XP-Weighted Distribution ---
         let amountForXp = remainingRewardPool;
 
         for (const user of eligibleUsers) {
@@ -2659,7 +2654,6 @@ router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
             });
         }
         
-        // Sort by total payout descending for a clear preview
         previewResults.sort((a, b) => b.totalPayout - a.totalPayout);
 
         res.status(200).json({
@@ -2680,8 +2674,6 @@ router.post('/rewards/preview-hybrid-distribution', async (req, res) => {
     }
 });
 
-// Add this new route to routes/admin.js
-
 router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     const { totalRewardUsd, participatingVaultIds, description } = req.body;
     const adminUserId = req.user.id;
@@ -2695,6 +2687,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
     try {
         await client.query('BEGIN');
         
+        // 1. VERIFY FUNDS IN THE POOL
         const poolBalanceResult = await client.query("SELECT balance FROM treasury_ledgers WHERE ledger_name = 'FARMING_BUYBACK_POOL' FOR UPDATE");
         const poolBalance = parseFloat(poolBalanceResult.rows[0]?.balance || 0);
 
@@ -2702,6 +2695,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             throw new Error(`Insufficient funds in FARMING_BUYBACK_POOL. Available: $${poolBalance.toFixed(2)}, Requested: $${numericReward.toFixed(2)}`);
         }
 
+        // 2. GET ELIGIBLE USERS & THEIR STATS
         const eligibleUsersResult = await client.query(`SELECT DISTINCT u.user_id, u.username, u.xp FROM users u JOIN vault_ledger_entries vle ON u.user_id = vle.user_id WHERE vle.vault_id = ANY($1::int[])`, [participatingVaultIds]);
         const eligibleUsers = eligibleUsersResult.rows;
         const userIds = eligibleUsers.map(u => u.user_id);
@@ -2720,6 +2714,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
         const totalEligibleXp = parseFloat(totalXpResult.rows[0].total_xp);
         let totalOutstandingBonusPoints = Array.from(bonusPointsMap.values()).reduce((sum, points) => sum + points, 0);
 
+        // 3. CALCULATE DISTRIBUTION TIERS
         let remainingRewardPool = numericReward;
         let amountForBuyback = Math.min(remainingRewardPool, totalOutstandingBonusPoints);
         if (amountForBuyback > 0) {
@@ -2727,6 +2722,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
         }
         let amountForXp = remainingRewardPool;
 
+        // 4. EXECUTE DISTRIBUTION & LOGGING FOR EACH USER
         for (const user of eligibleUsers) {
             const userId = user.user_id;
             let userBuybackAmount = 0;
@@ -2745,7 +2741,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             if (totalPayout <= 0) continue;
 
             const primaryVaultResult = await client.query(
-                `SELECT vault_id, SUM(amount) as capital FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = ANY($2::int[]) GROUP BY vault_id ORDER BY capital DESC LIMIT 1`,
+                `SELECT vault_id FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = ANY($2::int[]) GROUP BY vault_id ORDER BY SUM(amount) DESC LIMIT 1`,
                 [userId, participatingVaultIds]
             );
             const targetVaultId = primaryVaultResult.rows[0]?.vault_id || participatingVaultIds[0];
@@ -2753,12 +2749,10 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             if (userBuybackAmount > 0.000001) {
                 await client.query('INSERT INTO bonus_points (user_id, points_amount, source) VALUES ($1, $2, $3)', [userId, -userBuybackAmount, 'HYBRID_DISTRIBUTION_BUYBACK']);
                 await client.query(`INSERT INTO vault_ledger_entries (user_id, vault_id, entry_type, amount, fee_amount, status) VALUES ($1, $2, 'DEPOSIT', $3, 0, 'SWEPT')`, [userId, targetVaultId, userBuybackAmount]);
-                
-                // The 'awardXp' call is now valid because it was imported.
                 await awardXp({
                     userId: userId, xpAmount: userBuybackAmount * 0.1, type: 'BONUS_POINT_BUYBACK',
                     descriptionKey: 'xp_history.hybrid_buyback', descriptionVars: { amount: userBuybackAmount.toFixed(2) },
-                    relatedVaultId: targetVaultId // Also associate this XP with the vault
+                    relatedVaultId: targetVaultId 
                 }, client);
             }
             
@@ -2768,6 +2762,7 @@ router.post('/rewards/execute-hybrid-distribution', async (req, res) => {
             }
         }
         
+        // 5. DEBIT TREASURY & CREATE TRANSACTION LOG
         await client.query(
             `UPDATE treasury_ledgers SET balance = balance - $1 WHERE ledger_name = 'FARMING_BUYBACK_POOL'`,
             [numericReward]
