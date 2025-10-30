@@ -17,9 +17,17 @@ const RUN_FOR_ALL_USERS = false;
 
 // Add the specific user UUIDs you want to audit here.
 const userIdsToAudit = [
-    // '00000000-0000-0000-0000-000000000001',
-    // '00000000-0000-0000-0000-000000000002',
-    // ...add the ~13 user IDs here
+   'acde1fad-0e79-402a-a0ef-efe8f2738871', // 1234
+    'ebaddbc4-f382-4782-97f8-5fbf100c811b', // aarondean
+    'c46df9e8-6cf8-4555-bdac-74cd3b5bda9d', // Kage Token
+    'eccbec70-4443-4c8b-8d25-2358f86036c4', // MisterBuggy
+    '0932e6f3-4004-46c2-939b-ea0d32dc7831', // m.schulz@netcologne.de
+    '4c3fa0f7-e083-4fc5-b74f-6ea4216842c6', // NotAdmin
+    '2749e30f-d5ca-4ecb-a2f3-55b237ae1220', // Sabine Boos
+    '085ee643-c11e-4108-89f8-5e749a979173', // SG
+    '71bd55c5-d7c3-4465-9a0b-31a2c727eb27', // Steffen
+    '5407b11c-5b44-4881-bb89-95ecad93dcab', // Toraji
+    'ffb33864-e0ba-4d25-87a4-a95afc47b135', // Zom Cakes
 ];
 
 // --- SCRIPT LOGIC ---
