@@ -10,7 +10,7 @@ const { calculateUserTier } = require('../utils/tierUtils');
 // --- CONFIGURATION ---
 
 // Set to 'false' to execute the changes. ALWAYS run in 'true' first.
-const DRY_RUN = true; 
+const DRY_RUN = false; 
 
 // Set to 'true' to run for all users, or 'false' to run only for the IDs below.
 const RUN_FOR_ALL_USERS = false; 
