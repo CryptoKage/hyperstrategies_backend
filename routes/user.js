@@ -10,6 +10,7 @@ const tokenMap = require('../utils/tokens/tokenMap');
 const axios = require('axios');
 const erc20Abi = require('../utils/abis/erc20.json');
 const { ok, fail } = require('../utils/response');
+const { calculateActiveEffects } = require('../utils/effectsEngine');
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.ALCHEMY_RPC_URL);
 const usdcContract = new ethers.Contract(tokenMap.usdc.address, erc20Abi, provider);
@@ -103,7 +104,7 @@ router.get('/profile', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     // 1. Fetch all necessary data in parallel
-    const [profileResult, ownedPinsResult, activePinIdsResult, userEffects] = await Promise.all([
+    const [profileResult, ownedPinsResult, activePinIdsResult, userEffects, totalStakedResult] = await Promise.all([
       client.query(`
         SELECT u.username, u.email, u.xp, u.referral_code, u.account_tier, u.auto_equip_pins
         FROM users u 
@@ -120,7 +121,13 @@ router.get('/profile', authenticateToken, async (req, res) => {
       // Get a simple list of which pin IDs are active
       client.query('SELECT pin_id FROM user_active_pins WHERE user_id = $1', [userId]),
       // Use our engine to calculate total available slots
-      calculateActiveEffects(userId, client)
+      calculateActiveEffects(userId, client),
+      client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_capital 
+         FROM vault_ledger_entries 
+         WHERE user_id = $1 AND entry_type IN ('DEPOSIT', 'VAULT_TRANSFER_IN', 'PNL_DISTRIBUTION', 'PERFORMANCE_FEE', 'BONUS_POINT_BUYBACK_CREDIT')`, // Use a comprehensive list of credit-like types
+        [userId]
+      )
     ]);
 
     if (profileResult.rows.length === 0) {
@@ -138,7 +145,8 @@ router.get('/profile', authenticateToken, async (req, res) => {
       ownedPins: ownedPins,         // Array of objects with full pin details
       activePinIds: activePinIds,   // Array of integers, e.g., [101, 102]
       totalPinSlots: totalPinSlots,  // A single number, e.g., 3
-      auto_equip_pins: profileData.auto_equip_pins
+      auto_equip_pins: profileData.auto_equip_pins,
+      total_staked_capital: parseFloat(totalStakedResult.rows[0].total_capital)
     });
   } catch (err) {
     console.error('Error fetching rich profile data:', err);

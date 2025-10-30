@@ -1,4 +1,4 @@
-// hyperstrategies_backend/routes/vaultDetails.js
+// FILE: cryptokage-hyperstrategies_backend/routes/vaultDetails.js
 
 const express = require('express');
 const router = express.Router();
@@ -23,7 +23,7 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
       userLedgerResult,
       farmingProtocolsResult,
       buybackGainsResult,
-      xpGainsResult
+      xpGainsResult // This query gets HISTORICAL totals
     ] = await Promise.all([
       client.query('SELECT * FROM vaults WHERE vault_id = $1', [vaultId]),
       client.query('SELECT symbol, contract_address, chain, coingecko_id, is_primary_asset FROM vault_assets WHERE vault_id = $1', [vaultId]),
@@ -35,6 +35,7 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
     ]);
 
     if (vaultInfoResult.rows.length === 0) {
+      client.release();
       return res.status(404).json({ error: 'Vault not found' });
     }
 
@@ -48,17 +49,23 @@ router.get('/:vaultId', authenticateToken, async (req, res) => {
     if (userLedgerEntries.length > 0) {
       const principal = userLedgerEntries.filter(e => e.entry_type === 'DEPOSIT' || e.entry_type === 'VAULT_TRANSFER_IN').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
       const strategyGains = userLedgerEntries.filter(e => e.entry_type === 'PNL_DISTRIBUTION').reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-      const unrealizedPnl = 0; // Placeholder
+      const unrealizedPnl = 0;
       const totalCapital = principal + strategyGains + buybackGains;
+
+      // --- THIS CALCULATION IS STILL REQUIRED ---
+      // It calculates the CURRENT DAILY RATE, which is different from the historical sum.
+      const dailyXpRate = principal / 300;
+      // --- END OF NEW LOGIC ---
 
       userPosition = { 
         totalCapital, 
         principal, 
         strategyGains,
-        unrealizedPnl, // Keep for consistency even if 0
+        unrealizedPnl,
         buybackGains,
-        totalXpFromVault: xpFromDeposits + xpFromStaking,
-        xpBreakdown: { deposit: xpFromDeposits, staking: xpFromStaking }
+        totalXpFromVault: xpFromDeposits + xpFromStaking, // This is the historical total
+        xpBreakdown: { deposit: xpFromDeposits, staking: xpFromStaking },
+        dailyXpRate: dailyXpRate // This is the current daily rate
       };
     }
 
