@@ -2289,14 +2289,8 @@ router.get('/reports/aggregate', async (req, res) => {
     }
 });
 
-// Add this new route to routes/admin.js
-
-// REPLACE the existing '/calculate-and-post-fees' route in admin.js with this one.
-
-// REPLACE the existing '/calculate-and-post-fees' route in admin.js with this one.
 
 router.post('/calculate-and-post-fees', async (req, res) => {
-    // NOTE: We no longer use pnlPercentage. It is ignored.
     const { vaultId, month } = req.body;
     const adminUserId = req.user.id;
 
@@ -2331,28 +2325,39 @@ router.post('/calculate-and-post-fees', async (req, res) => {
         for (const participant of participants) {
             const userId = participant.user_id;
 
-            // --- THIS IS THE FIX: We get the TRUE PNL from the ledger ---
-            const [startingCapitalResult, truePnlResult] = await Promise.all([
-                client.query(`SELECT COALESCE(SUM(amount), 0) as capital FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at < $3`, [userId, vaultId, startDate]),
-                client.query(`SELECT COALESCE(SUM(amount), 0) as pnl FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND entry_type = 'PNL_DISTRIBUTION' AND created_at >= $3 AND created_at < $4`, [userId, vaultId, startDate, endDate])
-            ]);
-            const startingCapital = parseFloat(startingCapitalResult.rows[0].capital);
-            const grossPnl = parseFloat(truePnlResult.rows[0].pnl);
-            // --- END OF FIX ---
+            // --- REFACTORED AND CORRECTED FEE LOGIC ---
 
-            // Skip users who weren't active in this period
-            if (startingCapital <= 0 && grossPnl === 0 && (await client.query('SELECT 1 FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at >= $3 AND created_at < $4 LIMIT 1', [userId, vaultId, startDate, endDate])).rows.length === 0) {
-                continue;
-            }
+            // 1. Get all ledger entries for the user in this vault.
+            const allEntries = (await client.query(
+                `SELECT entry_type, amount, created_at FROM vault_ledger_entries WHERE user_id = $1 AND vault_id = $2 AND created_at < $3 ORDER BY created_at ASC`,
+                [userId, vaultId, endDate]
+            )).rows.map(e => ({...e, amount: parseFloat(e.amount)}));
 
-            const hwmResult = await client.query(`SELECT COALESCE(MAX(ending_account_value), 0) as high_water_mark FROM user_performance_snapshots WHERE user_id = $1 AND vault_id = $2 AND period_end_date < $3`, [userId, vaultId, startDate]);
+            // 2. Calculate key figures based on entry dates.
+            const startingCapital = allEntries.filter(e => new Date(e.created_at) < startDate).reduce((sum, e) => sum + e.amount, 0);
+            const periodDeposits = allEntries.filter(e => new Date(e.created_at) >= startDate && e.entry_type.includes('DEPOSIT')).reduce((sum, e) => sum + e.amount, 0);
+            const periodWithdrawals = allEntries.filter(e => new Date(e.created_at) >= startDate && e.entry_type.includes('WITHDRAWAL')).reduce((sum, e) => sum + e.amount, 0); // Withdrawals are negative
+            const grossPnl = allEntries.filter(e => new Date(e.created_at) >= startDate && e.entry_type === 'PNL_DISTRIBUTION').reduce((sum, e) => sum + e.amount, 0);
+
+            // 3. Get the High-Water Mark from the PREVIOUS period.
+            const hwmResult = await client.query(
+                `SELECT COALESCE(MAX(ending_account_value), 0) as high_water_mark FROM user_performance_snapshots WHERE user_id = $1 AND vault_id = $2 AND period_end_date < $3`,
+                [userId, vaultId, startDate]
+            );
             const highWaterMark = parseFloat(hwmResult.rows[0].high_water_mark);
-
-            const newAccountValue = startingCapital + grossPnl;
-            let feeAmount = 0;
             
-            if (newAccountValue > highWaterMark && grossPnl > 0) {
-                const profitSubjectToFee = Math.min(grossPnl, newAccountValue - highWaterMark);
+            // 4. Calculate the end-of-period value and the profit subject to fees.
+            const endingCapital = startingCapital + periodDeposits + periodWithdrawals + grossPnl;
+            
+            // Profit is the change in value, adjusted for cash flows.
+            const netProfit = endingCapital - startingCapital - (periodDeposits + periodWithdrawals);
+            
+            // The value used to test against the HWM is the starting capital adjusted for profit ONLY.
+            const performanceAdjustedValue = startingCapital + netProfit;
+
+            let feeAmount = 0;
+            if (performanceAdjustedValue > highWaterMark && netProfit > 0) {
+                const profitSubjectToFee = performanceAdjustedValue - highWaterMark;
                 feeAmount = profitSubjectToFee * PERFORMANCE_FEE_RATE;
 
                 if (feeAmount > 0.000001) {
@@ -2368,13 +2373,13 @@ router.post('/calculate-and-post-fees', async (req, res) => {
 
             results.push({
                 userId, username: (await client.query('SELECT username FROM users WHERE user_id = $1', [userId])).rows[0].username,
-                startingCapital, highWaterMark, grossPnl, newAccountValue, feeAmount
+                startingCapital, highWaterMark, grossPnl, netProfit, endingCapital, feeAmount
             });
         }
 
         await client.query('COMMIT');
         res.status(200).json({ 
-            message: `Fee calculation complete using event-driven PNL. Posted ${feesPostedCount} fee transactions totaling $${totalFeesCalculated.toFixed(2)}.`,
+            message: `Corrected fee calculation complete. Posted ${feesPostedCount} fee transactions totaling $${totalFeesCalculated.toFixed(2)}.`,
             calculationResults: results
         });
 
